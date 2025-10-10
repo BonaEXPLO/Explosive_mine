@@ -1,8 +1,12 @@
-# Ledger local
-/internal/ledger/data/
-*.db
+# Ledger / Badger DB
+/internal/ledger/
+ledgerdb/
+*.vlog
 *.badger
-*.bolt
+MANIFEST
+LOCK
+KEYREGISTRY
+DISCARD
 
 # Clés privées
 /internal/keys/
@@ -17,7 +21,7 @@
 
 # Build / binaires
 /bin/
-/obj/
+obj/
 *.exe
 *.apk
 
