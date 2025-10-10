@@ -1,0 +1,25 @@
+# Ledger local
+/internal/ledger/data/
+*.db
+*.badger
+*.bolt
+
+# Clés privées
+/internal/keys/
+*.pem
+*.key
+
+# Conscience Fingerprint / mots
+/internal/guardian/fingerprint.json
+
+# Configs secrets
+/internal/config/*.json
+
+# Build / binaires
+/bin/
+/obj/
+*.exe
+*.apk
+
+# Logs
+*.log

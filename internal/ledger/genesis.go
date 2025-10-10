@@ -1,0 +1,128 @@
+// internal/ledger/genesis.go
+package ledger
+
+import (
+	"errors"
+	"fmt"
+)
+
+// ==========================================================
+// EXPLOSIVE NETWORK — MAINNET GENESIS BLOCK DEFINITION
+// ==========================================================
+
+const (
+	GenesisMinerAddress = "GENESIS"
+	GenesisEXPLO        = 10 // Locked forever
+
+	// Fixed timestamp (UTC 2024-01-01 00:00:00)
+	GenesisTimestamp int64 = 1704067200000
+
+	// Canonical Genesis hash matching current block construction
+	GenesisHash = "45beb1aa8e01fb8dcda83df071abbe4d0431be141a9394b76a82a1830fd20825"
+)
+
+// CreateGenesisBlock initializes the blockchain with the immutable genesis block.
+// It builds the block deterministically, computes its final hash and ensures it
+// matches the canonical GenesisHash before storing it.
+func CreateGenesisBlock(db *Ledger) (*Block, error) {
+	if db == nil || db.db == nil {
+		return nil, fmt.Errorf("ledger not initialized")
+	}
+
+	// If block 0 already exists, verify it matches the canonical genesis.
+	existing, err := db.GetBlockByHeight(0)
+	if err == nil && existing != nil {
+		if existing.BlockHash != GenesisHash {
+			return nil, errors.New("invalid genesis block hash — possible chain corruption")
+		}
+		fmt.Println("✅ Genesis block already exists and hash verified.")
+		return existing, nil
+	}
+
+	// Build the deterministic genesis transaction
+	genesisTx := Transaction{
+		From:      "SYSTEM",
+		To:        GenesisMinerAddress,
+		AmountEXP: GenesisEXPLO,
+		AmountIM:  0,
+		Fee:       0,
+		Timestamp: GenesisTimestamp,
+		IsReward:  true,
+		Note:      "🔒 Genesis EXPLO locked forever",
+	}
+
+	// Compute merkle root deterministically
+	merkle := ComputeMerkleRoot([]Transaction{genesisTx})
+
+	// Build header with fixed fields
+	header := BlockHeader{
+		Height:       0,
+		PrevHash:     "",
+		Timestamp:    GenesisTimestamp,
+		Nonce:        0,
+		MinerAddress: GenesisMinerAddress,
+		MerkleRoot:   merkle,
+	}
+
+	// Assemble block (BlockHash left empty for now)
+	genesisBlock := &Block{
+		Header:       header,
+		Transactions: []Transaction{genesisTx},
+	}
+
+	// Compute final hash (must match canonical GenesisHash)
+	computed := genesisBlock.ComputeFinalHash()
+	if computed != GenesisHash {
+		return nil, fmt.Errorf(
+			"computed genesis hash mismatch: computed=%s expected=%s\n"+
+				"-> If you intentionally changed the genesis contents, update GenesisHash constant accordingly.",
+			computed, GenesisHash,
+		)
+	}
+
+	// Assign canonical hash
+	genesisBlock.BlockHash = computed
+
+	// Store and flush
+	if err := db.StoreBlockBatch(genesisBlock); err != nil {
+		return nil, fmt.Errorf("failed to store genesis block: %v", err)
+	}
+	if err := db.ForceFlushBlocks(); err != nil {
+		return nil, fmt.Errorf("failed to flush genesis block: %v", err)
+	}
+
+	fmt.Printf("⚡ Genesis block created: %d EXPLO locked forever\n", GenesisEXPLO)
+	return genesisBlock, nil
+}
+
+// VerifyGenesis ensures the stored block #0 matches the Mainnet specification.
+// Call this during Ledger initialization to reject any altered local DB.
+func VerifyGenesis(db *Ledger) error {
+	if db == nil || db.db == nil {
+		return fmt.Errorf("ledger not initialized")
+	}
+
+	block, err := db.GetBlockByHeight(0)
+	if err != nil {
+		return fmt.Errorf("unable to load genesis block: %v", err)
+	}
+	if block == nil {
+		return fmt.Errorf("genesis block missing")
+	}
+
+	if block.BlockHash != GenesisHash {
+		return fmt.Errorf("genesis hash mismatch — expected %s, found %s", GenesisHash, block.BlockHash)
+	}
+
+	if block.Header.MinerAddress != GenesisMinerAddress || len(block.Transactions) != 1 {
+		return fmt.Errorf("invalid genesis structure")
+	}
+
+	tx := block.Transactions[0]
+	if tx.To != GenesisMinerAddress || tx.AmountEXP != GenesisEXPLO || tx.Timestamp != GenesisTimestamp {
+		return fmt.Errorf("invalid genesis transaction data")
+	}
+
+	fmt.Println("✅ Genesis block integrity verified.")
+	return nil
+}
