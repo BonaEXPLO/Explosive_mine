@@ -1,0 +1,462 @@
+// internal/ledger/block.go
+package ledger
+
+import (
+    "bytes"
+    "crypto/sha256"
+    "encoding/binary"
+    "encoding/hex"
+    "fmt"
+    "sync"
+
+    "explosive/internal/compressor"
+
+    "github.com/dgraph-io/badger/v4"
+    "github.com/fxamacker/cbor/v2"
+    "golang.org/x/crypto/sha3"
+)
+
+var prefixBlock = []byte("block:")
+
+// ---------------- BlockHeader ----------------
+type BlockHeader struct {
+    Height       uint64 `cbor:"height"`
+    PrevHash     string `cbor:"prev_hash"`
+    Timestamp    int64  `cbor:"timestamp"`
+    Nonce        uint64 `cbor:"nonce"`
+    MinerAddress string `cbor:"miner_address"`
+    MerkleRoot   string `cbor:"merkle_root"`
+}
+
+// ---------------- Block ----------------
+type Block struct {
+    Header       BlockHeader   `cbor:"header"`
+    Transactions []Transaction `cbor:"txs"`
+    BlockHash    string        `cbor:"hash"`
+}
+
+// ---------------- Block Creation ----------------
+func NewBlock(height uint64, prevHash string, miner string, txs []Transaction, nonce uint64) *Block {
+    header := BlockHeader{
+        Height:       height,
+        PrevHash:     prevHash,
+        Timestamp:    NowMillis(),
+        Nonce:        nonce,
+        MinerAddress: miner,
+        MerkleRoot:   computeMerkleRoot(txs),
+    }
+
+    b := &Block{
+        Header:       header,
+        Transactions: txs,
+    }
+    b.BlockHash = b.ComputeFinalHash()
+    return b
+}
+
+// ---------------- Hashing ----------------
+func (b *Block) ComputeFastHash() string {
+    data, _ := cbor.Marshal(b.Header)
+    h := sha256.Sum256(data)
+    return hex.EncodeToString(h[:])
+}
+
+func (b *Block) ComputeFinalHash() string {
+    data, _ := cbor.Marshal(b)
+    h := sha3.Sum256(data)
+    return hex.EncodeToString(h[:])
+}
+
+// ---------------- Validation ----------------
+func (b *Block) Validate(expectedPrev string) error {
+    if b.BlockHash != b.ComputeFinalHash() {
+        return fmt.Errorf("invalid block hash")
+    }
+    if b.Header.Height == 0 && expectedPrev != "" {
+        return fmt.Errorf("genesis block should not have previous hash")
+    }
+    if b.Header.Height > 0 && b.Header.PrevHash != expectedPrev {
+        return fmt.Errorf("previous hash mismatch")
+    }
+    return nil
+}
+
+// ---------------- Concurrent Block Iteration ----------------
+func (l *Ledger) IterateBlocks(cb func(*Block) error) error {
+    if l == nil || l.db == nil {
+        return fmt.Errorf("ledger not initialized")
+    }
+
+    return l.db.View(func(txn *badger.Txn) error {
+        opts := badger.DefaultIteratorOptions
+        opts.PrefetchValues = true
+        it := txn.NewIterator(opts)
+        defer it.Close()
+
+        for it.Seek(prefixBlock); it.ValidForPrefix(prefixBlock); it.Next() {
+            item := it.Item()
+            val, err := item.ValueCopy(nil)
+            if err != nil {
+                return err
+            }
+
+            data, err := compressor.DecompressZSTD(val)
+            if err != nil {
+                return err
+            }
+
+            var blk Block
+            if err := cbor.Unmarshal(data, &blk); err != nil {
+                return err
+            }
+
+            if err := cb(&blk); err != nil {
+                return err
+            }
+        }
+        return nil
+    })
+}
+
+func (l *Ledger) ScanBlocksStream(process func(blk *Block) error) error {
+    if l == nil || l.db == nil {
+        return fmt.Errorf("ledger not initialized")
+    }
+
+    return l.db.View(func(txn *badger.Txn) error {
+        opts := badger.DefaultIteratorOptions
+        opts.PrefetchValues = false
+        it := txn.NewIterator(opts)
+        defer it.Close()
+
+        for it.Seek(prefixBlock); it.ValidForPrefix(prefixBlock); it.Next() {
+            item := it.Item()
+            val, err := item.ValueCopy(nil)
+            if err != nil {
+                return err
+            }
+
+            data, err := compressor.DecompressZSTD(val)
+            if err != nil {
+                return err
+            }
+
+            var blk Block
+            if err := cbor.Unmarshal(data, &blk); err != nil {
+                return err
+            }
+
+            if err := process(&blk); err != nil {
+                return err
+            }
+        }
+        return nil
+    })
+}
+
+// ---------------- Batch Block Storage ----------------
+var (
+    batchMu      sync.Mutex
+    batchQueueA  []*Block
+    batchQueueB  []*Block
+    activeQueueA = true
+    batchSize    = 500
+)
+
+func (l *Ledger) StoreBlockBatch(blk *Block) error {
+    if l == nil || l.db == nil {
+        return fmt.Errorf("ledger not initialized")
+    }
+
+    batchMu.Lock()
+    if activeQueueA {
+        batchQueueA = append(batchQueueA, blk)
+        if len(batchQueueA) >= batchSize {
+            toWrite := batchQueueA
+            batchQueueA = nil
+            activeQueueA = false
+            batchMu.Unlock()
+            return flushBlockBatch(l, toWrite)
+        }
+    } else {
+        batchQueueB = append(batchQueueB, blk)
+        if len(batchQueueB) >= batchSize {
+            toWrite := batchQueueB
+            batchQueueB = nil
+            activeQueueA = true
+            batchMu.Unlock()
+            return flushBlockBatch(l, toWrite)
+        }
+    }
+    batchMu.Unlock()
+    return nil
+}
+
+func flushBlockBatch(l *Ledger, blocks []*Block) error {
+    return l.db.Update(func(txn *badger.Txn) error {
+        for _, b := range blocks {
+            key := blockKeyByHeight(b.Header.Height)
+
+            // marshal + compress
+            val, err := cbor.Marshal(b)
+            if err != nil {
+                return err
+            }
+            comp, err := compressor.CompressZSTD(val)
+            if err != nil {
+                // fallback to raw if compression fails
+                comp = val
+            }
+
+            if err := txn.Set(key, comp); err != nil {
+                return err
+            }
+        }
+        return nil
+    })
+}
+
+func (l *Ledger) ForceFlushBlocks() error {
+    if l == nil || l.db == nil {
+        return fmt.Errorf("ledger not initialized")
+    }
+
+    batchMu.Lock()
+    defer batchMu.Unlock()
+
+    if len(batchQueueA) > 0 {
+        if err := flushBlockBatch(l, batchQueueA); err != nil {
+            return err
+        }
+        batchQueueA = nil
+    }
+    if len(batchQueueB) > 0 {
+        if err := flushBlockBatch(l, batchQueueB); err != nil {
+            return err
+        }
+        batchQueueB = nil
+    }
+    return nil
+}
+
+// ---------------- Merkle Root Placeholder ----------------
+func computeMerkleRoot(txs []Transaction) string {
+    if len(txs) == 0 {
+        return ""
+    }
+    hashes := make([]byte, 0, len(txs)*32)
+    for _, tx := range txs {
+        h := sha3.Sum256([]byte(fmt.Sprintf("%v", tx)))
+        hashes = append(hashes, h[:]...)
+    }
+    final := sha3.Sum256(hashes)
+    return hex.EncodeToString(final[:])
+}
+
+// ApplyBlock validates then queues the block for storage.
+func (l *Ledger) ApplyBlock(blk *Block) error {
+    if l == nil || l.db == nil {
+        return fmt.Errorf("ledger not initialized")
+    }
+
+    // Determine last block
+    var lastHash string
+    var lastHeight uint64
+    if err := l.IterateBlocks(func(b *Block) error {
+        if b.Header.Height > lastHeight {
+            lastHeight = b.Header.Height
+            lastHash = b.BlockHash
+        }
+        return nil
+    }); err != nil {
+        return fmt.Errorf("failed to retrieve last block: %v", err)
+    }
+
+    if err := blk.Validate(lastHash); err != nil {
+        return fmt.Errorf("block validation failed: %v", err)
+    }
+
+    if err := l.StoreBlockBatch(blk); err != nil {
+        return fmt.Errorf("failed to store block: %v", err)
+    }
+
+    return nil
+}
+
+func (l *Ledger) GetLatestBlockHeight() uint64 {
+    var lastHeight uint64
+    _ = l.IterateBlocks(func(b *Block) error {
+        if b.Header.Height > lastHeight {
+            lastHeight = b.Header.Height
+        }
+        return nil
+    })
+    return lastHeight
+}
+
+func (b *Block) VerifySignature() (bool, error) {
+    return true, nil
+}
+
+// GetLatestBlock returns the most recent block.
+func (l *Ledger) GetLatestBlock() (*Block, error) {
+    var last *Block
+
+    err := l.db.View(func(txn *badger.Txn) error {
+        opts := badger.DefaultIteratorOptions
+        opts.Reverse = true
+        it := txn.NewIterator(opts)
+        defer it.Close()
+
+        // Seek to the end of the prefix range
+        it.Seek(append(prefixBlock, 0xFF))
+        for it.Valid() {
+            item := it.Item()
+            k := item.Key()
+            if !bytes.HasPrefix(k, prefixBlock) {
+                break
+            }
+
+            val, err := item.ValueCopy(nil)
+            if err != nil {
+                return err
+            }
+
+            data, err := compressor.DecompressZSTD(val)
+            if err != nil {
+                return err
+            }
+
+            var blk Block
+            if err := cbor.Unmarshal(data, &blk); err != nil {
+                return fmt.Errorf("failed to decode block: %w", err)
+            }
+
+            last = &blk
+            break
+        }
+
+        if last == nil {
+            return fmt.Errorf("no blocks in ledger")
+        }
+        return nil
+    })
+
+    if err != nil {
+        return nil, err
+    }
+    return last, nil
+}
+
+// blockKeyByHeight returns the DB key for a block at a specific height.
+func blockKeyByHeight(height uint64) []byte {
+    b := make([]byte, 8)
+    binary.BigEndian.PutUint64(b, height)
+    return append(prefixBlock, b...)
+}
+
+// PutBlock stores a block compressed with ZSTD asynchronously.
+func (l *Ledger) PutBlock(height uint64, blk *Block) error {
+    bufVal, err := cbor.Marshal(blk)
+    if err != nil {
+        return err
+    }
+    compData, err := compressor.CompressZSTD(bufVal)
+    if err != nil {
+        compData = bufVal
+    }
+    l.AsyncPut(blockKeyByHeight(height), compData)
+
+    hb := make([]byte, 8)
+    binary.BigEndian.PutUint64(hb, height)
+    return l.PutBytes(MetaChainTip, hb)
+}
+
+// GetBlockByHeight retrieves and decompresses a block by its height.
+func (l *Ledger) GetBlockByHeight(height uint64) (*Block, error) {
+    data, err := l.GetBytes(blockKeyByHeight(height))
+    if err != nil {
+        return nil, err
+    }
+
+    data, err = compressor.DecompressZSTD(data)
+    if err != nil {
+        return nil, err
+    }
+
+    var blk Block
+    if err := cbor.Unmarshal(data, &blk); err != nil {
+        return nil, err
+    }
+    return &blk, nil
+}
+
+func (l *Ledger) AddBlock(blk *Block) error {
+    return l.ApplyBlock(blk)
+}
+
+// DumpLedger prints all blocks in the database and detects corrupted blocks.
+// Useful for debugging and verifying blockchain integrity.
+func (l *Ledger) DumpLedger() error {
+    if l == nil || l.db == nil {
+        return fmt.Errorf("ledger not initialized")
+    }
+
+    fmt.Println("📜 ====== LEDGER DUMP START ======")
+    count := 0
+    var prevHash string
+
+    // Iterate through all blocks
+    err := l.IterateBlocks(func(b *Block) error {
+        // Recompute the block hash to check integrity
+        computedHash := b.ComputeFinalHash()
+        isCorrupt := false
+
+        if b.BlockHash != computedHash {
+            fmt.Printf("❌ Block #%d has invalid hash!\n", b.Header.Height)
+            fmt.Printf("   Expected: %s\n", computedHash)
+            fmt.Printf("   Found   : %s\n", b.BlockHash)
+            isCorrupt = true
+        }
+
+        // Check previous hash consistency (except for genesis block)
+        if b.Header.Height > 0 && b.Header.PrevHash != prevHash {
+            fmt.Printf("❌ Block #%d has mismatched PrevHash!\n", b.Header.Height)
+            fmt.Printf("   Expected PrevHash: %s\n", prevHash)
+            fmt.Printf("   Found PrevHash   : %s\n", b.Header.PrevHash)
+            isCorrupt = true
+        }
+
+        // Print block info
+        fmt.Printf("🔗 Block #%d %s\n", b.Header.Height, func() string {
+            if isCorrupt {
+                return "(CORRUPTED)"
+            }
+            return ""
+        }())
+        fmt.Printf("   ⏱️  Timestamp: %d\n", b.Header.Timestamp)
+        fmt.Printf("   👤 Miner: %s\n", b.Header.MinerAddress)
+        fmt.Printf("   🔑 PrevHash: %s\n", b.Header.PrevHash)
+        fmt.Printf("   🧾 Hash: %s\n", b.BlockHash)
+        fmt.Printf("   💰 Transactions: %d\n", len(b.Transactions))
+        fmt.Println("   -----------------------------")
+
+        // Update prevHash for next block check
+        prevHash = b.BlockHash
+        count++
+        return nil
+    })
+
+    if err != nil {
+        return fmt.Errorf("failed to iterate blocks: %v", err)
+    }
+
+    if count == 0 {
+        fmt.Println("⚠️ No blocks found in the ledger.")
+    } else {
+        fmt.Printf("✅ %d blocks found in the ledger.\n", count)
+    }
+
+    fmt.Println("📜 ====== LEDGER DUMP END ======")
+    return nil
+}
