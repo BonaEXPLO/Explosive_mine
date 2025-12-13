@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"math/rand"
 	"net"
 	"sync"
@@ -39,35 +38,39 @@ func init() {
 // PeerID is a string identifier for a peer (could be hex/base58).
 type PeerID string
 
-// Peer represents a remote peer connection, its outgoing queue and lifecycle.
+// Peer represents a remote peer connection, its outgoing queue, lifecycle, and blockchain state.
 type Peer struct {
-	id   PeerID
-	addr string
+    id   PeerID
+    addr string
 
-	// underlying network connection (may be nil until connected)
-	conn net.Conn
+    // underlying network connection (may be nil until connected)
+    conn net.Conn
 
-	// back reference to owning node (same package)
-	node *Node
+    // back reference to owning node (same package)
+    node *Node
 
-	// outgoing send queue (encoded envelopes)
-	sendQ chan []byte
+    // outgoing send queue (encoded envelopes)
+    sendQ chan []byte
 
-	// cancellation and lifecycle
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+    // cancellation and lifecycle
+    ctx    context.Context
+    cancel context.CancelFunc
+    wg     sync.WaitGroup
 
-	// metadata protected by mu
-	mu        sync.RWMutex
-	connected bool
-	lastSeen  time.Time
+    // metadata protected by mu
+    mu        sync.RWMutex
+    connected bool
+    lastSeen  time.Time
 
-	// anti-abuse / scoring
-	score    int
-	banUntil time.Time
-	errCount int
+    // anti-abuse / scoring
+    score    int
+    banUntil time.Time
+    errCount int
+
+    // blockchain info
+    LatestHeight uint64
 }
+
 
 // NewPeer constructs a Peer object (not connected).
 // It reads queue sizing from node.config.SendQueueSize.
@@ -155,47 +158,53 @@ func (p *Peer) backoffDial(ctx context.Context) (net.Conn, error) {
 // It uses Node.config.DialTimeout for dial timeout.
 // Subsequent calls when already connected are no-op.
 func (p *Peer) Connect() error {
-	// quick check
-	p.mu.RLock()
-	if p.connected && p.conn != nil {
-		p.mu.RUnlock()
-		return nil
-	}
-	p.mu.RUnlock()
+    p.mu.Lock()
+    if p.connected && p.conn != nil {
+        p.mu.Unlock()
+        return nil
+    }
+    if p.IsBanned() {
+        ban := p.banUntil
+        p.mu.Unlock()
+        return fmt.Errorf("peer %s is banned until %s", p.addr, ban.String())
+    }
+    p.mu.Unlock()
 
-	// check ban
-	if p.IsBanned() {
-		return fmt.Errorf("peer %s is banned until %s", p.addr, p.banUntil.String())
-	}
+    ctx, cancel := context.WithCancel(p.ctx)
+    defer cancel()
 
-	// use context with cancel so backoffDial can observe cancellation
-	ctx, cancel := context.WithCancel(p.ctx)
-	defer cancel()
+    conn, err := p.backoffDial(ctx)
+    if err != nil {
+        return err
+    }
 
-	// try dialing with backoff
-	conn, err := p.backoffDial(ctx)
-	if err != nil {
-		return err
-	}
+    p.mu.Lock()
+    p.conn = conn
+    p.connected = true
+    p.lastSeen = time.Now()
+    p.mu.Unlock()
 
-	p.mu.Lock()
-	p.conn = conn
-	p.connected = true
-	p.lastSeen = time.Now()
-	p.mu.Unlock()
+    p.wg.Add(2)
+    go p.readLoop()
+    go p.writeLoop()
 
-	// start read/write loops
-	p.wg.Add(2)
-	go p.readLoop()
-	go p.writeLoop()
+    // handshake with timeout
+    done := make(chan error, 1)
+    go func() {
+        done <- p.sendHandshake()
+    }()
+    select {
+    case err := <-done:
+        if err != nil {
+            p.Close()
+            return fmt.Errorf("handshake failed: %w", err)
+        }
+    case <-time.After(10 * time.Second):
+        p.Close()
+        return errors.New("handshake timeout")
+    }
 
-	// send handshake synchronously; if fails, close and return error
-	if err := p.sendHandshake(); err != nil {
-		p.Close()
-		return err
-	}
-
-	return nil
+    return nil
 }
 
 // sendHandshake sends the local node's handshake to the peer.
@@ -221,86 +230,88 @@ func (p *Peer) sendHandshake() error {
 
 // SendEnvelope serializes the envelope and enqueues it for sending.
 // Non-blocking: when send queue is full we drop-oldest then enqueue.
+
+// SendEnvelope serializes and enqueues an envelope for sending.
+// Ensures TX messages are flushed immediately (no drop/silent loss).
 func (p *Peer) SendEnvelope(e *Envelope) error {
-	if p.node == nil {
-		return errors.New("missing node reference")
-	}
-	b, err := EncodeEnvelope(e)
-	if err != nil {
-		return err
-	}
-	// enforce max message size
-	max := p.node.config.MaxMsgSize
-	if max <= 0 {
-		max = 4 * 1024 * 1024 // sane default 4MB
-	}
-	if len(b) > max {
-		return fmt.Errorf("message too large %d > %d", len(b), max)
-	}
+    if p.node == nil {
+        return errors.New("missing node reference")
+    }
 
-	// If peer closed
-	select {
-	case <-p.ctx.Done():
-		return errors.New("peer closed")
-	default:
-	}
+    b, err := EncodeEnvelope(e)
+    if err != nil {
+        return fmt.Errorf("encode envelope: %w", err)
+    }
 
-	// attempt to enqueue
-	select {
-	case p.sendQ <- b:
-		return nil
-	default:
-		// try drop oldest to free slot
-		select {
-		case <-p.sendQ:
-			// freed one slot
-			select {
-			case p.sendQ <- b:
-				return nil
-			default:
-				return errors.New("send queue busy after drop")
-			}
-		default:
-			return errors.New("send queue full")
-		}
-	}
+    // Respect max message size
+    max := p.node.config.MaxMsgSize
+    if max <= 0 {
+        max = 4 * 1024 * 1024
+    }
+    if len(b) > max {
+        return fmt.Errorf("message too large: %d > %d", len(b), max)
+    }
+
+    select {
+    case <-p.ctx.Done():
+        return errors.New("peer closed")
+    default:
+    }
+
+    // TX messages: priorité, jamais drop
+    if e.Type == MsgTypeTx {
+        select {
+        case p.sendQ <- b:
+            return nil
+        default:
+            // si queue pleine, on augmente le score d'erreur
+            p.Penalize(1, 0)
+            return errors.New("TX queue full")
+        }
+    }
+
+    // Messages normaux: drop oldest si nécessaire
+    for {
+        select {
+        case p.sendQ <- b:
+            return nil
+        default:
+            // Drop oldest pour faire de la place
+            select {
+            case <-p.sendQ:
+            default:
+                // impossible de drop, on retourne erreur
+                return errors.New("send queue full, cannot enqueue")
+            }
+        }
+    }
 }
 
 // Close gracefully shuts down peer: cancels context, closes conn and waits loops.
 func (p *Peer) Close() {
-	p.mu.Lock()
-	// idempotent check
-	if !p.connected && p.conn == nil {
-		// still cancel context to wake any waiters
-		if p.cancel != nil {
-			p.cancel()
-		}
-		p.mu.Unlock()
-		return
-	}
-	if p.cancel != nil {
-		p.cancel()
-	}
-	if p.conn != nil {
-		_ = p.conn.Close()
-	}
-	p.connected = false
-	p.conn = nil
-	p.mu.Unlock()
+    p.mu.Lock()
+    if !p.connected && p.conn == nil {
+        if p.cancel != nil { p.cancel() }
+        p.mu.Unlock()
+        return
+    }
+    if p.cancel != nil { p.cancel() }
+    if p.conn != nil { _ = p.conn.Close() }
+    p.connected = false
+    p.conn = nil
+    p.mu.Unlock()
 
-	// wait loops to finish
-	p.wg.Wait()
-
-	// drain sendQ to avoid goroutine leaks on re-use
+    // drain sendQ
 cleanup:
-	for {
-		select {
-		case <-p.sendQ:
-			// continue draining
-		default:
-			break cleanup
-		}
-	}
+    for {
+        select {
+        case <-p.sendQ:
+        default:
+            break cleanup
+        }
+    }
+
+    p.wg.Wait()
 }
 
 // getConn returns the underlying connection under read lock.
@@ -312,199 +323,181 @@ func (p *Peer) getConn() net.Conn {
 
 // readLoop reads framed messages from the peer and dispatches them to node handlers.
 // Frame format: 4-byte big-endian length followed by CBOR payload.
+
+// readLoop continuously reads framed messages and dispatches them.
 func (p *Peer) readLoop() {
-	defer p.wg.Done()
-	conn := p.getConn()
-	if conn == nil {
-		return
-	}
-	r := bufio.NewReader(conn)
+    defer p.wg.Done()
+    for {
+        select {
+        case <-p.ctx.Done():
+            return
+        default:
+        }
 
-	for {
-		// stop if requested
-		select {
-		case <-p.ctx.Done():
-			return
-		default:
-		}
+        conn := p.getConn()
+        if conn == nil {
+            return
+        }
+        r := bufio.NewReader(conn)
 
-		// apply read deadline if configured
-		if c, ok := conn.(interface{ SetReadDeadline(time.Time) error }); ok {
-			rd := 60 * time.Second
-			if p.node != nil && p.node.config.ConnReadTimeout > 0 {
-				rd = p.node.config.ConnReadTimeout
-			}
-			_ = c.SetReadDeadline(time.Now().Add(rd))
-		}
+        var lenBuf [4]byte
+        if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+            if err != io.EOF {
+                log.Printf("peer %s read header error: %v", p.addr, err)
+            }
+            if p.node != nil {
+                p.node.handlePeerDisconnect(p)
+            }
+            return
+        }
 
-		// read 4-byte length prefix
-		var lenBuf [4]byte
-		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-			if err != io.EOF {
-				log.Printf("peer %s read header error: %v", p.addr, err)
-			}
-			// notify node for cleanup
-			if p.node != nil {
-				p.node.handlePeerDisconnect(p)
-			}
-			return
-		}
-		msgLen := int(binary.BigEndian.Uint32(lenBuf[:]))
+        msgLen := int(binary.BigEndian.Uint32(lenBuf[:]))
+        if msgLen <= 0 || msgLen > 4*1024*1024 {
+            log.Printf("peer %s invalid msgLen %d", p.addr, msgLen)
+            if p.node != nil {
+                p.node.handlePeerDisconnect(p)
+            }
+            return
+        }
 
-		// validate size
-		max := 4 * 1024 * 1024
-		if p.node != nil && p.node.config.MaxMsgSize > 0 {
-			max = p.node.config.MaxMsgSize
-		}
-		if msgLen <= 0 || msgLen > max {
-			log.Printf("peer %s invalid msgLen %d (max %d)", p.addr, msgLen, max)
-			if p.node != nil {
-				p.node.handlePeerDisconnect(p)
-			}
-			return
-		}
+        payload := make([]byte, msgLen)
+        if _, err := io.ReadFull(r, payload); err != nil {
+            log.Printf("peer %s read payload error: %v", p.addr, err)
+            if p.node != nil {
+                p.node.handlePeerDisconnect(p)
+            }
+            return
+        }
 
-		// read payload
-		payload := make([]byte, msgLen)
-		if _, err := io.ReadFull(r, payload); err != nil {
-			log.Printf("peer %s read payload error: %v", p.addr, err)
-			if p.node != nil {
-				p.node.handlePeerDisconnect(p)
-			}
-			return
-		}
+        env, err := DecodeEnvelope(payload)
+        if err != nil {
+            log.Printf("peer %s decode error: %v", p.addr, err)
+            continue
+        }
+        if err := ValidateEnvelope(env); err != nil {
+            log.Printf("peer %s invalid envelope: %v", p.addr, err)
+            continue
+        }
 
-		// decode envelope
-		env, err := DecodeEnvelope(payload)
-		if err != nil {
-			// decode errors are not fatal by themselves
-			log.Printf("peer %s decode error: %v", p.addr, err)
-			continue
-		}
-		// basic validation
-		if err := ValidateEnvelope(env); err != nil {
-			log.Printf("peer %s invalid envelope: %v", p.addr, err)
-			continue
-		}
+        p.mu.Lock()
+        p.lastSeen = time.Now()
+        p.mu.Unlock()
 
-		// update last seen
-		p.mu.Lock()
-		p.lastSeen = time.Now()
-		p.mu.Unlock()
-
-		// dispatch to node (non-blocking). node.handleIncomingEnvelope will enqueue/buffer.
-		if p.node != nil {
-			p.node.handleIncomingEnvelope(p, env)
-		}
-	}
+        if p.node != nil {
+            p.node.handleIncomingEnvelope(p, env)
+        }
+    }
 }
-
 // writeLoop consumes sendQ and writes framed messages to the connection.
 // Writes are batched and flushed periodically to increase throughput.
 func (p *Peer) writeLoop() {
-	defer p.wg.Done()
-	conn := p.getConn()
-	if conn == nil {
-		return
-	}
-	// buffered writer with a reasonable size
-	w := bufio.NewWriterSize(conn, 64*1024)
-	// adaptive flush interval (configurable)
-	flushInterval := 100 * time.Millisecond
-	if p.node != nil && p.node.config.FlushInterval > 0 {
-		flushInterval = p.node.config.FlushInterval
-	}
-	flushTicker := time.NewTicker(flushInterval)
-	defer flushTicker.Stop()
+    defer p.wg.Done()
+    conn := p.getConn()
+    if conn == nil {
+        return
+    }
+    w := bufio.NewWriterSize(conn, 64*1024)
+    flushTicker := time.NewTicker(100 * time.Millisecond)
+    defer flushTicker.Stop()
 
-	var pending [][]byte
-	var pendingBytes int
+    var pending [][]byte
+    var pendingBytes int
 
-	flush := func() error {
-		if len(pending) == 0 {
-			return nil
-		}
-		// ensure write deadline
-		if c, ok := conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
-			wd := 30 * time.Second
-			if p.node != nil && p.node.config.ConnWriteTimeout > 0 {
-				wd = p.node.config.ConnWriteTimeout
-			}
-			_ = c.SetWriteDeadline(time.Now().Add(wd))
-		}
-		for _, b := range pending {
-			ln := uint32(len(b))
-			lenBuf := []byte{byte(ln >> 24), byte(ln >> 16), byte(ln >> 8), byte(ln)}
-			if _, err := w.Write(lenBuf); err != nil {
-				return err
-			}
-			if _, err := w.Write(b); err != nil {
-				return err
-			}
-		}
-		if err := w.Flush(); err != nil {
-			return err
-		}
-		pending = pending[:0]
-		pendingBytes = 0
-		return nil
-	}
+    flush := func() error {
+        if len(pending) == 0 {
+            return nil
+        }
+        if c, ok := conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+            _ = c.SetWriteDeadline(time.Now().Add(30 * time.Second))
+        }
+        for _, b := range pending {
+            // encode length prefix correctly
+            var lenBuf [4]byte
+            binary.BigEndian.PutUint32(lenBuf[:], uint32(len(b)))
 
-	// protect against unbounded memory: cap batch size
-	maxBatchBytes := 64 * 1024
-	if p.node != nil {
-		nodeMax := p.node.config.SendQueueSize * 1024
-		if nodeMax > maxBatchBytes {
-			maxBatchBytes = int(math.Min(float64(nodeMax), 512*1024))
-		}
-	}
+            if _, err := w.Write(lenBuf[:]); err != nil {
+                return err
+            }
+            if _, err := w.Write(b); err != nil {
+                return err
+            }
+        }
+        if err := w.Flush(); err != nil {
+            return err
+        }
+        pending = pending[:0]
+        pendingBytes = 0
+        return nil
+    }
 
-	for {
-		select {
-		case <-p.ctx.Done():
-			// flush then exit
-			_ = flush()
-			return
-		case b := <-p.sendQ:
-			// if peer got banned while waiting, drop messages
-			if p.IsBanned() {
-				// discard message silently
-				continue
-			}
-			pending = append(pending, b)
-			pendingBytes += len(b)
-			// urgent flush if size limit reached
-			urgentThreshold := maxBatchBytes
-			if urgentThreshold <= 0 {
-				urgentThreshold = 64 * 1024
-			}
-			if pendingBytes >= urgentThreshold || len(pending) >= 128 {
-				if err := flush(); err != nil {
-					log.Printf("peer %s write flush error: %v", p.addr, err)
-					if p.node != nil {
-						p.node.handlePeerDisconnect(p)
-					}
-					return
-				}
-			}
-		case <-flushTicker.C:
-			// do a periodic flush but skip when nothing to write
-			if pendingBytes == 0 {
-				continue
-			}
-			if err := flush(); err != nil {
-				log.Printf("peer %s periodic flush error: %v", p.addr, err)
-				if p.node != nil {
-					p.node.handlePeerDisconnect(p)
-				}
-				return
-			}
-		}
-	}
+    for {
+        select {
+        case <-p.ctx.Done():
+            _ = flush()
+            return
+        case b := <-p.sendQ:
+            if p.IsBanned() {
+                continue
+            }
+            pending = append(pending, b)
+            pendingBytes += len(b)
+            // flush dès que 64 KB ou 128 messages
+            if pendingBytes >= 64*1024 || len(pending) >= 128 {
+                if err := flush(); err != nil {
+                    log.Printf("peer %s write flush error: %v", p.addr, err)
+                    if p.node != nil {
+                        p.node.handlePeerDisconnect(p)
+                    }
+                    return
+                }
+            }
+        case <-flushTicker.C:
+            if pendingBytes == 0 {
+                continue
+            }
+            if err := flush(); err != nil {
+                log.Printf("peer %s periodic flush error: %v", p.addr, err)
+                if p.node != nil {
+                    p.node.handlePeerDisconnect(p)
+                }
+                return
+            }
+        }
+    }
 }
-
 // RequestBlocksSince asks the peer for blocks starting from a specific height.
 func (p *Peer) RequestBlocksSince(height uint64) ([]*ledger.Block, error) {
     // TODO: implement actual P2P request (RPC / gRPC / HTTP)
     return nil, fmt.Errorf("RequestBlocksSince not implemented")
+}
+
+// internal/p2p/peer.go
+
+func (p *Peer) SendData(data []byte) error {
+    if p == nil || !p.IsConnected() {
+        return fmt.Errorf("peer not connected")
+    }
+
+    env := &Envelope{
+        Version:   1,
+        Type:      MsgTypeCustomData,
+        Payload:   data,
+        Timestamp: time.Now().UnixMilli(),
+    }
+    return p.SendEnvelope(env)
+}
+
+// GetLatestBlockHeight returns the last known block height of the peer
+func (p *Peer) GetLatestBlockHeight() (uint64, error) {
+    if p.LatestHeight == 0 {
+        return 0, fmt.Errorf("peer height unknown")
+    }
+    return p.LatestHeight, nil
+}
+
+// RequestBlocksRange requests blocks from 'from' to 'to' (inclusive) from this peer.
+// Returns a slice of ledger.Block. For now, it's a stub; real implementation requires P2P request.
+func (p *Peer) RequestBlocksRange(from, to uint64) ([]*ledger.Block, error) {
+    // TODO: implement real P2P request
+    return []*ledger.Block{}, nil
 }

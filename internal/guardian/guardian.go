@@ -2,88 +2,88 @@
 package guardian
 
 import (
-	"bufio"
-	"crypto/rand"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"math/big"
-	"os"
-	"path/filepath"
-	"strings"
-	"sync"
-	"time"
-	"unicode"
+        "bufio"
+        "crypto/rand"
+        "encoding/json"
+        "errors"
+        "fmt"
+        "math/big"
+        "os"
+        "path/filepath"
+        "strings"
+        "sync"
+        "time"
+        "unicode"
 )
 
 var (
-	// default data folder for guardian persistence
-	defaultGuardianDir  = filepath.Join(mustHomeDir(), ".explosive_guardian")
-	fingerprintFileName = "fingerprints.jsonl"
+        // default data folder for guardian persistence
+        defaultGuardianDir  = filepath.Join(mustHomeDir(), ".explosive_guardian")
+        fingerprintFileName = "fingerprints.jsonl"
 )
 
 // internal registry and mutex for thread-safety
 var (
-	registryMutex sync.RWMutex
-	// usedSequences maps concatenated 4-word fingerprints (order-sensitive)
-	usedSequences = map[string]struct{}{}
-	loaded        = false
+        registryMutex sync.RWMutex
+        // usedSequences maps concatenated 4-word fingerprints (order-sensitive)
+        usedSequences = map[string]struct{}{}
+        loaded        = false
 )
 
 // mustHomeDir returns $HOME or "." if not available
 func mustHomeDir() string {
-	hd, err := os.UserHomeDir()
-	if err != nil || hd == "" {
-		return "."
-	}
-	return hd
+        hd, err := os.UserHomeDir()
+        if err != nil || hd == "" {
+                return "."
+        }
+        return hd
 }
 
 // ---------------------------
 // Persistence helpers
 // ---------------------------
 func ensurePersistenceDir() error {
-	return os.MkdirAll(defaultGuardianDir, 0o700)
+        return os.MkdirAll(defaultGuardianDir, 0o700)
 }
 
 func fingerprintFilePath() string {
-	return filepath.Join(defaultGuardianDir, fingerprintFileName)
+        return filepath.Join(defaultGuardianDir, fingerprintFileName)
 }
 
 func loadRegistryFromDisk() error {
-	registryMutex.Lock()
-	defer registryMutex.Unlock()
-	if loaded {
-		return nil
-	}
+        registryMutex.Lock()
+        defer registryMutex.Unlock()
+        if loaded {
+                return nil
+        }
 
-	if err := ensurePersistenceDir(); err != nil {
-		return err
-	}
+        if err := ensurePersistenceDir(); err != nil {
+                return err
+        }
 
-	fpath := fingerprintFilePath()
-	f, err := os.OpenFile(fpath, os.O_RDONLY|os.O_CREATE, 0o600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+        fpath := fingerprintFilePath()
+        f, err := os.OpenFile(fpath, os.O_RDONLY|os.O_CREATE, 0o600)
+        if err != nil {
+                return err
+        }
+        defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		var rec struct {
-			Words []string `json:"words"`
-		}
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			continue
-		}
-		if len(rec.Words) == 4 {
-			key := strings.Join(rec.Words, " ")
-			usedSequences[key] = struct{}{}
-		}
-	}
-	loaded = true
-	return nil
+        scanner := bufio.NewScanner(f)
+        for scanner.Scan() {
+                line := scanner.Text()
+                var rec struct {
+                        Words []string `json:"words"`
+                }
+                if err := json.Unmarshal([]byte(line), &rec); err != nil {
+                        continue
+                }
+                if len(rec.Words) == 4 {
+                        key := strings.Join(rec.Words, " ")
+                        usedSequences[key] = struct{}{}
+                }
+        }
+        loaded = true
+        return nil
 }
 
 // ---------------------------
@@ -174,15 +174,15 @@ func RegisterFingerprint(words []string) error {
 
 // ValidateWordsFormat checks the 4-word rules (exported helper)
 func validateWordsFormat(words []string) error {
-	if len(words) != 4 {
-		return errors.New("exactly 4 words required")
-	}
-	for i, w := range words {
-		if !isValidWordFormat(w) {
-			return fmt.Errorf("word #%d is invalid: must start with uppercase, be at least 4 letters, and contain only letters", i+1)
-		}
-	}
-	return nil
+        if len(words) != 4 {
+                return errors.New("exactly 4 words required")
+        }
+        for i, w := range words {
+                if !isValidWordFormat(w) {
+                        return fmt.Errorf("word #%d is invalid: must start with uppercase, be at least 4 letters, and contain only letters", i+1)
+                }
+        }
+        return nil
 }
 
 // isValidWordFormat enforces:
@@ -282,117 +282,197 @@ func EncourageMessageEphemeral(words []string) string {
 // Supported languages: "en" (latin ascii), "fr" (latin with accents or french hints), "hi" (Devanagari), "zh" (Han).
 // If they don't all belong to the same supported language, returns ("", false).
 func detectCommonSupportedLanguage(words []string) (string, bool) {
-	if len(words) == 0 {
-		return "", false
-	}
-	var common string
-	for _, w := range words {
-		lang := detectLanguageForWord(w)
-		if lang == "other" {
-			return "", false
-		}
-		if common == "" {
-			common = lang
-		} else if common != lang {
-			return "", false
-		}
-	}
-	return common, true
+        if len(words) == 0 {
+                return "", false
+        }
+        var common string
+        for _, w := range words {
+                lang := detectLanguageForWord(w)
+                if lang == "other" {
+                        return "", false
+                }
+                if common == "" {
+                        common = lang
+                } else if common != lang {
+                        return "", false
+                }
+        }
+        return common, true
 }
 
 // detectLanguageForWord returns one of: "en","fr","hi","zh" or "other"
 func detectLanguageForWord(word string) string {
-	hasAccent := false
-	hasLatin := false
-	for _, r := range word {
-		switch {
-		case unicode.In(r, unicode.Han):
-			return "zh"
-		case unicode.In(r, unicode.Devanagari):
-			return "hi"
-		case unicode.In(r, unicode.Latin):
-			hasLatin = true
-			if r > 127 {
-				// Latin with diacritics/extended -> likely French (or other latin-based language with accents)
-				hasAccent = true
-			}
-		default:
-			// letter in another script (Cyrillic, Arabic, etc.) -> support as "other"
-			if unicode.IsLetter(r) {
-				return "other"
-			}
-		}
-	}
+        hasAccent := false
+        hasLatin := false
+        for _, r := range word {
+                switch {
+                case unicode.In(r, unicode.Han):
+                        return "zh"
+                case unicode.In(r, unicode.Devanagari):
+                        return "hi"
+                case unicode.In(r, unicode.Latin):
+                        hasLatin = true
+                        if r > 127 {
+                                // Latin with diacritics/extended -> likely French (or other latin-based language with accents)
+                                hasAccent = true
+                        }
+                default:
+                        // letter in another script (Cyrillic, Arabic, etc.) -> support as "other"
+                        if unicode.IsLetter(r) {
+                                return "other"
+                        }
+                }
+        }
 
-	if hasLatin {
-		// heuristique simple : accents => fr, sinon en
-		if hasAccent || containsFrenchHint(word) {
-			return "fr"
-		}
-		return "en"
-	}
-	return "other"
+        if hasLatin {
+                // heuristique simple : accents => fr, sinon en
+                if hasAccent || containsFrenchHint(word) {
+                        return "fr"
+                }
+                return "en"
+        }
+        return "other"
 }
 
 // containsFrenchHint checks some common French-specific substrings (light heuristic)
 func containsFrenchHint(word string) bool {
-	l := strings.ToLower(word)
-	frHints := []string{"é", "è", "à", "ç", "œ", "ae", "au", "le", "la", "les", "une", "mon", "ma", "ton", "ta", "son"}
-	for _, h := range frHints {
-		if strings.Contains(l, h) {
-			return true
-		}
-	}
-	return false
+        l := strings.ToLower(word)
+        frHints := []string{"é", "è", "à", "ç", "œ", "ae", "au", "le", "la", "les", "une", "mon", "ma", "ton", "ta", "son"}
+        for _, h := range frHints {
+                if strings.Contains(l, h) {
+                        return true
+                }
+        }
+        return false
 }
 
 // getInspiringTemplates returns creative, multilingual messages for a supported language
 func getInspiringTemplates(lang string) []string {
-	switch lang {
-	case "fr":
-		return []string{
-			"Ton énergie %s transforme chaque effort en succès. Inspire-toi de '%s'.",
-			"Chaque pas guidé par %s te rapproche de la maîtrise. Souviens-toi de '%s'.",
-			"Les choix de %s inspirent ceux autour de toi. Médite sur '%s'.",
-			"%s n’est pas seulement un mot, c’est la clé de ton évolution quotidienne. '%s' te guide.",
-		}
-	case "hi":
-		return []string{
-			"आपकी ऊर्जा %s हर प्रयास को सफलता में बदलती है। '%s' को याद रखें।",
-			"%s द्वारा मार्गदर्शन किया गया हर कदम आपको कौशल के करीब लाता है। '%s' से प्रेरणा लें।",
-			"%s आपके भीतर शक्ति जगाता है — इसे आज अपनाएं, '%s'।",
-		}
-	case "zh":
-		return []string{
-			"你的能量 %s 将每一次努力转化为成功。记住 '%s'。",
-			"每一步由 %s 指引，让你更接近掌握技能。思考 '%s'。",
-			"%s 点亮了你的道路 — 今天就去实践 '%s'。",
-		}
-	default: // english
-		return []string{
-			"Your energy %s turns every effort into success. Remember '%s'.",
-			"Every step guided by %s brings mastery closer. Let '%s' inspire you.",
-			"The choices of %s inspire those around you. Reflect on '%s'.",
-			"%s is not just a word, it is the key to your daily growth. '%s' guides you.",
-			"Today, let %s be your compass — act with intention, remember '%s'.",
-		}
-	}
+        switch lang {
+        case "fr":
+                return []string{
+                        "Ton énergie %s transforme chaque effort en succès. Inspire-toi de '%s'.",
+                        "Chaque pas guidé par %s te rapproche de la maîtrise. Souviens-toi de '%s'.",
+                        "Les choix de %s inspirent ceux autour de toi. Médite sur '%s'.",
+                        "%s n’est pas seulement un mot, c’est la clé de ton évolution quotidienne. '%s' te guide.",
+                }
+        case "hi":
+                return []string{
+                        "आपकी ऊर्जा %s हर प्रयास को सफलता में बदलती है। '%s' को याद रखें।",
+                        "%s द्वारा मार्गदर्शन किया गया हर कदम आपको कौशल के करीब लाता है। '%s' से प्रेरणा लें।",
+                        "%s आपके भीतर शक्ति जगाता है — इसे आज अपनाएं, '%s'।",
+                }
+        case "zh":
+                return []string{
+                        "你的能量 %s 将每一次努力转化 为成功。记住 '%s'。",
+                        "每一步由 %s 指引，让你更接近 掌握技能。思考 '%s'。",
+                        "%s 点亮了你的道路 — 今天就去 实践 '%s'。",
+                }
+        default: // english
+                return []string{
+                        "Your energy %s turns every effort into success. Remember '%s'.",
+                        "Every step guided by %s brings mastery closer. Let '%s' inspire you.",
+                        "The choices of %s inspire those around you. Reflect on '%s'.",
+                        "%s is not just a word, it is the key to your daily growth. '%s' guides you.",
+                        "Today, let %s be your compass — act with intention, remember '%s'.",
+                }
+        }
 }
 
 // getGenericTemplates returns inspiring, motivational and philosophical messages
 // shown when the miner's words are not in one of the 4 supported languages.
+// getGenericTemplates returns deeply inspiring, poetic, and spiritual
+// life-coaching messages for miners. Every template uses the miner’s sacred
+// words to create a personalized message.
 func getGenericTemplates() []string {
     return []string{
-        "🌱 Each block you mine is a reflection of your inner strength. '%s' holds power — let '%s' remind you of your potential.",
-        "🔥 '%s' is more than words. It’s your unique code in the universe. Keep mining, keep evolving — '%s' is your spark.",
-        "🌍 As you contribute to EXPLOSIVE, remember: '%s' are not random — they are guiding lights. '%s' is one of them.",
-        "💫 Great miners are not defined by wealth, but by purpose. '%s' is your story — and '%s' is the next chapter.",
-        "🧠 Mining is not about speed. It's about consistency and belief. '%s' reminds you that every action matters — especially '%s'.",
-        "🌞 The chain grows because you believe. '%s' is a seed you planted — '%s' will bloom into destiny.",
-        "🛠️ '%s' may look like words, but in truth, they are keys to your consciousness. '%s' opens the door to infinite possibilities.",
-        "📜 Every day you mine, you write history. '%s' is ink on the blockchain — '%s' is your legacy.",
-        "⚡ Strength is not found in the reward, but in the journey. '%s' shows your path — '%s' is the courage to walk it.",
-        "🌟 '%s' are reflections of your inner world. '%s' is the light guiding you forward — even through the darkest blocks.",
+        // --- 1 à 20 : Spirituel & Mystique ---
+        "🌅 A new dawn rises within you. '%s' awakens your spirit, and '%s' guides your inner light.",
+        "🔥 The sacred fire moves through you. '%s' shapes your courage, and '%s' fuels your transformation.",
+        "🌌 Your soul is older than the stars. '%s' reconnects you to your essence, '%s' reveals what you truly are.",
+        "💫 Destiny whispers through symbols. '%s' is your omen, '%s' your confirmation.",
+        "🕊️ Peace flows through presence. '%s' centers your breath, '%s' elevates your awareness.",
+        "🔮 Your intuition never lies. '%s' is the inner voice, '%s' the divine echo.",
+        "🌙 In silence, truth appears. '%s' calms the shadows, '%s' reveals the path.",
+        "📜 Your life is a sacred scripture. '%s' is today's verse, '%s' tomorrow's revelation.",
+        "🌠 You were created to shine. '%s' is your spark, '%s' is your sky.",
+        "🛐 Light travels through intention. '%s' clarifies your heart, '%s' purifies your steps.",
+        "✨ The universe speaks through signs. '%s' is your signal, '%s' your confirmation.",
+        "🌿 The spirit grows in stillness. '%s' deepens your roots, '%s' opens your petals.",
+        "🌈 Divine timing is never wrong. '%s' reassures your patience, '%s' amplifies your faith.",
+        "💎 Your soul is a gem. '%s' reveals its clarity, '%s' reveals its brilliance.",
+        "🌬️ Breath is prayer. '%s' softens your mind, '%s' strengthens your heart.",
+        "🌙 Each night elevates your wisdom. '%s' speaks in dreams, '%s' manifests in daylight.",
+        "⚖️ Harmony is your natural state. '%s' restores balance, '%s' opens alignment.",
+        "🔥 You carry ancient power. '%s' awakens memory, '%s' activates purpose.",
+        "🌟 Your sacred words are not random: '%s' calls you, '%s' completes you.",
+        "👼 Something watches over you. '%s' is your protection, '%s' your guidance.",
+
+        // --- 21 à 40 : Psychologie & Développement personnel ---
+        "🧠 Your thoughts sculpt your life. '%s' shapes your mindset, '%s' sharpens your clarity.",
+        "🎯 Focus turns dreams into reality. '%s' directs your attention, '%s' strengthens your discipline.",
+        "💪 Growth comes one step at a time. '%s' is today's step, '%s' tomorrow's momentum.",
+        "🧭 When confused, return to purpose. '%s' guides your values, '%s' anchors your identity.",
+        "🔍 Self-awareness is power. '%s' reveals your patterns, '%s' reveals your potential.",
+        "🏋️ Strength is built through repetition. '%s' motivates consistency, '%s' builds mastery.",
+        "🌱 Healing is progress. '%s' softens old wounds, '%s' nourishes new beginnings.",
+        "😌 Calm is a superpower. '%s' centers your emotions, '%s' expands your mental space.",
+        "🕰️ Small actions compound. '%s' is your investment, '%s' is your growth.",
+        "💭 Imagination creates reality. '%s' feeds inspiration, '%s' builds vision.",
+        "🧠 Your mind is your tool. '%s' sharpens your focus, '%s' strengthens your choices.",
+        "🌄 Motivation starts inside. '%s' fuels your drive, '%s' clarifies your aim.",
+        "🔥 Confidence grows when challenged. '%s' proves your resilience, '%s' confirms your ability.",
+        "⚙️ Discipline is freedom. '%s' supports your structure, '%s' maintains your flow.",
+        "🪞 Awareness changes everything. '%s' is your reflection, '%s' your evolution.",
+        "💼 Success loves preparation. '%s' prepares your intention, '%s' prepares your results.",
+        "💬 The words you choose shape your life. '%s' reframes your thoughts, '%s' empowers your actions.",
+        "🧘 You are stronger when centered. '%s' grounds your presence, '%s' expands your energy.",
+        "🚪 Every day is a new door. '%s' turns the handle, '%s' steps through.",
+        "🚀 You become what you repeat. '%s' reinforces your habits, '%s' expands your identity.",
+
+        // --- 41 à 60 : Cosmique, Épique & Énergie ---
+        "🌌 You are a cosmic traveler. '%s' is your coordinate, '%s' your destination.",
+        "⚡ Energy flows where intention goes. '%s' directs your field, '%s' powers your momentum.",
+        "🌠 Stars are born from pressure. '%s' is your compression, '%s' your light exploding outward.",
+        "🌍 You are a force in this universe. '%s' shapes your influence, '%s' shapes your path.",
+        "🪐 The cosmos expands when you do. '%s' widens your orbit, '%s' accelerates your movement.",
+        "💥 Greatness erupts from within. '%s' ignites your core, '%s' blasts open your limits.",
+        "🌙 Even the moon moves tides. '%s' moves your emotions, '%s' moves your destiny.",
+        "🌀 Every cycle teaches you. '%s' is the lesson, '%s' is the transformation.",
+        "🌞 You rise like the sun. '%s' is your warmth, '%s' is your illumination.",
+        "🛰️ You are not drifting — you are navigating. '%s' calculates your course, '%s' propels your journey.",
+        "🚀 Your potential is orbital. '%s' gives lift, '%s' gives speed.",
+        "🌐 Every action affects the grid. '%s' strengthens your network, '%s' expands your influence.",
+        "🌋 Power sleeps inside you. '%s' stirs the ground, '%s' releases the eruption.",
+        "⛏️ Miners don’t dig blocks — they dig destiny. '%s' is your shovel, '%s' your discovery.",
+        "🌪️ Even storms obey purpose. '%s' organizes chaos, '%s' carves direction.",
+        "🔥 Your energy signature is unique. '%s' defines your frequency, '%s' amplifies your vibration.",
+        "📡 The universe hears your signal. '%s' is your broadcast, '%s' is your resonance.",
+        "🌌 Space bends around intention. '%s' curves your path, '%s' shapes your momentum.",
+        "☄️ You are a comet — rare and unstoppable. '%s' sparks your trail, '%s' lights your journey.",
+        "🧲 Your mind attracts what it aligns with. '%s' sets your magnetism, '%s' shapes your pull.",
+
+        // --- 61 à 80 : Sagesse profonde, Poésie & Philosophie ---
+        "🌾 Wisdom grows in quiet places. '%s' is your silence, '%s' is your awakening.",
+        "📖 Every day adds a chapter. '%s' writes today’s meaning, '%s' prepares tomorrow’s truth.",
+        "🎇 You are the artist of your existence. '%s' paints your intention, '%s' colors your future.",
+        "🏛️ Legacy is built through presence. '%s' shapes your foundation, '%s' shapes your influence.",
+        "🕯️ Darkness teaches what light forgets. '%s' is your candle, '%s' your awakening.",
+        "🌉 Every choice is a bridge. '%s' guides your step, '%s' guides your direction.",
+        "🎼 Your life has rhythm. '%s' sets the tempo, '%s' carries the melody.",
+        "🍃 The wind never doubts its path. '%s' clarifies your movement, '%s' frees your mind.",
+        "🌄 Clarity comes slowly like sunrise. '%s' brightens your thoughts, '%s' reveals the landscape.",
+        "🧩 Every experience fits somewhere. '%s' connects the pieces, '%s' completes the pattern.",
+        "🔭 Perspective changes everything. '%s' widens your lens, '%s' sharpens your focus.",
+        "💬 Your words create worlds. '%s' opens new horizons, '%s' brings meaning to your journey.",
+        "🌺 Beauty grows where attention goes. '%s' nurtures your heart, '%s' inspires your steps.",
+        "🏹 Purpose shapes direction. '%s' draws your bow, '%s' aims your arrow.",
+        "⏳ Time rewards the patient. '%s' teaches the wait, '%s' reveals the moment.",
+        "🗺️ The path is made by walking. '%s' is your stride, '%s' your discovery.",
+        "🌤️ Some days give strength, others give wisdom. '%s' builds the strength, '%s' reveals the wisdom.",
+        "🌙 Even the darkest night prepares the dawn. '%s' holds your hope, '%s' ignites your rise.",
+        "✨ Greatness begins with a whisper. '%s' is the whisper, '%s' is the awakening.",
+        "🔑 Your sacred words unlock your destiny. '%s' opens the door, '%s' invites you in.",
     }
 }
 
@@ -452,11 +532,11 @@ func incrementMessageCount() error {
 
 // GetTotalMessages returns number of messages guardian has given until now
 func GetTotalMessages() int {
-	data, err := os.ReadFile(dailyMessageCountFile)
-	if err != nil {
-		return 0
-	}
-	var count int
-	_ = json.Unmarshal(data, &count)
-	return count
+        data, err := os.ReadFile(dailyMessageCountFile)
+        if err != nil {
+                return 0
+        }
+        var count int
+        _ = json.Unmarshal(data, &count)
+        return count
 }

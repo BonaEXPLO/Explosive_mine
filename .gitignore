@@ -1,29 +1,63 @@
-# Ledger / Badger DB
-/internal/ledger/
+############################
+# 🚫 DATA / RUNTIME
+############################
+
+# Ledger runtime DB / snapshots
 ledgerdb/
+data/
+.explosive/
 *.vlog
 *.badger
 MANIFEST
 LOCK
 KEYREGISTRY
 DISCARD
+*.slex
 
-# Clés privées
-/internal/keys/
+# Backups & exports
+*.dat
+*.backup
+*.tar.gz
+*.zip
+
+############################
+# 🔐 SECRETS / KEYS
+############################
+
+# Private keys / sensitive identity
 *.pem
 *.key
-
-# Conscience Fingerprint / mots
+/internal/keys/
+/internal/config/*.json
 /internal/guardian/fingerprint.json
 
-# Configs secrets
-/internal/config/*.json
+############################
+# 🧱 BINARIES / BUILDS
+############################
 
-# Build / binaires
+ledgerapp
+walletapp
+p2pnode
+explosive-server
+explosive-for-seed
+
 /bin/
 obj/
 *.exe
 *.apk
 
-# Logs
+############################
+# 📜 LOGS / TEMP
+############################
+
 *.log
+*.tmp
+seed.pid
+
+############################
+# 🧹 OS / EDITORS
+############################
+
+.DS_Store
+.idea/
+.vscode/

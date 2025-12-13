@@ -3,31 +3,31 @@ package wallet
 
 import (
     "crypto/ed25519"
-    "encoding/hex"
     "encoding/base64"
+    "encoding/hex"
     "errors"
     "fmt"
     "strings"
 
+    "github.com/fxamacker/cbor/v2"
     "github.com/tyler-smith/go-bip39"
-    "github.com/fxamacker/cbor/v2" // <-- CBOR library
+
     "explosive/internal/address"
+    "explosive/internal/encryption"
 )
 
 // Wallet represents a user wallet for the EXPLOSIVE blockchain.
-// The mnemonic is no longer stored in plaintext; it is stored encrypted inside EncryptedPriv.
 type Wallet struct {
-    PublicKeyHex  string           `cbor:"public_key_hex"`  // hex encoded public key
-    Address       string           `cbor:"address"`
-    Mnemonic      string           `cbor:"mnemonic,omitempty"` // Deprecated, never stored plaintext
-    EncryptedPriv *EncryptedWallet `cbor:"encrypted_priv"`      // Encrypted private key + mnemonic
+    PublicKeyHex  string                     `cbor:"public_key_hex"`
+    Address       string                     `cbor:"address"`
+    Mnemonic      string                     `cbor:"mnemonic,omitempty"` // Deprecated
+    EncryptedPriv *encryption.EncryptedWallet `cbor:"encrypted_priv"`
 
-    // For Ledger synchronization
     BalanceEXP float64 `cbor:"balance_exp"`
     BalanceIM  float64 `cbor:"balance_im"`
 }
 
-// validatePassword enforces a strong password policy for NEW passwords.
+// validatePassword ensures a strong password policy.
 func validatePassword(password string) error {
     if len(password) < 8 {
         return errors.New("password must be at least 8 characters")
@@ -51,7 +51,7 @@ func validatePassword(password string) error {
     return nil
 }
 
-// CreateWallet creates a new wallet, encrypts the private key + mnemonic using the password.
+// CreateWallet generates a new wallet and encrypts the private key + mnemonic.
 func CreateWallet(password string) (*Wallet, error) {
     if err := validatePassword(password); err != nil {
         return nil, err
@@ -61,6 +61,7 @@ func CreateWallet(password string) (*Wallet, error) {
     if err != nil {
         return nil, fmt.Errorf("failed to generate entropy: %w", err)
     }
+
     mnemonic, err := bip39.NewMnemonic(entropy)
     if err != nil {
         return nil, fmt.Errorf("failed to generate mnemonic: %w", err)
@@ -72,14 +73,12 @@ func CreateWallet(password string) (*Wallet, error) {
 
     addr := address.GenerateEXPLOAddress(pub)
 
-    encPriv, err := EncryptWallet(priv, mnemonic, password)
-    if err != nil {
-        return nil, err
-    }
-
-    // Zero sensitive memory
+    encPriv, err := encryption.EncryptWallet(priv, mnemonic, password)
     for i := range priv {
         priv[i] = 0
+    }
+    if err != nil {
+        return nil, err
     }
 
     return &Wallet{
@@ -92,7 +91,7 @@ func CreateWallet(password string) (*Wallet, error) {
     }, nil
 }
 
-// RestoreWalletByMnemonic restores wallet from mnemonic and encrypts it with password.
+// RestoreWalletByMnemonic restores a wallet from a mnemonic.
 func RestoreWalletByMnemonic(mnemonic, password string) (*Wallet, error) {
     if !bip39.IsMnemonicValid(mnemonic) {
         return nil, errors.New("invalid mnemonic")
@@ -104,16 +103,14 @@ func RestoreWalletByMnemonic(mnemonic, password string) (*Wallet, error) {
     seed := bip39.NewSeed(mnemonic, "")
     priv := ed25519.NewKeyFromSeed(seed[:32])
     pub := priv.Public().(ed25519.PublicKey)
-
     addr := address.GenerateEXPLOAddress(pub)
 
-    encPriv, err := EncryptWallet(priv, mnemonic, password)
-    if err != nil {
-        return nil, err
-    }
-
+    encPriv, err := encryption.EncryptWallet(priv, mnemonic, password)
     for i := range priv {
         priv[i] = 0
+    }
+    if err != nil {
+        return nil, err
     }
 
     return &Wallet{
@@ -126,19 +123,19 @@ func RestoreWalletByMnemonic(mnemonic, password string) (*Wallet, error) {
     }, nil
 }
 
-// RevealMnemonic returns the mnemonic only if the provided password decrypts the encrypted blob.
+// RevealMnemonic returns the mnemonic if password is correct.
 func (w *Wallet) RevealMnemonic(password string) (string, error) {
     if w.EncryptedPriv == nil {
         return "", errors.New("no encrypted data available")
     }
-    _, mnemonic, err := DecryptWallet(w.EncryptedPriv, password)
+    _, mnemonic, err := encryption.DecryptWallet(w.EncryptedPriv, password)
     if err != nil {
         return "", err
     }
     return mnemonic, nil
 }
 
-// ChangePassword changes encryption password by decrypting with old password and re-encrypting with new.
+// ChangePassword updates the wallet password.
 func (w *Wallet) ChangePassword(oldPassword, newPassword string) error {
     if w.EncryptedPriv == nil {
         return errors.New("no encrypted data available")
@@ -147,12 +144,12 @@ func (w *Wallet) ChangePassword(oldPassword, newPassword string) error {
         return errors.New("new password does not meet strength requirements")
     }
 
-    priv, mnemonic, err := DecryptWallet(w.EncryptedPriv, oldPassword)
+    priv, mnemonic, err := encryption.DecryptWallet(w.EncryptedPriv, oldPassword)
     if err != nil {
         return errors.New("old password incorrect")
     }
 
-    newEnc, err := EncryptWallet(priv, mnemonic, newPassword)
+    newEnc, err := encryption.EncryptWallet(priv, mnemonic, newPassword)
     for i := range priv {
         priv[i] = 0
     }
@@ -163,12 +160,12 @@ func (w *Wallet) ChangePassword(oldPassword, newPassword string) error {
     return nil
 }
 
-// DeleteWallet securely erases the wallet if the user proves ownership.
+// DeleteWallet securely erases wallet after verification.
 func (w *Wallet) DeleteWallet(mnemonic, password string) error {
     if w.EncryptedPriv == nil {
         return errors.New("no encrypted data available")
     }
-    priv, storedMnemonic, err := DecryptWallet(w.EncryptedPriv, password)
+    priv, storedMnemonic, err := encryption.DecryptWallet(w.EncryptedPriv, password)
     if err != nil {
         return errors.New("invalid password or corrupted data")
     }
@@ -184,7 +181,7 @@ func (w *Wallet) DeleteWallet(mnemonic, password string) error {
     return nil
 }
 
-// ToCBORLine serializes wallet to CBOR and encodes as base64 for line-based logs.
+// ToCBORLine serializes wallet to CBOR + base64.
 func (w *Wallet) ToCBORLine() (string, error) {
     data, err := cbor.Marshal(w)
     if err != nil {
@@ -193,7 +190,7 @@ func (w *Wallet) ToCBORLine() (string, error) {
     return base64.StdEncoding.EncodeToString(data), nil
 }
 
-// FromCBORLine deserializes a base64 CBOR line into a Wallet.
+// FromCBORLine deserializes base64 CBOR into wallet.
 func FromCBORLine(line string) (*Wallet, error) {
     raw, err := base64.StdEncoding.DecodeString(line)
     if err != nil {
@@ -204,4 +201,76 @@ func FromCBORLine(line string) (*Wallet, error) {
         return nil, fmt.Errorf("failed to deserialize wallet: %w", err)
     }
     return &w, nil
+}
+
+// ExportEd25519Keys decrypts and returns keys in hex.
+func (w *Wallet) ExportEd25519Keys(password string) (privHex, pubHex string, err error) {
+    if w.EncryptedPriv == nil {
+        return "", "", errors.New("no encrypted data in wallet")
+    }
+
+    privBytes, _, err := encryption.DecryptWallet(w.EncryptedPriv, password)
+    if err != nil {
+        return "", "", fmt.Errorf("failed to decrypt wallet: %w", err)
+    }
+    defer func() {
+        for i := range privBytes {
+            privBytes[i] = 0
+        }
+    }()
+
+    priv := ed25519.PrivateKey(privBytes)
+    pub := priv.Public().(ed25519.PublicKey)
+    return hex.EncodeToString(priv), hex.EncodeToString(pub), nil
+}
+
+// SignTransaction signs txData using wallet's private key with HMAC check.
+// Now returns the raw signature bytes ([]byte) instead of a hex string.
+func SignTransaction(w *Wallet, password string, txData []byte) ([]byte, error) {
+    if w.EncryptedPriv == nil {
+        return nil, errors.New("wallet has no encrypted private key")
+    }
+
+    // DecryptWallet returns (privBytes, mnemonic, error) and validates HMAC internally
+    privBytes, _, err := encryption.DecryptWallet(w.EncryptedPriv, password)
+    if err != nil {
+        // HMAC mismatch or incorrect password triggers this
+        return nil, fmt.Errorf("failed to decrypt private key: %w", err)
+    }
+    // Always zero private key after usage
+    defer func() {
+        for i := range privBytes {
+            privBytes[i] = 0
+        }
+    }()
+
+    // Ensure private key length is exactly 64 bytes for ed25519
+    if len(privBytes) != ed25519.PrivateKeySize {
+        return nil, errors.New("decrypted private key has invalid size")
+    }
+
+    priv := ed25519.PrivateKey(privBytes)
+    signature := ed25519.Sign(priv, txData)
+
+    // Return raw signature bytes (64 bytes)
+    return signature, nil
+}
+
+// PublicKeyBytes returns the public key of the wallet as a byte slice.
+// It temporarily decrypts the private key to derive the public key.
+// ⚠️ Currently uses a dummy password for decryption; this will fail if the encryption checks the password.
+func (w *Wallet) PublicKeyBytes(password string) ([]byte, error) {
+    if w.EncryptedPriv == nil {
+        return nil, errors.New("no encrypted private key available")
+    }
+
+    privBytes, _, err := encryption.DecryptWallet(w.EncryptedPriv, password)
+    if err != nil {
+        return nil, fmt.Errorf("failed to decrypt private key: %w", err)
+    }
+    defer func() { for i := range privBytes { privBytes[i] = 0 } }()
+
+    priv := ed25519.PrivateKey(privBytes)
+    pub := priv.Public().(ed25519.PublicKey)
+    return pub, nil
 }

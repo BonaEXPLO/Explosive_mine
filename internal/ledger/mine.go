@@ -4,6 +4,7 @@ package ledger
 import (
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"strconv"
 	"strings"
@@ -96,6 +97,10 @@ func benchmarkPoW(message string, zeros int, duration time.Duration) bool {
 // -----------------------------
 // Mine performs a mining session for a miner (hermetic supply)
 // -----------------------------
+// This function is defensive: it protects against uninitialized IMANI subsystem
+// (which can happen during early bootstrap or after restoring older snapshots).
+// If the IMANI module isn't ready, we gracefully continue — mining rewards are
+// still applied to the ledger and the donation amount is recorded in DB.
 func Mine(db *Ledger, miner *Miner, state *MinerState, donationPercent float64) error {
 	now := time.Now().Unix()
 
@@ -193,15 +198,44 @@ func Mine(db *Ledger, miner *Miner, state *MinerState, donationPercent float64) 
 	if state.LUMEN > MaxLumen {
 		state.LUMEN = MaxLumen
 	}
-	imanifund.RegisterLumen(miner.ID, state.LUMEN)
 
-	// Send donation
-	if err := imanifund.AddDonation(miner.ID, donationAmount); err != nil {
-		return fmt.Errorf("failed to add donation: %v", err)
+	// Register LUMEN in IMANI fund — protect against nil or uninitialized imanifund package.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// IMANI subsystem not initialized or panicked — log and continue.
+				log.Printf("imanifund.RegisterLumen panic recovered: %v — continuing without IMANI persistence", r)
+			}
+		}()
+		imanifund.RegisterLumen(miner.ID, state.LUMEN)
+	}()
+
+	// Send donation — try IMANI fund first, fallback to persisting donpool to ledger DB on failure.
+	addedToImani := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("imanifund.AddDonation panic recovered: %v — falling back to ledger donpool", r)
+			}
+		}()
+		if err := imanifund.AddDonation(miner.ID, donationAmount); err != nil {
+			// If AddDonation returns an error, log and fallback to ledger donpool storage
+			log.Printf("imanifund.AddDonation error: %v — falling back to ledger donpool", err)
+			return
+		}
+		addedToImani = true
+	}()
+
+	if !addedToImani && donationAmount > 0 {
+		// Persist donation to ledger-level donpool as a durable fallback
+		if err := CreditDonpool(db, donationAmount); err != nil {
+			// Non-fatal for mining; log and continue
+			log.Printf("CreditDonpool failed: %v", err)
+		}
 	}
 
-	// Credit miner
-	tx, err := NewMiningReward(miner.ID, netReward, imaniMint)
+	// Credit miner by creating and applying the mining reward transaction
+	tx, err := NewMiningReward(miner.ID, netReward, imaniMint, time.Now().UnixMilli())
 	if err != nil {
 		return fmt.Errorf("failed to create mining reward tx: %v", err)
 	}
@@ -212,45 +246,55 @@ func Mine(db *Ledger, miner *Miner, state *MinerState, donationPercent float64) 
 
 	state.LastMineUnix = now
 
-    // 💡 Inspire the miner with Guardian's ephemeral message
-    encMsg := guardian.EncourageMessageEphemeral(miner.ConsciousnessFingerprint)
-    totalMsgs := guardian.GetTotalMessages()
+	// 💡 Inspire the miner with Guardian's ephemeral message
+	encMsg := guardian.EncourageMessageEphemeral(miner.ConsciousnessFingerprint)
+	totalMsgs := guardian.GetTotalMessages()
 
-    // Display mining result
-    fmt.Println(msg)
-    fmt.Printf("🌟 LUMEN: %.2f / %.2f\n", state.LUMEN, MaxLumen)
-    fmt.Println("💬 Guardian says:", encMsg)
-    fmt.Printf("📜 Guardian has inspired miners %d times so far.\n", totalMsgs)
+	// Display mining result
+	fmt.Println(msg)
+	fmt.Printf("🌟 LUMEN: %.2f / %.2f\n", state.LUMEN, MaxLumen)
+	fmt.Println("💬 Guardian says:", encMsg)
+	fmt.Printf("📜 Guardian has inspired miners %d times so far.\n", totalMsgs)
 
-    return nil
+	return nil
 }
 
 // CreditDonpool ajoute le montant donné au donpool global du ledger
 func CreditDonpool(db *Ledger, amount float64) error {
-    if amount <= 0 {
-        return nil
+	if amount <= 0 {
+		return nil
+	}
+
+	return db.db.Update(func(txn *badger.Txn) error {
+		var current float64
+		item, err := txn.Get([]byte("donpool"))
+		if err != nil {
+			if err == badger.ErrKeyNotFound {
+				current = 0
+			} else {
+				return err
+			}
+		} else {
+			err = item.Value(func(val []byte) error {
+				current, err = strconv.ParseFloat(string(val), 64)
+				return err
+			})
+			if err != nil {
+				return err
+			}
+		}
+
+		newTotal := current + amount
+		return txn.Set([]byte("donpool"), []byte(fmt.Sprintf("%.8f", newTotal)))
+	})
+}
+
+func CreditSoul(db *Ledger, minerID string, amount float64) error {
+    balanceKey := []byte("balance:" + minerID)
+    bal := &Balance{}
+    if err := db.GetObject(balanceKey, bal); err != nil {
+        bal = &Balance{}
     }
-
-    return db.db.Update(func(txn *badger.Txn) error {
-        var current float64
-        item, err := txn.Get([]byte("donpool"))
-        if err != nil {
-            if err == badger.ErrKeyNotFound {
-                current = 0
-            } else {
-                return err
-            }
-        } else {
-            err = item.Value(func(val []byte) error {
-                current, err = strconv.ParseFloat(string(val), 64)
-                return err
-            })
-            if err != nil {
-                return err
-            }
-        }
-
-        newTotal := current + amount
-        return txn.Set([]byte("donpool"), []byte(fmt.Sprintf("%.8f", newTotal)))
-    })
+    bal.EXPLO += amount
+    return db.PutObject(balanceKey, bal)
 }

@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EXPLOSIVE WALLET v3.0</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+<div class="container">
+
+    <!-- Écran d'accueil -->
+    <div id="welcomeScreen" class="screen">
+        <h1>WELCOME TO EXPLOSIVE WALLET</h1>
+        <button class="btn primary" id="welcomeContinue">CONTINUE</button>
+        <div style="margin-top:1rem;">
+            <label>Langue:
+                <select id="langSelect">
+                    <option value="en">English</option>
+                    <option value="fr" selected>Français</option>
+                </select>
+            </label>
+        </div>
+    </div>
+
+    <!-- Alerte mnémonique -->
+    <div id="alertScreen" class="screen" style="display:none;">
+        <h2 id="alertTitle">Attention</h2>
+        <p id="alertText">
+            Vous êtes responsable de votre phrase mnémonique. Ne la partagez jamais.
+        </p>
+        <button class="btn primary" id="alertContinue">CONTINUE</button>
+    </div>
+
+    <!-- Choix Create / Restore -->
+    <div id="choiceScreen" class="screen" style="display:none;">
+        <h2 id="choiceTitle">Choisissez une action</h2>
+        <button class="btn primary" id="createBtn">Créer un nouveau wallet</button>
+        <button class="btn" id="restoreBtn">Restaurer un wallet</button>
+    </div>
+
+    <!-- Dashboard -->
+    <div id="dashboardScreen" class="screen" style="display:none;">
+        <header>
+            <h1>EXPLOSIVE <span>WALLET</span></h1>
+            <div class="status" id="netStatus">CONNECTING</div>
+        </header>
+        <div class="grid">
+            <div class="card">
+                <h3>Hauteur du bloc</h3>
+                <div class="value" id="height">--</div>
+            </div>
+            <div class="card">
+                <h3>Peers</h3>
+                <div class="value" id="peers">--</div>
+            </div>
+            <div class="card">
+                <h3>Adresse</h3>
+                <div class="value addr" id="address">Aucun wallet chargé</div>
+            </div>
+            <div class="card big">
+                <h3>Solde EXPLO</h3>
+                <div class="value huge" id="balance">0.000000</div>
+                <div class="small">IMANI: <span id="imani">0.0000</span></div>
+            </div>
+        </div>
+        <div class="actions" id="actions">
+            <button class="btn primary" id="createBtnDashboard">Créer un nouveau wallet</button>
+            <button class="btn" id="unlockBtnDashboard" style="display:none">Déverrouiller le wallet</button>
+        </div>
+
+        <!-- Actions ENVOYER / RECEVOIR -->
+        <div class="actions" id="dashboardActions">
+            <button class="btn primary" id="sendBtn">Envoyer</button>
+            <button class="btn" id="receiveBtn">Recevoir</button>
+        </div>
+    </div>
+
+    <!-- Modale pour mnémonique -->
+    <div id="mnemonicModal" class="modal">
+        <div class="modal-content">
+            <span class="close">×</span>
+            <h2>Votre phrase mnémonique (24 mots)</h2>
+            <p><strong>Écrivez-la sur papier. Ne la partagez jamais.</strong></p>
+            <div class="mnemonic-box" id="mnemonicText"></div>
+            <button class="btn primary" id="copyBtn">Copier dans le presse-papier</button>
+        </div>
+    </div>
+
+    <!-- Modale Création Wallet -->
+    <div id="createWalletModal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h2>Créer un nouveau wallet</h2>
+
+            <!-- Étape 1 : Afficher mnemonique -->
+            <div id="stepMnemonic">
+                <p><strong>Votre phrase mnémonique (24 mots)</strong></p>
+                <button class="btn primary" id="revealMnemonicBtn">Révéler ma phrase</button>
+                <div class="mnemonic-box" id="mnemonicDisplay" style="display:none;"></div>
+                <button class="btn" id="copyMnemonicBtn" style="display:none;">Copier la phrase</button>
+            </div>
+
+            <!-- Étape 2 : Vérification de 4 mots -->
+            <div id="stepVerify" style="display:none;">
+                <p>Confirmez 4 mots choisis au hasard de votre phrase :</p>
+                <form id="verifyForm">
+                    <input type="text" id="word1" placeholder="Mot n°1" required>
+                    <input type="text" id="word2" placeholder="Mot n°2" required>
+                    <input type="text" id="word3" placeholder="Mot n°3" required>
+                    <input type="text" id="word4" placeholder="Mot n°4" required>
+                    <button type="submit" class="btn primary">Valider</button>
+                </form>
+            </div>
+
+            <!-- Étape 3 : Mot de passe -->
+            <div id="stepPassword" style="display:none;">
+                <p>Choisissez un mot de passe sécurisé :</p>
+                <input type="password" id="pw1" placeholder="Mot de passe" required>
+                <input type="password" id="pw2" placeholder="Confirmer mot de passe" required>
+                <label><input type="checkbox" id="togglePw"> Afficher mot de passe</label>
+                <button class="btn primary" id="createWalletBtn">Créer le wallet</button>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- Modal ENVOYER -->
+    <div id="sendModal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h2>Envoyer des tokens</h2>
+            <label>Adresse du destinataire :</label>
+            <input type="text" id="sendAddress" placeholder="explo...">
+            <label>Montant :</label>
+            <input type="number" step="0.000001" id="sendAmount" placeholder="0.000000">
+            <label>Mot de passe :</label>
+            <input type="password" id="sendPassword">
+            <button class="btn primary" id="confirmSendBtn">Envoyer</button>
+        </div>
+    </div>
+
+    <!-- Modal RECEVOIR -->
+    <div id="receiveModal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h2>Recevoir des tokens</h2>
+            <p>Adresse de réception :</p>
+            <div class="mnemonic-box" id="receiveAddress"></div>
+            <button class="btn" id="copyReceiveBtn">Copier</button>
+        </div>
+    </div>
+
+</div>
+<script src="app.js"></script>
+</body>
+</html>

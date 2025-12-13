@@ -31,51 +31,81 @@ var (
 
 // ---------------- Ledger Struct ----------------
 
-// Ledger wraps a BadgerDB instance with async write support, CBOR pooling, and helper methods.
 type Ledger struct {
-	db        *badger.DB
-	asyncCh   chan kvPair   // channel for async batch writes
-	stopAsync chan struct{} // signal to stop async writer
-	cborPool  sync.Pool     // CBOR buffer pool for reuse
+    db        *badger.DB
+    asyncCh   chan kvPair   // channel for async batch writes
+    stopAsync chan struct{} // signal to stop async writer
+    cborPool  sync.Pool     // CBOR buffer pool for reuse
+    dbPath    string        // chemin du dossier ledger
 }
 
 // kvPair represents a key/value pair for async batch writes.
 type kvPair struct {
-	key []byte
-	val []byte
+    key []byte
+    val []byte
 }
 
-// ---------------- Open / Close Ledger ----------------
+// ---------------- OpenLedger ----------------
 
-// OpenLedger opens (or creates) a BadgerDB at the specified path and returns a Ledger instance.
-// Configured for high throughput to support mobile devices and high TPS.
+// OpenLedger opens (or creates) a BadgerDB instance at the specified path
+// and returns a Ledger instance with asynchronous write support and CBOR pooling.
+// It also ensures the genesis block is initialized deterministically.
 func OpenLedger(path string) (*Ledger, error) {
-	opts := badger.DefaultOptions(path)
-	opts.SyncWrites = false            // disable fsync for faster writes
-	opts.Logger = nil                  // disable logging
-	opts.ValueLogFileSize = 1 << 20    // 1MiB per value log file
-	opts.NumMemtables = 8              // more memtables for concurrent writes
-	opts.NumLevelZeroTables = 8
-	opts.NumLevelZeroTablesStall = 16
+    // Configure BadgerDB options for high throughput
+    opts := badger.DefaultOptions(path)
+    opts.SyncWrites = false  // disable fsync for faster writes
+    opts.Logger = nil        // disable default logging
 
-	db, err := badger.Open(opts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open ledger DB: %w", err)
-	}
+    // Open (or create) the database
+    db, err := badger.Open(opts)
+    if err != nil {
+        return nil, fmt.Errorf("failed to open ledger DB: %w", err)
+    }
 
-	l := &Ledger{
-		db:        db,
-		asyncCh:   make(chan kvPair, 100_000), // large async channel for high TPS
-		stopAsync: make(chan struct{}),
-		cborPool: sync.Pool{
-			New: func() interface{} { return new(bytes.Buffer) },
-		},
-	}
+    // Initialize Ledger struct with async channel and CBOR buffer pool
+    l := &Ledger{
+        db:        db,
+        asyncCh:   make(chan kvPair, 100_000), // large channel for high TPS
+        stopAsync: make(chan struct{}),        // signal to stop async writer
+        cborPool: sync.Pool{
+            New: func() interface{} { return new(bytes.Buffer) }, // reuse CBOR buffers
+        },
+        dbPath: path, // <-- initialisation du chemin du ledger
+    }
 
-	// Start the async batch writer goroutine
-	go l.asyncWriter()
+    // Start asynchronous batch writer in a separate goroutine
+    go l.asyncWriter()
 
-	return l, nil
+    // ----------------- INIT GENESIS BLOCK -----------------
+    // Ensure the genesis block exists and is valid; create if absent
+    err = InitLedger(l)
+    if err != nil {
+        _ = db.Close() // cleanup on failure
+        return nil, fmt.Errorf("ledger initialization failed: %v", err)
+    }
+
+    return l, nil
+}
+
+func InitLedger(db *Ledger) error {
+    if db == nil || db.db == nil {
+        return fmt.Errorf("ledger not initialized")
+    }
+
+    block0, err := db.GetBlockByHeight(0)
+    if err == nil && block0 != nil {
+        if err := VerifyGenesis(db); err != nil {
+            return fmt.Errorf("ledger corruption detected: %v", err)
+        }
+        fmt.Println("✅ Genesis block already exists and verified.")
+        return nil
+    }
+
+    _, err = CreateGenesisBlock(db)
+    if err != nil {
+        return fmt.Errorf("failed to create genesis block: %v", err)
+    }
+    return nil
 }
 
 // Close safely closes the ledger, flushing any pending async writes.
@@ -169,6 +199,22 @@ func (l *Ledger) GetBytes(key []byte) ([]byte, error) {
 		return nil
 	})
 	return out, err
+}
+
+// DeleteBytes removes a key from the ledger database.
+// Safe for concurrent use and returns an error if the DB isn't initialized.
+func (l *Ledger) DeleteBytes(key []byte) error {
+    if l == nil || l.db == nil {
+        return fmt.Errorf("ledger not initialized")
+    }
+
+    return l.db.Update(func(txn *badger.Txn) error {
+        err := txn.Delete(key)
+        if err == badger.ErrKeyNotFound {
+            return nil // Not fatal — key simply didn't exist
+        }
+        return err
+    })
 }
 
 // PutObject marshals an object to CBOR and stores it in the DB.
@@ -272,3 +318,82 @@ func (l *Ledger) GetGlobalBalances() (map[string]interface{}, error) {
 
     return data, nil
 }
+
+// ListAllMiners returns all miners currently stored in the ledger.
+func (l *Ledger) ListAllMiners() ([]Miner, error) {
+    if l == nil || l.db == nil {
+        return nil, fmt.Errorf("ledger not initialized")
+    }
+
+    miners := []Miner{}
+    prefix := []byte("miner:") // Tous les mineurs sont stockés avec cette clé
+
+    err := l.db.View(func(txn *badger.Txn) error {
+        it := txn.NewIterator(badger.DefaultIteratorOptions)
+        defer it.Close()
+
+        for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+            item := it.Item()
+
+            val, err := item.ValueCopy(nil)
+            if err != nil {
+                return err
+            }
+
+            var m Miner
+            if err := cbor.Unmarshal(val, &m); err != nil {
+                return err
+            }
+
+            miners = append(miners, m)
+        }
+
+        return nil
+    })
+
+    if err != nil {
+        return nil, err
+    }
+
+    return miners, nil
+}
+
+// MarkRegistrationAttempt stores the timestamp (ms) of the last registration attempt for a miner
+func (l *Ledger) MarkRegistrationAttempt(minerID string) error {
+    key := []byte("reg_attempt:" + minerID)
+    ts := NowMillis()
+    return l.PutObject(key, ts)
+}
+
+// HasRecentRegAttempt checks if the last registration attempt was within windowMs milliseconds
+func (l *Ledger) HasRecentRegAttempt(minerID string, windowMs int64) bool {
+    key := []byte("reg_attempt:" + minerID)
+    var ts int64
+    if err := l.GetObject(key, &ts); err != nil {
+        return false // no record => no recent attempt
+    }
+    return NowMillis()-ts < windowMs
+}
+
+// HasMinerOnChain checks if the miner is already registered on-chain
+// This is a placeholder; adapt selon ton état de ledger ou bucket miners_confirmed
+// HasMinerOnChain checks if the miner is already registered on-chain
+func (l *Ledger) HasMinerOnChain(minerID string) (bool, error) {
+    key := []byte("onchain_miner:" + minerID)
+    var flag bool
+
+    err := l.GetObject(key, &flag)
+    if err != nil {
+        if errors.Is(err, badger.ErrKeyNotFound) {
+            return false, nil
+        }
+        return false, err
+    }
+    return flag, nil
+}
+// SetMinerOnChain marks a miner as registered on-chain (à utiliser après réception du Tx signé)
+func (l *Ledger) SetMinerOnChain(minerID string) error {
+    key := []byte("onchain_miner:" + minerID)
+    return l.PutObject(key, true)
+}
+
