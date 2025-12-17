@@ -1,0 +1,63 @@
+############################
+# 🚫 DATA / RUNTIME
+############################
+
+# Ledger runtime DB / snapshots
+ledgerdb/
+data/
+.explosive/
+*.vlog
+*.badger
+MANIFEST
+LOCK
+KEYREGISTRY
+DISCARD
+*.slex
+
+# Backups & exports
+*.dat
+*.backup
+*.tar.gz
+*.zip
+
+############################
+# 🔐 SECRETS / KEYS
+############################
+
+# Private keys / sensitive identity
+*.pem
+*.key
+/internal/keys/
+/internal/config/*.json
+/internal/guardian/fingerprint.json
+
+############################
+# 🧱 BINARIES / BUILDS
+############################
+
+ledgerapp
+walletapp
+p2pnode
+explosive-server
+explosive-for-seed
+
+/bin/
+obj/
+*.exe
+*.apk
+
+############################
+# 📜 LOGS / TEMP
+############################
+
+*.log
+*.tmp
+seed.pid
+
+############################
+# 🧹 OS / EDITORS
+############################
+
+.DS_Store
+.idea/
+.vscode/

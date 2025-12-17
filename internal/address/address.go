@@ -4,6 +4,7 @@ import (
 	"crypto/sha3"
 	"encoding/hex"
 	"strings"
+        "crypto/ed25519"
 )
 
 const (
@@ -89,4 +90,10 @@ func IsValidMinerID(addr string) bool {
 // IsValidEXPLOAddress is an exported alias for backward compatibility.
 func IsValidEXPLOAddress(addr string) bool {
 	return IsValidMinerID(addr)
+}
+
+// FromEd25519PublicKey generates a miner/wallet address from an Ed25519 public key.
+// It simply wraps GenerateEXPLOAddress for clarity in miner context.
+func FromEd25519PublicKey(pubKey ed25519.PublicKey) string {
+    return GenerateEXPLOAddress(pubKey)
 }

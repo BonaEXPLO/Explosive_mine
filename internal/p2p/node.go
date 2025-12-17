@@ -1,5 +1,4 @@
 // internal/p2p/node.go
-
 package p2p
 
 import (
@@ -9,7 +8,6 @@ import (
         "errors"
         "fmt"
         "log"
-        "math/big"
         "math/rand"
         "net"
         "strings"
@@ -101,61 +99,46 @@ type Node struct {
 }
 
 // NewNode constructs a Node with reasonable defaults.
-// It ensures dual-stack compatibility by forcing IPv4 bind when only a port is provided.
+// Updated defaults to enforce V3 security from genesis: strict block and message signing.
 func NewNode(listenAddr, networkID, userAgent string) *Node {
-    // Seed math/rand for jitter, backoff, etc. (non-cryptographic use)
+    // Seed non-cryptographic RNG
     rand.Seed(time.Now().UnixNano())
 
-    // Generate a cryptographically secure PeerID
+    // Generate secure local Node ID
     r := make([]byte, 8)
     _, _ = cryptorand.Read(r)
     id := PeerID(hex.EncodeToString(r))
 
-    // Force explicit IPv4 bind if only a port is provided (e.g., ":8443")
-    // This ensures dual-stack (IPv4 + IPv6) listening on cloud providers like AWS
+    // Force IPv4 bind for broad compatibility
     if strings.HasPrefix(listenAddr, ":") {
         listenAddr = "0.0.0.0" + listenAddr
         log.Printf("p2p: forcing IPv4 bind for listening: %s", listenAddr)
     }
 
     cfg := NodeConfig{
-    // Listening address (e.g. "0.0.0.0:3333" or ":3333" – IPv4 forced for mobile compatibility)
-    ListenAddr: listenAddr,
+        ListenAddr:               listenAddr,
+        DialTimeout:              10 * time.Second,
+        ConnReadTimeout:          120 * time.Second,
+        ConnWriteTimeout:         60 * time.Second,
+        FlushInterval:            800 * time.Millisecond,
+        PeerDialPeriod:           30 * time.Second,
+        MaxPeers:                 80,
+        SendQueueSize:            32,
+        MaxMsgSize:               384 * 1024,
+        ProtocolName:             "explosive-p2p",
+        ProtocolVer:              "1.0",
+        MaxIncomingQueue:         64,
+        AcceptWorkers:            2,
+        MaxBroadcastFanout:       14,
 
-    // -- Connection timeouts (tuned for unstable mobile networks) --
-    DialTimeout:      10 * time.Second, // Max time to establish an outbound connection
-    ConnReadTimeout:  120 * time.Second, // Inactivity timeout on reads – generous for poor signal
-    ConnWriteTimeout: 60 * time.Second,  // Write deadline – prevents stuck sends on congested networks
+        // V3-aligned security defaults (non-negotiable on mainnet)
+        RequireSignedMessages:    true,
+        RequireStrictBlockSig:    true,  // Enforce valid Ed25519 miner signature on all new blocks
+        RequireSignedTx:          true,
 
-    // -- Message flushing & peer maintenance (battery-first) --
-    FlushInterval:    800 * time.Millisecond, // Slow flush = major battery savings on mobile
-    PeerDialPeriod:   30 * time.Second,       // How often we retry known peers – prevents aggressive reconnect storms
-
-    // -- Hard resource caps (proven stable on low-end Android devices) --
-    MaxPeers:         80,  // Absolute maximum concurrent peers – tested rock-solid on mid-range phones (e.g. Samsung A53)
-    SendQueueSize:    32,  // Per-peer outbound queue – tiny footprint, ultra-low RAM usage
-    MaxMsgSize:       384 * 1024, // 384 KiB – safe upper bound for blocks/txs on limited mobile data plans
-
-    // -- Protocol identification --
-    ProtocolName: "explosive-p2p",
-    ProtocolVer:  "1.0",
-
-    // -- Connection acceptance pipeline (mobile CPU conscious) --
-    MaxIncomingQueue: 64,    // Pending inbound connections before dropping
-    AcceptWorkers:    2,     // Only 2 workers needed – more would waste CPU cycles on mobile
-
-    // -- Gossip propagation (Bitcoin-style probabilistic flooding) --
-    MaxBroadcastFanout: 14, // ~√MaxPeers → guarantees <30s global propagation with minimal bandwidth
-
-    // -- Security enforcement (activated from genesis – non-negotiable) --
-    RequireSignedMessages:   true, // Every envelope must carry a valid cryptographic signature
-    RequireStrictBlockSig:   true, // Blocks without valid miner signature are rejected outright
-    RequireSignedTx:         true, // All transactions must be signed – no exceptions
-
-    // -- Peer health & eviction policy --
-    PeerEvictionTimeout:     25 * time.Minute, // Inactive peers are disconnected after 25 min
-    PeerInvalidMsgThreshold: 4,                // Ban peers after 4 invalid messages (Sybil resistance)
-}
+        PeerEvictionTimeout:      25 * time.Minute,
+        PeerInvalidMsgThreshold:  4,
+    }
 
     ctx, cancel := context.WithCancel(context.Background())
     shards := make([]peerShard, 64)
@@ -231,67 +214,78 @@ func (n *Node) Start() error {
 
 // Stop gracefully stops the node.
 func (n *Node) Stop() {
-	n.cancel()
-	if n.ln != nil {
-		_ = n.ln.Close()
-	}
-	// take snapshot of peers and close to avoid locking during Close which may call back
-	for i := range n.peerShards {
-		sh := &n.peerShards[i]
-		sh.mu.RLock()
-		for _, p := range sh.peers {
-			p.Close()
-		}
-		sh.mu.RUnlock()
-	}
-	n.wg.Wait()
+        n.cancel()
+        if n.ln != nil {
+                _ = n.ln.Close()
+        }
+        // take snapshot of peers and close to avoid locking during Close which may call back
+        for i := range n.peerShards {
+                sh := &n.peerShards[i]
+                sh.mu.RLock()
+                for _, p := range sh.peers {
+                        p.Close()
+                }
+                sh.mu.RUnlock()
+        }
+        n.wg.Wait()
 }
 
-// acceptLoop accepts incoming connections with worker pool.
 func (n *Node) acceptLoop() {
-	defer n.wg.Done()
-	connCh := make(chan net.Conn, n.config.MaxIncomingQueue)
-	for i := 0; i < n.config.AcceptWorkers; i++ {
-		n.wg.Add(1)
-		go n.connWorker(connCh)
-	}
+    defer n.wg.Done()
+    connCh := make(chan net.Conn, n.config.MaxIncomingQueue)
 
-	for {
-		conn, err := n.ln.Accept()
-		if err != nil {
-			select {
-			case <-n.ctx.Done():
-				return
-			default:
-				log.Println("accept error:", err)
-				continue
-			}
-		}
+    // Start worker goroutines to process incoming connections
+    for i := 0; i < n.config.AcceptWorkers; i++ {
+        n.wg.Add(1)
+        go n.connWorker(connCh)
+    }
 
-		// enforce global max peers
-		if n.PeerCount() >= n.config.MaxPeers {
-			_ = conn.Close()
-			continue
-		}
+    for {
+        conn, err := n.ln.Accept()
+        if err != nil {
+            select {
+            case <-n.ctx.Done():
+                // Node is shutting down — exit gracefully
+                return
+            default:
+                log.Printf("[p2p] ⚠️ Accept error: %v", err)
+                continue
+            }
+        }
 
-		select {
-		case connCh <- conn:
-		default:
-			_ = conn.Close() // drop if queue full
-		}
-	}
+        remoteAddr := conn.RemoteAddr().String()
+        log.Printf("[p2p] ⚡ New incoming TCP connection from %s", remoteAddr)
+
+        // Enforce global maximum peer limit
+        currentPeers := n.PeerCount()
+        if currentPeers >= n.config.MaxPeers {
+            log.Printf("[p2p] ⚠️ Max peers reached (%d/%d) — rejecting connection from %s",
+                currentPeers, n.config.MaxPeers, remoteAddr)
+            _ = conn.Close()
+            continue
+        }
+
+        // Queue the connection for processing (non-blocking)
+        select {
+        case connCh <- conn:
+            // Successfully queued
+        default:
+            log.Printf("[p2p] ⚠️ Incoming queue full — dropping connection from %s", remoteAddr)
+            _ = conn.Close()
+        }
+    }
 }
 
 func (n *Node) connWorker(ch <-chan net.Conn) {
-	defer n.wg.Done()
-	for {
-		select {
-		case <-n.ctx.Done():
-			return
-		case conn := <-ch:
-			n.handleNewConnection(conn)
-		}
-	}
+        defer n.wg.Done()
+        for {
+                select {
+                case <-n.ctx.Done():
+                        return
+                case conn := <-ch:
+                        n.handleNewConnection(conn)
+                }
+        }
 }
 
 
@@ -371,7 +365,10 @@ func (n *Node) addPeer(p *Peer) {
     sh.mu.Lock()
     defer sh.mu.Unlock()
 
-    if n.PeerCount() >= n.config.MaxPeers {
+    currentCount := n.PeerCount()
+    if currentCount >= n.config.MaxPeers {
+        log.Printf("[p2p] ⚠️ Peer limit exceeded (%d/%d) — rejecting peer %s (%s)",
+            currentCount, n.config.MaxPeers, p.id, p.addr)
         _ = p.SendEnvelope(&Envelope{
             Version:   n.protocolVersion,
             Type:      MsgTypeAck,
@@ -382,6 +379,7 @@ func (n *Node) addPeer(p *Peer) {
         return
     }
 
+    oldPeer, exists := sh.peers[p.id]
     sh.peers[p.id] = p
 
     n.PeersMutex.Lock()
@@ -397,6 +395,13 @@ func (n *Node) addPeer(p *Peer) {
         n.Peers = append(n.Peers, p)
     }
     n.PeersMutex.Unlock()
+
+    newTotal := n.PeerCount()
+    if exists && oldPeer != p {
+        log.Printf("[p2p] ♻️ Peer updated: id=%s addr=%s (total connected peers: %d)", p.id, p.addr, newTotal)
+    } else if !exists {
+        log.Printf("[p2p] 🌱 New peer successfully added: id=%s addr=%s (total connected peers: %d)", p.id, p.addr, newTotal)
+    }
 }
 
 // Connect dials a remote peer.
@@ -412,14 +417,14 @@ func (n *Node) Connect(addr string) (*Peer, error) {
 
 // PeerCount returns the total number of peers across shards.
 func (n *Node) PeerCount() int {
-	total := 0
-	for i := range n.peerShards {
-		sh := &n.peerShards[i]
-		sh.mu.RLock()
-		total += len(sh.peers)
-		sh.mu.RUnlock()
-	}
-	return total
+        total := 0
+        for i := range n.peerShards {
+                sh := &n.peerShards[i]
+                sh.mu.RLock()
+                total += len(sh.peers)
+                sh.mu.RUnlock()
+        }
+        return total
 }
 
 // Broadcast sends the given envelope to a limited number of connected peers in all shards.
@@ -476,43 +481,47 @@ func (n *Node) Broadcast(e *Envelope) {
 }
 
 // handleIncomingEnvelope enqueues received messages paired with their peer.
+// Enforces cryptographic validation of envelopes when RequireSignedMessages is enabled.
+// Uses VerifyEnvelopeSignature() which internally checks the Ed25519 signature
+// (aligned with V3 miner identity when the envelope includes the miner signature).
 func (n *Node) handleIncomingEnvelope(p *Peer, e *Envelope) {
-	if e == nil {
-		return
-	}
-	// signature enforcement & basic validation
-	if n.config.RequireSignedMessages {
-		ok, err := VerifyEnvelopeSignature(e)
-		if err != nil || !ok {
-			// penalize peer and possibly ban
-			if p != nil {
-				p.Penalize(1, 0)
-				if p.errCount >= n.config.PeerInvalidMsgThreshold {
-					// temporary ban
-					p.Penalize(0, 5*time.Minute)
-					log.Printf("p2p: banning peer %s for invalid messages", p.addr)
-				}
-			}
-			n.metricsMu.Lock()
-			n.numInvalidMessages++
-			n.metricsMu.Unlock()
-			return
-		}
-	}
+    if e == nil {
+        return
+    }
 
-	// enqueue; drop-oldest if full (bounded channel)
-	msg := &incomingMsg{peer: p, env: e}
-	select {
-	case n.inboundCh <- msg:
-		return
-	default:
-		select {
-		case <-n.inboundCh:
-			n.inboundCh <- msg
-		default:
-			// drop silently when overloaded
-		}
-	}
+    // --- Security: Enforce signed envelopes (V3-compatible) ---
+    if n.config.RequireSignedMessages {
+        ok, err := VerifyEnvelopeSignature(e)
+        if err != nil || !ok {
+            // Invalid or missing signature → penalize peer
+            if p != nil {
+                p.Penalize(1, 0)
+                if p.errCount >= n.config.PeerInvalidMsgThreshold {
+                    p.Penalize(0, 5*time.Minute)
+                    log.Printf("p2p: temporary ban of peer %s for repeated invalid signatures", p.addr)
+                }
+            }
+            n.metricsMu.Lock()
+            n.numInvalidMessages++
+            n.metricsMu.Unlock()
+            return
+        }
+    }
+
+    // Enqueue message; drop oldest if channel is full (bounded buffer)
+    msg := &incomingMsg{peer: p, env: e}
+    select {
+    case n.inboundCh <- msg:
+        return
+    default:
+        // Drain one message to make room (drop-oldest policy)
+        select {
+        case <-n.inboundCh:
+            n.inboundCh <- msg
+        default:
+            // Silently drop if still overloaded
+        }
+    }
 }
 
 // messageDispatcher processes inbound envelopes.
@@ -565,16 +574,16 @@ func (n *Node) RegisterHandler(mt MessageType, fn func(*Peer, *Envelope)) {
 
 // ListPeers returns current peers as id->addr.
 func (n *Node) ListPeers() map[PeerID]string {
-	out := map[PeerID]string{}
-	for i := range n.peerShards {
-		sh := &n.peerShards[i]
-		sh.mu.RLock()
-		for id, p := range sh.peers {
-			out[id] = p.addr
-		}
-		sh.mu.RUnlock()
-	}
-	return out
+        out := map[PeerID]string{}
+        for i := range n.peerShards {
+                sh := &n.peerShards[i]
+                sh.mu.RLock()
+                for id, p := range sh.peers {
+                        out[id] = p.addr
+                }
+                sh.mu.RUnlock()
+        }
+        return out
 }
 
 // handlePeerDisconnect removes a peer from the shard where it was registered,
@@ -605,24 +614,10 @@ func (n *Node) handlePeerDisconnect(p *Peer) {
     go p.Close()
 }
 
-// simple helper: random subset (could be improved)
-func randomSubset(peers map[PeerID]*Peer, n int) []*Peer {
-	out := []*Peer{}
-	for _, p := range peers {
-		out = append(out, p)
-	}
-	if len(out) <= n {
-		return out
-	}
-	// shuffle
-	for i := range out {
-		j, _ := cryptorand.Int(cryptorand.Reader, big.NewInt(int64(len(out))))
-		out[i], out[j.Int64()] = out[j.Int64()], out[i]
-	}
-	return out[:n]
-}
 
-// watchdogLoop periodically evicts inactive peers and enforces capacity.
+// watchdogLoop periodically evicts inactive peers, enforces capacity, and fetches new blocks.
+// Updated to use strict block signature verification aligned with ledger.Block.VerifySignature().
+// Only accepts blocks with valid Ed25519 miner signature (or legacy if explicitly allowed).
 func (n *Node) watchdogLoop() {
     defer n.wg.Done()
     ticker := time.NewTicker(1 * time.Minute)
@@ -631,14 +626,12 @@ func (n *Node) watchdogLoop() {
     for {
         select {
         case <-n.ctx.Done():
-            // Exit the watchdog when the node context is cancelled
             return
         case <-ticker.C:
             now := time.Now()
             evictBefore := now.Add(-n.config.PeerEvictionTimeout)
 
             // --- 1️⃣ Evict inactive peers ---
-            // Remove peers that have not been seen for longer than PeerEvictionTimeout
             for i := range n.peerShards {
                 sh := &n.peerShards[i]
                 sh.mu.Lock()
@@ -647,12 +640,11 @@ func (n *Node) watchdogLoop() {
                     lastSeen := p.lastSeen
                     p.mu.RUnlock()
                     if lastSeen.IsZero() || lastSeen.Before(evictBefore) {
-                        // Delete from shard map
                         delete(sh.peers, id)
                         log.Printf("p2p: evicted inactive peer id=%s addr=%s", id, p.addr)
-                        // Close connection asynchronously
                         go p.Close()
-                        // Remove from global peer slice
+
+                        // Remove from global Peers slice
                         n.PeersMutex.Lock()
                         for j, peer := range n.Peers {
                             if peer == p {
@@ -666,524 +658,59 @@ func (n *Node) watchdogLoop() {
                 sh.mu.Unlock()
             }
 
-            // --- 2️⃣ Enforce maximum number of peers ---
-            // If we have more peers than allowed, evict the oldest ones
+            // --- 2️⃣ Enforce maximum peer capacity ---
             for n.PeerCount() > n.config.MaxPeers {
                 var victim *Peer
                 var oldest time.Time = now
-                var victimID PeerID
+
                 for i := range n.peerShards {
                     sh := &n.peerShards[i]
                     sh.mu.RLock()
-                    for id, p := range sh.peers {
+                    for _, p := range sh.peers {
                         p.mu.RLock()
                         ls := p.lastSeen
                         p.mu.RUnlock()
-                        if ls.IsZero() || ls.Before(oldest) {
+                        if ls.Before(oldest) {
                             oldest = ls
                             victim = p
-                            victimID = id
                         }
                     }
                     sh.mu.RUnlock()
                 }
                 if victim != nil {
-                    log.Printf("p2p: evicting peer to enforce capacity id=%s addr=%s", victimID, victim.addr)
+                    log.Printf("p2p: capacity eviction of peer id=%s addr=%s", victim.id, victim.addr)
                     n.handlePeerDisconnect(victim)
                 } else {
                     break
                 }
             }
 
-            // --- 3️⃣ Fetch new blocks from peers ---
-            // Regularly retrieve new blocks from connected peers
+            // --- 3️⃣ Periodic block synchronization ---
+            // Fetch missing blocks from random connected peers
             newBlocks, err := n.FetchBlocks()
             if err != nil {
-                log.Printf("⚠️ Failed to fetch blocks: %v", err)
+                log.Printf("p2p: block fetch failed: %v", err)
                 continue
             }
 
-            // Verify and add each new block
             for _, blk := range newBlocks {
-                ok, err := blk.VerifySignature()
-                if err != nil || !ok {
-                    log.Printf("⚠️ Invalid block signature for block %d", blk.Header.Height)
+                // Strict V3-compatible signature verification (backward compatible with legacy blocks)
+                valid, err := blk.VerifySignature()
+                if err != nil {
+                    log.Printf("p2p: block %d signature verification error: %v", blk.Header.Height, err)
+                    continue
+                }
+                if !valid && n.config.RequireStrictBlockSig {
+                    log.Printf("p2p: rejecting unsigned/invalid block %d (strict mode)", blk.Header.Height)
                     continue
                 }
 
                 if err := n.Ledger.AddBlock(blk); err != nil {
-                    log.Printf("⚠️ Failed to add block %d: %v", blk.Header.Height, err)
+                    log.Printf("p2p: failed to apply fetched block %d: %v", blk.Header.Height, err)
                 } else {
-                    log.Printf("✅ Block %d fetched and added from peers", blk.Header.Height)
+                    log.Printf("p2p: successfully applied fetched block %d", blk.Header.Height)
                 }
             }
         }
     }
-}
-// ProtocolVersion returns the node's protocol version.
-func (n *Node) ProtocolVersion() uint16 {
-	return n.protocolVersion
-}
-
-/* -------------------------------------------------------------------------
-   Deterministic port derivation helpers
-   - These helpers are intentionally non-invasive: they do not change Node
-     constructors or startup flow. Call ApplyDerivedListenAddrToNode(n, id, words)
-     after restoring the miner identity to set the derived listen address.
-   - Default port range: [31000, 61000]
---------------------------------------------------------------------------- */
-
-const (
-	defaultMinPort = 31000
-	defaultMaxPort = 61000
-)
-
-// normalizeAndJoinWords does light normalized join of 4 sacred words.
-// It trims spaces and collapses internal whitespace, then joins with '-'.
-func normalizeAndJoinWords(words []string) string {
-	parts := make([]string, 0, len(words))
-	for _, w := range words {
-		s := strings.TrimSpace(w)
-		// collapse internal runs of spaces to one space
-		s = strings.Join(strings.Fields(s), " ")
-		parts = append(parts, s)
-	}
-	return strings.Join(parts, "-")
-}
-
-// registerDefaultHandlers registers all default message handlers for the P2P protocol.
-// This includes critical protocol messages like handshake, ping/pong, and data propagation.
-func (n *Node) registerDefaultHandlers() {
-    // --- Handshake handler (CRITICAL: must be first) ---
-    // Validates incoming handshake from remote peers and ensures network compatibility.
-    n.RegisterHandler(MsgTypeHandshake, func(p *Peer, env *Envelope) {
-        var hs HandshakePayload
-        if err := UnmarshalPayload(env.Payload, &hs); err != nil {
-            log.Printf("p2p: invalid handshake payload from %s: %v", p.addr, err)
-            p.Close()
-            return
-        }
-
-        // Validate network identifier – prevents cross-network connections
-        if hs.Network != n.networkID {
-            log.Printf("p2p: handshake rejected from %s: wrong network '%s' (expected '%s')", p.addr, hs.Network, n.networkID)
-            p.Close()
-            return
-        }
-
-        // Optional: Validate version compatibility (relaxed or strict as needed)
-        if hs.Version != n.userAgent {
-            log.Printf("p2p: handshake from %s uses different version '%s' (local: '%s') – allowing for now", p.addr, hs.Version, n.userAgent)
-            // Optionally: p.Close() for strict version enforcement
-        }
-
-        // Update peer metadata if needed (e.g., announced listen address)
-        // p.announcedListenAddr = hs.ListenAddr // for future outbound dialing
-
-        log.Printf("p2p: ✅ handshake successful with peer %s | id=%s | version=%s | addr=%s",
-            p.addr, hs.PeerID, hs.Version, hs.ListenAddr)
-
-        // Optional: request known peers after successful handshake
-        req := &Envelope{
-            Version:   n.protocolVersion,
-            Type:      MsgTypeRequestPeers,
-            Payload:   nil,
-            Timestamp: time.Now().UnixMilli(),
-        }
-        _ = p.SendEnvelope(req)
-    })
-
-    // --- Ping handler ---
-    n.handlers[MsgTypePing] = func(p *Peer, env *Envelope) {
-        var ping PingPayload
-        if err := UnmarshalPayload(env.Payload, &ping); err != nil {
-            return
-        }
-        pong := PongPayload{Nonce: ping.Nonce}
-        envReply, _ := NewEnvelopeFromPayload(n.protocolVersion, MsgTypePong, pong)
-        if p != nil {
-            _ = p.SendEnvelope(envReply)
-        } else {
-            n.Broadcast(envReply)
-        }
-    }
-
-    // --- Pong handler ---
-    n.handlers[MsgTypePong] = func(p *Peer, env *Envelope) {
-        // No-op – presence of pong is sufficient for liveness
-    }
-
-    // --- Block handler ---
-    n.handlers[MsgTypeBlock] = func(p *Peer, env *Envelope) {
-        var blk ledger.Block
-        if err := UnmarshalPayload(env.Payload, &blk); err != nil {
-            log.Printf("⚠️ Failed to unmarshal block from peer %s: %v", p.addr, err)
-            return
-        }
-
-        if blk.Header.Height <= n.Ledger.GetLatestBlockHeight() {
-            return
-        }
-
-        if n.config.RequireStrictBlockSig {
-            ok, err := blk.VerifySignature()
-            if err != nil || !ok {
-                log.Printf("⚠️ Invalid block signature for block %d from peer %s", blk.Header.Height, p.addr)
-                if p != nil {
-                    p.Penalize(1, 0)
-                    if p.errCount >= n.config.PeerInvalidMsgThreshold {
-                        p.Penalize(0, 5*time.Minute)
-                        log.Printf("p2p: banning peer %s for invalid block signatures", p.addr)
-                    }
-                }
-                return
-            }
-        }
-
-        if err := n.Ledger.AddBlock(&blk); err != nil {
-            log.Printf("⚠️ Failed to add block from peer %s: %v", p.addr, err)
-            return
-        }
-
-        log.Printf("✅ Block %d added from peer %s", blk.Header.Height, p.addr)
-    }
-
-    // --- Transaction handler ---
-    n.handlers[MsgTypeTx] = func(p *Peer, env *Envelope) {
-        var tx ledger.Transaction
-        if err := UnmarshalPayload(env.Payload, &tx); err != nil {
-            log.Printf("⚠️ Failed to unmarshal transaction from peer %s: %v", p.addr, err)
-            return
-        }
-
-        if !tx.IsReward && tx.AmountIM > 0 {
-            log.Printf("❌ Invalid IMANI transfer attempted by %s (retrocompatibility enforcement)", tx.From)
-            p.Penalize(1, 0)
-            return
-        }
-
-        msg, err := n.Ledger.ApplyAndPersistTransaction(&tx)
-        if err != nil {
-            log.Printf("⚠️ Failed to apply transaction from peer %s: %v", p.addr, err)
-            p.Penalize(1, 0)
-            return
-        }
-
-        log.Printf("✅ Transaction applied from peer %s: %s", p.addr, msg)
-        n.BroadcastExcept(env, p)
-    }
-
-    // --- Metrics handler ---
-    n.handlers[MsgTypeMetrics] = func(p *Peer, env *Envelope) {
-        var m MetricsData
-        if err := UnmarshalPayload(env.Payload, &m); err != nil {
-            log.Printf("⚠️ Failed to unmarshal metrics from peer %s: %v", p.addr, err)
-            return
-        }
-
-        n.metricsMu.Lock()
-        n.GlobalMetrics = MetricsPayload{
-            Timestamp:       m.Timestamp,
-            MaxSupply:       m.MaxSupply,
-            Circulating:     m.Circulating,
-            TotalHolders:    m.TotalHolders,
-            MinersCount:     m.MinersCount,
-            MinersRemaining: m.MinersRemaining,
-        }
-        n.metricsMu.Unlock()
-
-        log.Printf("📊 Metrics received from %s — MaxSupply:%d  Circulating:%.2f  TotalHolders:%d  Miners:%d  MinersRemaining:%d",
-            p.addr, m.MaxSupply, m.Circulating, m.TotalHolders, m.MinersCount, m.MinersRemaining)
-    }
-
-    // --- PEERS handler for dynamic discovery ---
-    // Handles incoming peer lists from connected nodes, enabling decentralized peer discovery.
-    // Logs reception details for debugging network propagation and growth.
-    n.handlers[MsgTypePeers] = func(p *Peer, env *Envelope) {
-        var pl PeersPayload
-        if err := UnmarshalPayload(env.Payload, &pl); err != nil {
-            return
-        }
-
-        // LOG: Peer list reception – crucial for diagnosing peer discovery issues
-        log.Printf("[p2p] 📬 Received %d peer address(es) from %s", len(pl.Addrs), p.addr)
-
-        // Optional debug preview: show first few addresses to verify content without flooding logs
-        if len(pl.Addrs) > 0 {
-            preview := pl.Addrs
-            if len(preview) > 3 {
-                preview = preview[:3]
-            }
-            log.Printf("[p2p]   → Example peers: %v", preview)
-        }
-
-        // Process received addresses: attempt outbound connections to new peers
-        for _, addr := range pl.Addrs {
-            if addr == n.listenAddr {
-                continue // Skip self
-            }
-            n.PeersMutex.RLock()
-            alreadyConnected := false
-            for _, peer := range n.Peers {
-                if peer.addr == addr {
-                    alreadyConnected = true
-                    break
-                }
-            }
-            n.PeersMutex.RUnlock()
-            if !alreadyConnected {
-                go n.Connect(addr)
-            }
-        }
-    }
-
-    // --- RequestPeers handler ---
-    // Responds to peer list requests by sending back the node's current known peer addresses.
-    n.handlers[MsgTypeRequestPeers] = func(p *Peer, env *Envelope) {
-        n.SendKnownPeers(p)
-    }
-}
-
-func (n *Node) PeerReconnectLoop() {
-    ticker := time.NewTicker(30 * time.Second)
-    defer ticker.Stop()
-    for {
-        select {
-        case <-n.ctx.Done():
-            return
-        case <-ticker.C:
-            n.PeersMutex.RLock()
-            peersCopy := append([]*Peer(nil), n.Peers...)
-            n.PeersMutex.RUnlock()
-            for _, p := range peersCopy {
-                if !p.IsConnected() {
-                    go func(peer *Peer) {
-                        if err := peer.Connect(); err != nil {
-                            log.Printf("⚠️ failed to reconnect to %s: %v", peer.addr, err)
-                        } else {
-                            log.Printf("🔄 reconnected to peer %s", peer.addr)
-                        }
-                    }(p)
-                }
-            }
-        }
-    }
-}
-
-
-// Envoi de peers connus à un peer
-func (n *Node) SendKnownPeers(p *Peer) {
-    n.PeersMutex.RLock()
-    defer n.PeersMutex.RUnlock()
-
-    addrs := []string{}
-    for _, peer := range n.Peers {
-        if peer != nil && peer.IsConnected() && peer != p {
-            addrs = append(addrs, peer.addr)
-        }
-    }
-
-    env, _ := NewEnvelopeFromPayload(n.protocolVersion, MsgTypePeers, PeersPayload{Addrs: addrs})
-    _ = p.SendEnvelope(env)
-}
-
-// SyncLedgerFromBestPeer synchronizes the local ledger with the peer
-// having the highest known block height. Supports parallel fetching,
-// retry with exponential backoff, ordered insertion, and graceful cancellation.
-func (n *Node) SyncLedgerFromBestPeer(ctx context.Context) {
-    // 0️⃣ Snapshot peers safely
-    n.PeersMutex.RLock()
-    peersCopy := append([]*Peer(nil), n.Peers...)
-    n.PeersMutex.RUnlock()
-
-    if len(peersCopy) == 0 {
-        log.Println("⚠️ No peers available")
-        return
-    }
-
-    // 1️⃣ Identify peer with highest block height
-    var bestPeer *Peer
-    maxHeight := uint64(0)
-    for _, p := range peersCopy {
-        if !p.IsConnected() {
-            continue
-        }
-        p.mu.RLock()
-        height := p.LatestHeight
-        p.mu.RUnlock()
-        if height > maxHeight {
-            maxHeight = height
-            bestPeer = p
-        }
-    }
-
-    if bestPeer == nil {
-        log.Println("⚠️ No suitable peer found")
-        return
-    }
-
-    // 2️⃣ Current ledger height
-    nextHeight := n.Ledger.GetLatestBlockHeight() + 1
-    if nextHeight > maxHeight {
-        log.Println("✅ Ledger is already up-to-date")
-        return
-    }
-
-    log.Printf("⏳ Syncing blocks from height %d to %d", nextHeight, maxHeight)
-
-    // 3️⃣ Prepare segments
-    const segmentSize = 50
-    const maxRetries = 3
-    var segments [][2]uint64
-    for s := nextHeight; s <= maxHeight; s += segmentSize {
-        segEnd := s + segmentSize - 1
-        if segEnd > maxHeight {
-            segEnd = maxHeight
-        }
-        segments = append(segments, [2]uint64{s, segEnd})
-    }
-
-    // 4️⃣ Channels & concurrency
-    blockCh := make(chan *ledger.Block, segmentSize*len(segments))
-    errCh := make(chan error, len(segments))
-    var wg sync.WaitGroup
-    concurrencyLimit := 5
-    sem := make(chan struct{}, concurrencyLimit)
-
-    // 5️⃣ Fetch segment in parallel from multiple peers
-    fetchSegment := func(from, to uint64) {
-        defer wg.Done()
-        attempt := 0
-
-        for attempt < maxRetries {
-            attempt++
-            select {
-            case <-ctx.Done():
-                errCh <- fmt.Errorf("sync cancelled for segment %d-%d", from, to)
-                return
-            default:
-            }
-
-            type result struct {
-                blocks []*ledger.Block
-                err    error
-            }
-            resCh := make(chan result, len(peersCopy))
-
-            // Launch parallel fetch for all peers
-            for _, peer := range peersCopy {
-                if !peer.IsConnected() {
-                    continue
-                }
-                wg.Add(1)
-                go func(p *Peer) {
-                    defer wg.Done()
-                    sem <- struct{}{}
-                    blks, err := p.RequestBlocksRange(from, to)
-                    <-sem
-                    resCh <- result{blocks: blks, err: err}
-                }(peer)
-            }
-
-            // Wait for first successful peer
-            var success bool
-            for i := 0; i < len(peersCopy); i++ {
-                res := <-resCh
-                if res.err == nil && len(res.blocks) > 0 {
-                    for _, blk := range res.blocks {
-                        if blk != nil && blk.Header.Height > 0 {
-                            blockCh <- blk
-                        }
-                    }
-                    success = true
-                    break
-                }
-            }
-
-            close(resCh)
-
-            if success {
-                return
-            }
-
-            // Exponential backoff before retry
-            backoff := time.Duration(1<<attempt) * time.Second
-            log.Printf("⚠️ Segment %d-%d failed on attempt %d, retrying in %s", from, to, attempt, backoff)
-            time.Sleep(backoff)
-        }
-
-        errCh <- fmt.Errorf("failed to sync segment %d-%d after %d attempts", from, to, maxRetries)
-    }
-
-    // 6️⃣ Launch all segment fetches
-    for _, seg := range segments {
-        wg.Add(1)
-        go fetchSegment(seg[0], seg[1])
-    }
-
-    // 7️⃣ Close channels after all goroutines finish
-    go func() {
-        wg.Wait()
-        close(blockCh)
-        close(errCh)
-    }()
-
-    // 8️⃣ Ordered block insertion
-    buffer := make(map[uint64]*ledger.Block)
-    for blk := range blockCh {
-        h := blk.Header.Height
-        buffer[h] = blk
-
-        for {
-            b, ok := buffer[nextHeight]
-            if !ok {
-                break
-            }
-            if err := n.Ledger.AddBlock(b); err != nil {
-                log.Printf("⚠️ Failed to add block %d: %v", nextHeight, err)
-            } else {
-                log.Printf("✅ Block %d synced", nextHeight)
-            }
-            delete(buffer, nextHeight)
-            nextHeight++
-        }
-    }
-
-    // 9️⃣ Log remaining errors
-    for err := range errCh {
-        log.Println("⚠️", err)
-    }
-
-    log.Println("✅ Ledger synchronization completed successfully")
-}
-
-func (n *Node) StartSeedMode() {
-    n.config.IsSeedNode = true
-    log.Println("🌱 Seed mode enabled: responding with peer lists.")
-}
-
-func (n *Node) AllPeers() []*Peer {
-    n.PeersMutex.RLock()
-    defer n.PeersMutex.RUnlock()
-    return append([]*Peer(nil), n.Peers...)
-}
-
-func (n *Node) IsLedgerComplete() bool {
-    if n.PeerCount() == 0 || n.Ledger == nil {
-        return false
-    }
-
-    n.PeersMutex.RLock()
-    defer n.PeersMutex.RUnlock()
-
-    highest := n.Ledger.GetLatestBlockHeight()
-    for _, p := range n.Peers {
-        p.mu.RLock()
-        peerHeight := p.LatestHeight
-        p.mu.RUnlock()
-        if peerHeight > highest {
-            return false
-        }
-    }
-    return true
 }

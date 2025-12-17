@@ -116,79 +116,124 @@ func (n *Node) StartMetricsLoop(_ time.Duration)          {}
 func (n *Node) StartMetricsBroadcastLoop(_ time.Duration) {}
 
 // =============================================================================
-// METRICS À LA DEMANDE (menu 8 + restauration + création)
+// ON-DEMAND METRICS (menu option 8 + miner creation/restoration)
 // =============================================================================
 
+// FetchMetricsNow retrieves the latest network metrics on demand.
+// It is triggered explicitly by user actions (viewing metrics, creating or restoring a miner)
+// rather than running on a periodic timer, ensuring minimal battery and bandwidth usage.
+//
+// Behavior:
+// - If the ledger is unavailable, returns an empty MetricsData struct.
+// - Attempts to gather fresh metrics using the scan package.
+// - Falls back to cached metrics if gathering fails.
+// - Updates the local cached copy and global payload.
+// - Immediately broadcasts the refreshed metrics to all connected peers,
+//   ensuring network-wide consistency when users view sy
+// FetchMetricsNow retrieves the latest network metrics on demand.
+// Enhanced for V3 security:
+// - After gathering fresh metrics, triggers an authenticated broadcast
+//   using the local miner's Ed25519 identity if available.
+// - Ensures metrics announcements are signed when RequireSignedMessages is enabled,
+//   providing trustless proof of origin from a legitimate miner node.
+// - Remains fully mobile-friendly: no periodic background activity.
 func (n *Node) FetchMetricsNow() MetricsData {
-	if n == nil || n.Ledger == nil {
-		return MetricsData{}
-	}
+    if n == nil || n.Ledger == nil {
+        return MetricsData{}
+    }
 
-	md, err := scan.GatherMetrics(n.Ledger)
-	if err != nil || md == nil {
-		return n.GetMetrics()
-	}
+    md, err := scan.GatherMetrics(n.Ledger)
+    if err != nil || md == nil {
+        return n.GetMetrics()
+    }
 
-	// Conversion explicite scan.MetricsData → p2p.MetricsData
-	metrics := MetricsData{
-		Timestamp:       md.Timestamp,
-		MaxSupply:       md.MaxSupply,
-		Circulating:     md.Circulating,
-		TotalHolders:    md.TotalHolders,
-		MinersCount:     md.MinersCount,
-		MinersRemaining: md.MinersRemaining,
-	}
+    // Convert scan metrics to P2P format
+    metrics := MetricsData{
+        Timestamp:       md.Timestamp,
+        MaxSupply:       md.MaxSupply,
+        Circulating:     md.Circulating,
+        TotalHolders:    md.TotalHolders,
+        MinersCount:     md.MinersCount,
+        MinersRemaining: md.MinersRemaining,
+    }
 
-	n.UpdateGlobalMetrics(metrics)
-	return n.GetMetrics()
+    n.UpdateGlobalMetrics(metrics)
+
+    // Broadcast authenticated metrics if we have a local miner with V3 identity
+    // This ensures network-wide metric consistency with cryptographic proof of origin
+    if n.config.RequireSignedMessages {
+        miners, err := n.Ledger.ListAllMiners()
+        if err == nil && len(miners) > 0 {
+            miner := &miners[0]
+            if ledger.EnsureMinerSignature(miner) == nil {
+                // Attach MinerInfo to the metrics envelope for identity proof
+                env, err := NewEnvelopeFromPayload(n.ProtocolVersion(), MsgTypeMetrics, n.GlobalMetrics)
+                if err == nil {
+                    env.MinerInfo = &MinerInfo{
+                        MinerID:   miner.ID,
+                        Timestamp: env.Timestamp,
+                        PubKey:    miner.PubKey,
+                    }
+                    // Signature will be applied automatically in SendEnvelope/BroadcastEnvelope
+                    n.BroadcastEnvelope(env)
+                    return n.GetMetrics()
+                }
+            }
+        }
+    }
+
+    // Fallback: unsigned broadcast (compatible with light nodes or pre-V3)
+    n.BroadcastMetricsOnce()
+
+    return n.GetMetrics()
 }
 
+// BroadcastMetricsOnce broadcasts current metrics to all peers.
+// Now deprecated in favor of authenticated broadcast via FetchMetricsNow when possible.
+// Kept for backward compatibility and light nodes without miner identity.
 func (n *Node) BroadcastMetricsOnce() {
-	if n == nil {
-		return
-	}
+    if n == nil {
+        return
+    }
 
-	n.metricsMu.RLock()
-	metrics := n.GlobalMetrics
-	n.metricsMu.RUnlock()
+    n.metricsMu.RLock()
+    metrics := n.GlobalMetrics
+    n.metricsMu.RUnlock()
 
-	env, err := NewEnvelopeFromPayload(n.ProtocolVersion(), MsgTypeMetrics, metrics)
-	if err != nil {
-		return
-	}
-	n.BroadcastEnvelope(env)
+    env, err := NewEnvelopeFromPayload(n.ProtocolVersion(), MsgTypeMetrics, metrics)
+    if err != nil {
+        return
+    }
+
+    // Unsigned broadcast – used only as fallback
+    n.BroadcastEnvelope(env)
 }
 
-// Échantillon aléatoire de mineurs (IDs seulement)
+// GetSampleMiners returns a random sample of at most 'count' miner IDs.
+// Uses Fisher-Yates shuffle on a permutation for efficient unbiased sampling.
 func (n *Node) GetSampleMiners(count int) []string {
-	if n == nil || n.Ledger == nil {
-		return nil
-	}
+    if n == nil || n.Ledger == nil {
+        return nil
+    }
 
-	miners, err := n.Ledger.ListAllMiners() // ← retourne []ledger.Miner
-	if err != nil || len(miners) == 0 {
-		return nil
-	}
+    miners, err := n.Ledger.ListAllMiners()
+    if err != nil || len(miners) == 0 {
+        return nil
+    }
 
-	total := len(miners)
-	if count >= total {
-		count = total
-	}
+    total := len(miners)
+    if count > total {
+        count = total
+    }
 
-	result := make([]string, 0, count)
-	perm := rand.Perm(total)
-	seen := make(map[int]bool)
+    // Generate permutation and take first 'count' unique indices
+    perm := rand.Perm(total)
+    result := make([]string, count)
+    for i := 0; i < count; i++ {
+        result[i] = miners[perm[i]].ID
+    }
 
-	for len(result) < count {
-		idx := perm[len(result)]
-		if seen[idx] {
-			continue
-		}
-		seen[idx] = true
-		result = append(result, miners[idx].ID) // ← on prend uniquement l’ID
-	}
-
-	return result
+    return result
 }
 
 // ShowLiveMetrics displays a snapshot of network metrics and a small sample of miners.

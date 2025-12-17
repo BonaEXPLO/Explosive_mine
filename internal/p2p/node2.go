@@ -144,58 +144,81 @@ func (n *Node) startLightSyncCycles() {
 // =============================================================================
 
 // AutoRegisterLocalMiners announces unregistered local miners to the network.
-// Runs in background, rate-limited, never leaks sacred words or private keys.
+// Updated for full V3 compatibility:
+// - Announces deterministic Ed25519 PubKey (proof of consciousness fingerprint possession)
+// - Envelope is signed using the miner's stateless Ed25519 key when possible
+// - Rate-limited and privacy-preserving: no sacred words or private data ever transmitted
 func (n *Node) AutoRegisterLocalMiners() {
-        ticker := time.NewTicker(3 * time.Minute)
-        defer ticker.Stop()
+    ticker := time.NewTicker(3 * time.Minute)
+    defer ticker.Stop()
 
-        for range ticker.C {
-                miners, err := n.Ledger.ListAllMiners()
-                if err != nil || len(miners) == 0 {
-                        continue
-                }
-
-                const batchSize = 15
-                sent := 0
-
-                for _, m := range miners {
-                        if sent >= batchSize {
-                                break
-                        }
-
-                        // Skip if already registered on-chain
-                        if onChain, _ := n.Ledger.HasMinerOnChain(m.ID); onChain {
-                                continue
-                        }
-
-                        // Avoid spamming: max 1 attempt per 12 minutes
-                        if n.Ledger.HasRecentRegAttempt(m.ID, 12*60*1000) {
-                                continue
-                        }
-
-                        // Public announcement payload — ZERO private data
-                        payload := struct {
-                                MinerID        string `cbor:"miner_id"`
-                                FingerprintSHA string `cbor:"fingerprint_sha3"`
-                                Timestamp      int64  `cbor:"time"`
-                                SourceNode     string `cbor:"source"`
-                        }{
-                                MinerID:        m.ID,
-                                FingerprintSHA: ledger.FingerprintHash(m.ConsciousnessFingerprint),
-                                Timestamp:      time.Now().UnixMilli(),
-                                SourceNode:     string(n.id),
-                        }
-
-                        env, err := NewEnvelopeFromPayload(n.ProtocolVersion(), MsgTypeAnnounceMiner, payload)
-                        if err != nil {
-                                continue
-                        }
-
-                        n.BroadcastEnvelope(env)
-                        _ = n.Ledger.MarkRegistrationAttempt(m.ID)
-                        sent++
-                }
+    for range ticker.C {
+        miners, err := n.Ledger.ListAllMiners()
+        if err != nil || len(miners) == 0 {
+            continue
         }
+
+        const batchSize = 15
+        sent := 0
+
+        for _, m := range miners {
+            if sent >= batchSize {
+                break
+            }
+
+            // Skip if already registered on-chain
+            if onChain, _ := n.Ledger.HasMinerOnChain(m.ID); onChain {
+                continue
+            }
+
+            // Avoid spamming: max 1 attempt per 12 minutes
+            if n.Ledger.HasRecentRegAttempt(m.ID, 12*60*1000) {
+                continue
+            }
+
+            // Ensure V3 deterministic identity is ready
+            if err := ledger.EnsureMinerSignature(&m); err != nil {
+                log.Printf("p2p: skipping miner %s announcement — V3 identity not ready: %v", m.ID, err)
+                continue
+            }
+
+            // Public announcement payload — includes Ed25519 PubKey as strong proof
+            payload := struct {
+                MinerID        string `cbor:"miner_id"`
+                PubKey         []byte `cbor:"pubkey"`                  // Ed25519 public key (deterministic)
+                FingerprintSHA string `cbor:"fingerprint_sha3"`        // Optional: for legacy compatibility
+                Timestamp      int64  `cbor:"time"`
+                SourceNode     string `cbor:"source"`
+            }{
+                MinerID:        m.ID,
+                PubKey:         m.PubKey,
+                FingerprintSHA: ledger.FingerprintHash(m.ConsciousnessFingerprint),
+                Timestamp:      time.Now().UnixMilli(),
+                SourceNode:     string(n.id),
+            }
+
+            env, err := NewEnvelopeFromPayload(n.ProtocolVersion(), MsgTypeAnnounceMiner, payload)
+            if err != nil {
+                continue
+            }
+
+            // Attach MinerInfo for redundancy and faster verification by peers
+            env.MinerInfo = &MinerInfo{
+                MinerID:   m.ID,
+                Timestamp: env.Timestamp,
+                PubKey:    m.PubKey,
+            }
+
+            // The envelope will be automatically signed in SendEnvelope/BroadcastEnvelope
+            // if RequireSignedMessages is enabled and miner key is derivable
+
+            n.BroadcastEnvelope(env)
+            _ = n.Ledger.MarkRegistrationAttempt(m.ID)
+            sent++
+
+            log.Printf("p2p: announced unregistered miner %s with V3 Ed25519 identity", m.ID)
+        }
+    }
 }
 
 // =============================================================================

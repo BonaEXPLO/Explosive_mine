@@ -597,7 +597,7 @@ func handleMine(db *ledger.Ledger, scanner *bufio.Scanner, miner *ledger.Miner, 
         return
     }
 
-    exploReward, err := halving.GetCurrentReward(db.GetDB())
+    exploReward, err := halving.GetCurrentReward(db.DB())
     if err != nil {
         fmt.Println("❌ Failed to get reward:", err)
         return

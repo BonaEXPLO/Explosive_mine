@@ -22,10 +22,10 @@ type MetricsData struct {
 // GatherMetrics calculates live metrics directly from the ledger DB.
 // Logic fully mirrors internal/scan/exploscan.go
 func GatherMetrics(l *ledger.Ledger) (*MetricsData, error) {
-    if l == nil || l.GetDB() == nil {
+    if l == nil || l.DB() == nil {
         return nil, fmt.Errorf("ledger not initialized")
     }
-    db := l.GetDB()
+    db := l.DB()
 
     var maxSupply uint64
     var circulating float64

@@ -24,21 +24,6 @@ const (
 	InvestorPortMax = 59999
 )
 
-// normalizeConsciousnessWords canonicalizes the 4 consciousness words.
-// Collapses whitespace and joins with hyphens → deterministic seed material.
-// Renamed from normalizeAndJoinWords to avoid conflict with node.go.
-func normalizeConsciousnessWords(words []string) string {
-	parts := make([]string, 0, len(words))
-	for _, w := range words {
-		s := strings.TrimSpace(w)
-		s = strings.Join(strings.Fields(s), " ")
-		if s != "" {
-			parts = append(parts, s)
-		}
-	}
-	return strings.Join(parts, "-")
-}
-
 // DerivePort is the single canonical deterministic port derivation routine.
 // Uses full 8-byte entropy → virtually zero collision risk.
 func DerivePort(seed string, minPort, maxPort int) (int, error) {
@@ -52,13 +37,21 @@ func DerivePort(seed string, minPort, maxPort int) (int, error) {
 }
 
 // DeriveMinerPort derives a stable listen port for a registered miner.
-// Requires walletID (miner public address) + exactly 4 consciousness words.
+// Updated to use the exact same canonical identity format as V3 key derivation:
+// "MINER|" + walletID + "|" + words joined by "|"
+// This ensures perfect alignment with DeriveMinerKey() in miner.go.
 func DeriveMinerPort(walletID string, words []string) (int, error) {
-	if len(words) != 4 {
-		return 0, errors.New("miner derivation requires exactly 4 consciousness words")
-	}
-	seed := walletID + ":" + normalizeConsciousnessWords(words)
-	return DerivePort(seed, MinerPortMin, MinerPortMax)
+    if len(words) != 4 {
+        return 0, errors.New("miner port derivation requires exactly 4 consciousness words")
+    }
+
+    // Canonical V3 identity string – MUST match the message signed in SignMinerIdentity()
+    // Format: "MINER|walletID|word1|word2|word3|word4"
+    // This guarantees deterministic alignment with Ed25519 key derivation
+    seedParts := append([]string{"MINER", walletID}, words...)
+    seed := strings.Join(seedParts, "|")
+
+    return DerivePort(seed, MinerPortMin, MinerPortMax)
 }
 
 // DeriveInvestorPort derives a port for non-miner (investor/light) wallets.
@@ -103,62 +96,77 @@ func ApplyDerivedListenAddrToNode(n *Node, walletID string, words []string, wall
 	return addr, nil
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// BLOCK FETCHING – Concurrent, deduplicated block retrieval from all peers
-// ─────────────────────────────────────────────────────────────────────────────
-
 // FetchBlocks retrieves all new blocks since the local ledger height.
-// Runs concurrently across all connected peers, deduplicates by BlockHash,
-// verifies signatures, and returns blocks sorted by height (ascending).
+// Improved to enforce strict V3 signature policy (configurable via NodeConfig.RequireStrictBlockSig),
+// deduplicates by hash, and returns blocks sorted by height for safe sequential application.
+// Concurrent fetching remains mobile-friendly (no excessive goroutines).
 func (n *Node) FetchBlocks() ([]*ledger.Block, error) {
-	if n.Ledger == nil {
-		return nil, errors.New("ledger not initialized")
-	}
+    if n.Ledger == nil {
+        return nil, errors.New("ledger not initialized")
+    }
 
-	latest := n.Ledger.GetLatestBlockHeight()
-	var blocks []*ledger.Block
-	var mu sync.Mutex
-	seen := make(map[string]struct{}) // BlockHash → already processed
-	var wg sync.WaitGroup
+    latest := n.Ledger.GetLatestBlockHeight()
+    var blocks []*ledger.Block
+    var mu sync.Mutex
+    seen := make(map[string]struct{}) // Deduplication by BlockHash
+    var wg sync.WaitGroup
 
-	for _, peer := range n.AllPeers() {
-		if !peer.IsConnected() {
-			continue
-		}
-		wg.Add(1)
-		go func(p *Peer) {
-			defer wg.Done()
-			blks, err := p.RequestBlocksSince(latest)
-			if err != nil {
-				log.Printf("[p2p] FetchBlocks from %s failed: %v", p.Addr(), err)
-				return
-			}
-			for _, b := range blks {
-				if b.Header.Height <= latest {
-					continue
-				}
-				if ok, _ := b.VerifySignature(); !ok {
-					log.Printf("[p2p] Invalid block signature (height %d) from %s", b.Header.Height, p.Addr())
-					continue
-				}
-				mu.Lock()
-				if _, exists := seen[b.BlockHash]; !exists {
-					seen[b.BlockHash] = struct{}{}
-					blocks = append(blocks, b)
-				}
-				mu.Unlock()
-			}
-		}(peer)
-	}
+    peers := n.AllPeers()
+    if len(peers) == 0 {
+        return nil, nil // No peers → nothing to fetch
+    }
 
-	wg.Wait()
+    for _, peer := range peers {
+        if !peer.IsConnected() {
+            continue
+        }
+        wg.Add(1)
+        go func(p *Peer) {
+            defer wg.Done()
+            blks, err := p.RequestBlocksSince(latest)
+            if err != nil {
+                log.Printf("[p2p] FetchBlocks from %s failed: %v", p.Addr(), err)
+                return
+            }
+            for _, b := range blks {
+                // Skip blocks already in local chain
+                if b.Header.Height <= latest {
+                    continue
+                }
 
-	// Sort ascending by height – required for sequential ledger application
-	sort.Slice(blocks, func(i, j int) bool {
-		return blocks[i].Header.Height < blocks[j].Header.Height
-	})
+                // V3-aligned signature verification
+                valid, err := b.VerifySignature()
+                if err != nil {
+                    log.Printf("[p2p] Block %d signature verification error from %s: %v", b.Header.Height, p.Addr(), err)
+                    continue
+                }
+                if !valid {
+                    if n.config.RequireStrictBlockSig {
+                        log.Printf("[p2p] Rejecting unsigned/invalid block %d from %s (strict mode)", b.Header.Height, p.Addr())
+                        continue
+                    }
+                    // Legacy block accepted only if strict mode is disabled
+                    log.Printf("[p2p] Accepting legacy unsigned block %d from %s", b.Header.Height, p.Addr())
+                }
 
-	return blocks, nil
+                mu.Lock()
+                if _, exists := seen[b.BlockHash]; !exists {
+                    seen[b.BlockHash] = struct{}{}
+                    blocks = append(blocks, b)
+                }
+                mu.Unlock()
+            }
+        }(peer)
+    }
+
+    wg.Wait()
+
+    // Sort by height ascending – mandatory for correct ledger application
+    sort.Slice(blocks, func(i, j int) bool {
+        return blocks[i].Header.Height < blocks[j].Header.Height
+    })
+
+    return blocks, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -259,11 +267,13 @@ func initCustomHandlers(n *Node) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // IsOnlineCount returns the number of connected peers across all shards.
-// Optimized for mobile: 
+// Optimized for mobile:
 // - minimal locking
 // - nil-safe
 // - limited checks per shard for CPU efficiency
 // - can be used to adapt Broadcast fanout dynamically
+// IsOnlineCount returns the number of connected peers across all shards.
+
 func (n *Node) IsOnlineCount(maxPerShard int) int {
     total := 0
 
@@ -273,9 +283,6 @@ func (n *Node) IsOnlineCount(maxPerShard int) int {
         sh.mu.RLock()
         checked := 0
         for _, p := range sh.peers {
-            if p == nil {
-                continue
-            }
             if p.IsConnected() {
                 total++
             }

@@ -26,7 +26,9 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+        "crypto/ed25519"
 	"time"
+        "github.com/fxamacker/cbor/v2"
         "explosive/internal/ledger"
 )
 
@@ -208,34 +210,112 @@ func (p *Peer) Connect() error {
 }
 
 // sendHandshake sends the local node's handshake to the peer.
-// NOTE: Transport-level identity proofs / signature of handshake should be
-// implemented at the transport or node layer. Keep handshake compact here.
+// Fixed: safe handling when no local miner (light/investor nodes)
+// Signs only if miner exists and V3 identity is ready.
 func (p *Peer) sendHandshake() error {
-	if p.node == nil {
-		return errors.New("missing node reference")
-	}
-	// Use Node's internal fields (id, listenAddr, userAgent, networkID)
-	h := HandshakePayload{
-		PeerID:     string(p.node.id),
-		ListenAddr: p.node.listenAddr,
-		Version:    p.node.userAgent,
-		Network:    p.node.networkID,
-	}
-	env, err := NewEnvelopeFromPayload(p.node.protocolVersion, MsgTypeHandshake, h)
-	if err != nil {
-		return err
-	}
-	return p.SendEnvelope(env)
+    if p.node == nil {
+        return errors.New("missing node reference")
+    }
+
+    // Build handshake payload (always sent)
+    h := HandshakePayload{
+        PeerID:     string(p.node.id),
+        ListenAddr: p.node.listenAddr,
+        Version:    p.node.userAgent,
+        Network:    p.node.networkID,
+    }
+
+    env, err := NewEnvelopeFromPayload(p.node.ProtocolVersion(), MsgTypeHandshake, h)
+    if err != nil {
+        return err
+    }
+
+    // Optional V3 identity attachment and signing
+    if p.node.Ledger != nil && p.node.config.RequireSignedMessages {
+        miners, err := p.node.Ledger.ListAllMiners()
+        if err == nil && len(miners) > 0 {
+            miner := &miners[0]
+
+            // Safely ensure V3 identity
+            if err := ledger.EnsureMinerSignature(miner); err == nil {
+                priv, _, err := ledger.DeriveMinerKey(miner.ID, miner.ConsciousnessFingerprint)
+                if err != nil {
+                    log.Printf("p2p: failed to derive key for handshake signing: %v", err)
+                } else {
+                    // Canonical signing data
+                    canon := struct {
+                        V  uint16      `cbor:"v"`
+                        T  MessageType `cbor:"t"`
+                        P  []byte      `cbor:"p,omitempty"`
+                        Ts int64       `cbor:"ts"`
+                    }{
+                        V:  env.Version,
+                        T:  env.Type,
+                        P:  env.Payload,
+                        Ts: env.Timestamp,
+                    }
+                    if msg, err := cbor.Marshal(canon); err == nil {
+                        env.Signature = ed25519.Sign(priv, msg)
+                        env.PubKey = miner.PubKey
+                        env.MinerInfo = &MinerInfo{
+                            MinerID:   miner.ID,
+                            Timestamp: env.Timestamp,
+                            PubKey:    miner.PubKey,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return p.SendEnvelope(env)
 }
 
-// SendEnvelope serializes the envelope and enqueues it for sending.
-// Non-blocking: when send queue is full we drop-oldest then enqueue.
-
 // SendEnvelope serializes and enqueues an envelope for sending.
-// Ensures TX messages are flushed immediately (no drop/silent loss).
+// Fixed: safe signing path when no miner or errors occur.
+// Critical messages (Tx, Block, AnnounceMiner) get MinerInfo attached.
 func (p *Peer) SendEnvelope(e *Envelope) error {
     if p.node == nil {
         return errors.New("missing node reference")
+    }
+
+    // Automatic signing if enabled and miner available
+    if p.node.config.RequireSignedMessages && p.node.Ledger != nil && e.Type != MsgTypeHandshake {
+        miners, err := p.node.Ledger.ListAllMiners()
+        if err == nil && len(miners) > 0 {
+            miner := &miners[0]
+            if ledger.EnsureMinerSignature(miner) == nil {
+                priv, _, err := ledger.DeriveMinerKey(miner.ID, miner.ConsciousnessFingerprint)
+                if err == nil {
+                    canon := struct {
+                        V  uint16      `cbor:"v"`
+                        T  MessageType `cbor:"t"`
+                        P  []byte      `cbor:"p,omitempty"`
+                        Ts int64       `cbor:"ts"`
+                    }{
+                        V:  e.Version,
+                        T:  e.Type,
+                        P:  e.Payload,
+                        Ts: e.Timestamp,
+                    }
+                    if msg, err := cbor.Marshal(canon); err == nil {
+                        e.Signature = ed25519.Sign(priv, msg)
+                        e.PubKey = miner.PubKey
+
+                        // Attach identity proof for key message types
+                        if e.Type == MsgTypeTx || e.Type == MsgTypeBlock || e.Type == MsgTypeAnnounceMiner || e.Type == MsgTypeMetrics {
+                            if e.MinerInfo == nil {
+                                e.MinerInfo = &MinerInfo{
+                                    MinerID:   miner.ID,
+                                    Timestamp: e.Timestamp,
+                                    PubKey:    miner.PubKey,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     b, err := EncodeEnvelope(e)
@@ -243,7 +323,6 @@ func (p *Peer) SendEnvelope(e *Envelope) error {
         return fmt.Errorf("encode envelope: %w", err)
     }
 
-    // Respect max message size
     max := p.node.config.MaxMsgSize
     if max <= 0 {
         max = 4 * 1024 * 1024
@@ -258,34 +337,31 @@ func (p *Peer) SendEnvelope(e *Envelope) error {
     default:
     }
 
-    // TX messages: priorité, jamais drop
     if e.Type == MsgTypeTx {
         select {
         case p.sendQ <- b:
             return nil
         default:
-            // si queue pleine, on augmente le score d'erreur
             p.Penalize(1, 0)
             return errors.New("TX queue full")
         }
     }
 
-    // Messages normaux: drop oldest si nécessaire
     for {
         select {
         case p.sendQ <- b:
             return nil
         default:
-            // Drop oldest pour faire de la place
             select {
             case <-p.sendQ:
             default:
-                // impossible de drop, on retourne erreur
-                return errors.New("send queue full, cannot enqueue")
+                return errors.New("send queue full")
             }
         }
     }
 }
+
+
 
 // Close gracefully shuts down peer: cancels context, closes conn and waits loops.
 func (p *Peer) Close() {
@@ -471,33 +547,42 @@ func (p *Peer) RequestBlocksSince(height uint64) ([]*ledger.Block, error) {
     return nil, fmt.Errorf("RequestBlocksSince not implemented")
 }
 
-// internal/p2p/peer.go
-
-func (p *Peer) SendData(data []byte) error {
-    if p == nil || !p.IsConnected() {
-        return fmt.Errorf("peer not connected")
-    }
-
-    env := &Envelope{
-        Version:   1,
-        Type:      MsgTypeCustomData,
-        Payload:   data,
-        Timestamp: time.Now().UnixMilli(),
-    }
-    return p.SendEnvelope(env)
-}
-
-// GetLatestBlockHeight returns the last known block height of the peer
-func (p *Peer) GetLatestBlockHeight() (uint64, error) {
-    if p.LatestHeight == 0 {
-        return 0, fmt.Errorf("peer height unknown")
-    }
-    return p.LatestHeight, nil
-}
-
-// RequestBlocksRange requests blocks from 'from' to 'to' (inclusive) from this peer.
-// Returns a slice of ledger.Block. For now, it's a stub; real implementation requires P2P request.
+// RequestBlocksRange sends a request to the remote peer for a range of blocks
+// from height 'from' to 'to' (inclusive).
+//
+// This is a fire-and-forget operation: the function only sends the request
+// envelope and returns immediately. The actual blocks are delivered asynchronously
+// via the node's MsgTypeBlocksResponse handler, which processes the response
+// and adds the received blocks to the local ledger.
+//
+// This design keeps the P2P layer non-blocking and mobile-friendly while
+// allowing concurrent requests to multiple peers during ledger synchronization.
+//
+// Returns:
+//   - nil, nil on successful enqueue of the request
+//   - an error if envelope creation or sending fails
+// RequestBlocksRange sends a GetBlocksRange request to the peer.
+// Now returns ([]*ledger.Block, error) to allow synchronous use during sync,
+// but remains non-blocking at network level. Response handled via node handler.
+// RequestBlocksRange sends a GetBlocksRange request to the peer.
+// Currently fire-and-forget (response handled asynchronously).
+// Returns nil blocks to reflect current design.
 func (p *Peer) RequestBlocksRange(from, to uint64) ([]*ledger.Block, error) {
-    // TODO: implement real P2P request
-    return []*ledger.Block{}, nil
+    if p.node == nil {
+        return nil, errors.New("no node reference")
+    }
+
+    payload := GetBlocksRangePayload{From: from, To: to}
+    env, err := NewEnvelopeFromPayload(p.node.ProtocolVersion(), MsgTypeGetBlocksRange, payload)
+    if err != nil {
+        return nil, err
+    }
+
+    if err := p.SendEnvelope(env); err != nil {
+        return nil, err
+    }
+
+    // Response arrives via node handler (MsgTypeBlocksResponse)
+    return nil, nil
 }
+

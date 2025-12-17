@@ -630,3 +630,23 @@ func (l *Ledger) DumpLedger() error {
 
     return nil
 }
+
+// GetBlocksRange returns all available blocks in the range [from, to] inclusive.
+// It is used by the P2P layer to serve block synchronization requests from peers.
+// Missing blocks (gaps) are skipped — this should not occur in a healthy chain.
+func (l *Ledger) GetBlocksRange(from, to uint64) ([]*Block, error) {
+    if l == nil || l.db == nil {
+        return nil, errors.New("ledger not initialized")
+    }
+
+    var blocks []*Block
+    for h := from; h <= to; h++ {
+        blk, err := l.GetBlockByHeight(h)
+        if err != nil {
+            // Log if you want, but continue — gaps should be rare
+            continue
+        }
+        blocks = append(blocks, blk)
+    }
+    return blocks, nil
+}
