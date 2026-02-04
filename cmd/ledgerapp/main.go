@@ -5,14 +5,14 @@ import (
 	"bufio"
 	"fmt"
         "flag"
-        "os/signal"
-        "syscall"
 	"log"
 	"os"
+        "sort"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+        "explosive/internal/address"
         "explosive/internal/imanifund"
         "github.com/fxamacker/cbor/v2"
 
@@ -27,78 +27,94 @@ import (
 // Toggle password masking (false = clear text, true = hidden)
 var hidePassword = false
 
-// start node, attach ledger, set up handlers, start Exploscan and request initial sync
-func startP2PNodeForMiner(listenAddr string, db *ledger.Ledger, minerID string) (*p2p.Node, chan struct{}, error) {
-    node := p2p.NewNode(listenAddr, "explosive-mainnet", "ledger-client")
+// startP2PNodeForMiner starts the P2P node, attaches the ledger, sets up handlers,
+// starts Exploscan and triggers an initial sync request.
+// It adapts to the new NewNode signature that supports deterministic TLS certificates.
+func startP2PNodeForMiner(listenAddr string, db *ledger.Ledger, minerID string, sacredWords []string) (*p2p.Node, chan struct{}, error) {
+    var node *p2p.Node
+    var err error
+
+    // Create node with miner identity if available (for deterministic V3 TLS cert)
+    // Fallback to empty identity if no miner yet (light mode or initial startup)
+    if minerID != "" && len(sacredWords) == 4 {
+        node, err = p2p.NewNode(listenAddr, "explosive-mainnet", "ledger-client", minerID, sacredWords)
+    } else {
+        node, err = p2p.NewNode(listenAddr, "explosive-mainnet", "ledger-client", "", nil)
+    }
+    if err != nil {
+        return nil, nil, fmt.Errorf("failed to create P2P node: %w", err)
+    }
+
     node.Ledger = db
 
     // Register custom message handler (replaces old OnMessage)
-p2p.RegisterCustomHandler(func(peer *p2p.Peer, payload []byte) {
-    var msg struct {
-        Type string `cbor:"type"`
-    }
-    if err := cbor.Unmarshal(payload, &msg); err != nil {
-        return
-    }
+    p2p.RegisterCustomHandler(func(peer *p2p.Peer, payload []byte) {
+        var msg struct {
+            Type string `cbor:"type"`
+        }
+        if err := cbor.Unmarshal(payload, &msg); err != nil {
+            return
+        }
 
-    switch msg.Type {
-    case "BALANCE_UPDATE":
-        var bal struct {
-            Addr   string  `cbor:"addr"`
-            Exp    float64 `cbor:"exp"`
-            Imani  float64 `cbor:"imani"`
-        }
-        if err := cbor.Unmarshal(payload, &bal); err == nil {
-            fmt.Printf("Balance update for %s: %.4f EXPLO / %.4f IMANI\n", bal.Addr, bal.Exp, bal.Imani)
-        }
-    case "LEDGER_SYNC":
-        var sync struct {
-            Data []wallet.Transaction `cbor:"data"`
-        }
-        if err := cbor.Unmarshal(payload, &sync); err == nil {
-            fmt.Printf("LEDGER_SYNC received: %d transactions\n", len(sync.Data))
-            for _, tx := range sync.Data {
-                _ = wallet.SaveTransaction(nil, tx)
+        switch msg.Type {
+        case "BALANCE_UPDATE":
+            var bal struct {
+                Addr  string  `cbor:"addr"`
+                Exp   float64 `cbor:"exp"`
+                Imani float64 `cbor:"imani"`
+            }
+            if err := cbor.Unmarshal(payload, &bal); err == nil {
+                fmt.Printf("Balance update for %s: %.4f EXPLO / %.4f IMANI\n", bal.Addr, bal.Exp, bal.Imani)
+            }
+        case "LEDGER_SYNC":
+            var sync struct {
+                Data []wallet.Transaction `cbor:"data"`
+            }
+            if err := cbor.Unmarshal(payload, &sync); err == nil {
+                fmt.Printf("LEDGER_SYNC received: %d transactions\n", len(sync.Data))
+                for _, tx := range sync.Data {
+                    _ = wallet.SaveTransaction(nil, tx)
+                }
             }
         }
-    }
-})
+    })
 
     // Start node
     if err := node.Start(); err != nil {
         return nil, nil, fmt.Errorf("failed to start P2P node: %w", err)
     }
 
-    // 🔹 Bootstrap peers (connect + LightSync + AutoRegisterLocalMiners)
+    // Bootstrap peers (connect + LightSync + AutoRegisterLocalMiners)
     go node.Bootstrap()
 
     // Attach node to wallet package so wallet functions can broadcast if needed
     wallet.SetActiveNode(node)
+
     // Start Exploscan (gathers and broadcasts metrics periodically)
     stopScan := make(chan struct{})
     go scan.StartExploscan(db, node, stopScan)
 
     // Small initial request for blocks / sync
-go func() {
-    time.Sleep(800 * time.Millisecond)
-    fmt.Println("📡 Requesting initial ledger sync from peers...")
+    go func() {
+        time.Sleep(800 * time.Millisecond)
+        fmt.Println("📡 Requesting initial ledger sync from peers...")
 
-    blocks, err := node.FetchBlocks()
-    if err != nil {
-        fmt.Printf("⚠️ Initial FetchBlocks failed: %v\n", err)
-        return
-    }
-
-    for _, blk := range blocks {
-        if err := db.ApplyBlock(blk); err != nil {
-            fmt.Printf("⚠️ Failed to apply block %d: %v\n", blk.Header.Height, err)
-        } else {
-            fmt.Printf("✅ Applied block %d\n", blk.Header.Height)
+        blocks, err := node.FetchBlocks()
+        if err != nil {
+            fmt.Printf("⚠️ Initial FetchBlocks failed: %v\n", err)
+            return
         }
-    }
 
-    fmt.Println("📡 Initial ledger sync completed.")
-}()
+        for _, blk := range blocks {
+            if err := db.ApplyBlock(blk); err != nil {
+                fmt.Printf("⚠️ Failed to apply block %d: %v\n", blk.Header.Height, err)
+            } else {
+                fmt.Printf("✅ Applied block %d\n", blk.Header.Height)
+            }
+        }
+
+        fmt.Println("📡 Initial ledger sync completed.")
+    }()
 
     return node, stopScan, nil
 }
@@ -163,11 +179,44 @@ if err := imanifund.Init(func(minerID string, amount float64) error {
         log.Fatal("❌ Failed to initialize NetworkID:", err)
     }
 
-    // ===== 3. Auto-restore the latest snapshot =====
-    // Attempt to restore the most recent snapshot for faster startup
-    if !ledger.AutoRestoreLatestSnapshot(db, snapshotDir) {
-        log.Println("⚠️ No snapshot restored → starting from genesis")
+    // ===== 3. Snapshot restore (SAFE MODE) =====
+
+snapshots, _ := filepath.Glob("snapshot-*.slex")
+
+if len(snapshots) == 0 {
+
+    log.Println("ℹ No snapshot found — restoring from blocks only")
+
+    if err := db.RebuildMetaValuesFromBlocks(); err != nil {
+        log.Fatalf("Ledger rebuild failed: %v", err)
     }
+
+    log.Println("✅ Ledger restored purely from block storage")
+
+} else {
+
+    sort.Slice(snapshots, func(i, j int) bool {
+        return snapshots[i] > snapshots[j] // newest first
+    })
+
+    latest := snapshots[0]
+
+    log.Printf("📦 Attempting snapshot restore: %s", latest)
+
+    if err := db.TryRestoreSnapshotSafe(latest); err != nil {
+
+       log.Println("⚠ Snapshot corrupted or incompatible — skipping")
+
+        if err := db.RebuildMetaValuesFromBlocks(); err != nil {
+            log.Fatalf("Ledger rebuild failed: %v", err)
+        }
+
+        log.Println("✅ Ledger restored purely from block storage")
+
+    } else {
+        log.Println("✅ Snapshot restored successfully")
+    }
+}
 
     // ===== 4. Start SnapshotManager =====
     // Start background snapshot manager to periodically create verified snapshots
@@ -189,35 +238,29 @@ if err := imanifund.Init(func(minerID string, amount float64) error {
     // ----- Headless / node mode -----
     // If running in headless mode, start P2P node if requested and wait for shutdown signals
     if *flagHeadless || *flagNode {
-        if *flagP2P {
-            listen := fmt.Sprintf(":%d", *flagPort)
-            fmt.Printf("🚀 Starting EXPLOSIVE P2P Node (HEADLESS) on %s ...\n", listen)
-            n, stop, err := startP2PNodeForMiner(listen, db, "")
-            if err != nil {
-                log.Fatalf("❌ Failed to start P2P node: %v", err)
-            }
-            node = n
-            scanStop = stop
-            fmt.Printf("📡 P2P node started on %s\n", listen)
-        } else {
-            fmt.Println("⚠️ Running in headless mode without --p2P: no network started.")
-        }
 
-        // Wait for termination signals (SIGINT / SIGTERM) to gracefully shutdown
-        sig := make(chan os.Signal, 1)
-        signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-        <-sig
-        fmt.Println("\n🛑 Shutdown signal received, stopping node...")
-
-        if scanStop != nil {
-            close(scanStop)
-        }
-        if node != nil {
-            node.Stop()
-        }
-        fmt.Println("✅ Node stopped, exiting.")
-        return
+    if !*flagP2P {
+        log.Fatal("❌ Headless mode requires --p2p")
     }
+
+    listen := fmt.Sprintf(":%d", *flagPort)
+    fmt.Printf("🚀 Starting EXPLOSIVE P2P Node (HEADLESS) on %s ...\n", listen)
+
+    n, stop, err := startP2PNodeForMiner(listen, db, "", nil)
+    if err != nil {
+        log.Fatalf("❌ Failed to start P2P node: %v", err)
+    }
+
+    node = n
+    scanStop = stop
+
+    fmt.Println("📡 P2P node running permanently in headless mode")
+
+    // 🔒 Keep process alive forever (true server behavior)
+    for {
+        time.Sleep(24 * time.Hour)
+    }
+}
 
     // ----- Interactive CLI -----
     // Start the command-line interface for miner operations
@@ -256,8 +299,8 @@ mainLoop:
                 if err != nil {
                     log.Fatal("❌ Cannot derive listen address:", err)
                 }
-                n, stop, err := startP2PNodeForMiner(listenAddr, db, currentMiner.ID)
-                if err != nil {
+                n, stop, err := startP2PNodeForMiner(listenAddr, db, currentMiner.ID, currentMiner.ConsciousnessFingerprint)
+                   if err != nil {
                     log.Fatalf("❌ Failed to start P2P node: %v", err)
                 }
                 node = n
@@ -269,9 +312,9 @@ metrics := p2p.MetricsData{
     Timestamp:       md.Timestamp,
     MaxSupply:       md.MaxSupply,
     Circulating:     md.Circulating,
-    TotalHolders:    md.TotalHolders,
-    MinersCount:     md.MinersCount,
-    MinersRemaining: md.MinersRemaining,
+    TotalHolders:    int(md.TotalHolders),
+    MinersCount:     int(md.MinersCount),
+    MinersRemaining: int(md.MinersRemaining),
 }
 node.UpdateGlobalMetrics(metrics)
 fmt.Println("📊 Global metrics initialized from ledger.")
@@ -290,8 +333,8 @@ fmt.Println("📊 Global metrics initialized from ledger.")
                 if err != nil {
                     log.Fatal("❌ Cannot derive listen address:", err)
                 }
-                n, stop, err := startP2PNodeForMiner(listenAddr, db, currentMiner.ID)
-                if err != nil {
+                n, stop, err := startP2PNodeForMiner(listenAddr, db, currentMiner.ID, currentMiner.ConsciousnessFingerprint)
+                    if err != nil {
                     log.Fatalf("❌ Failed to start P2P node: %v", err)
                 }
                 node = n
@@ -303,9 +346,9 @@ metrics := p2p.MetricsData{
     Timestamp:       md.Timestamp,
     MaxSupply:       md.MaxSupply,
     Circulating:     md.Circulating,
-    TotalHolders:    md.TotalHolders,
-    MinersCount:     md.MinersCount,
-    MinersRemaining: md.MinersRemaining,
+    TotalHolders:    int(md.TotalHolders),
+    MinersCount:     int(md.MinersCount),
+    MinersRemaining: int(md.MinersRemaining),
 }
 node.UpdateGlobalMetrics(metrics)
 fmt.Println("📊 Global metrics initialized from ledger.")
@@ -324,8 +367,8 @@ fmt.Println("📊 Global metrics initialized from ledger.")
             if err != nil {
                 log.Fatal("❌ Cannot derive listen address:", err)
             }
-            n, stop, err := startP2PNodeForMiner(listenAddr, db, currentMiner.ID)
-            if err != nil {
+            n, stop, err := startP2PNodeForMiner(listenAddr, db, currentMiner.ID, currentMiner.ConsciousnessFingerprint)
+               if err != nil {
                 log.Fatalf("❌ Failed to start P2P node: %v", err)
             }
             node = n
@@ -517,46 +560,61 @@ func handleCreateMiner(db *ledger.Ledger, scanner *bufio.Scanner, node *p2p.Node
 }
 
 func handleRestoreMiner(db *ledger.Ledger, scanner *bufio.Scanner) *ledger.Miner {
-    fmt.Println("\n♻️ Restore Miner Account")
-    id := readInput(scanner, "Enter miner ID (ex: explo + 40 hex + 8 checksum, total 53 chars): ")
+    fmt.Println("\n♻️ Restore Miner Account (Universal Restoration)")
 
-    var stored ledger.Miner
-    err := db.GetObject([]byte("miner:"+id), &stored)
-    if err != nil {
-        fmt.Println("❌ Miner not found:", err)
+    // --- Miner ID ---
+    id := strings.TrimSpace(
+        readInput(scanner, "Enter miner ID (ex: explo + 40 hex + 8 checksum, total 53 chars): "),
+    )
+
+    if !address.IsValidEXPLOAddress(id) {
+        fmt.Println("❌ Invalid miner ID format.")
         return nil
     }
 
+    // --- Sacred words ---
     fmt.Println("Enter your 4 sacred words in order:")
     words := make([]string, 4)
+
     for i := 0; i < 4; i++ {
         for {
-            word := strings.TrimSpace(readInput(scanner, fmt.Sprintf("Word #%d: ", i+1)))
+            word := strings.TrimSpace(
+                readInput(scanner, fmt.Sprintf("Word #%d: ", i+1)),
+            )
+
             if !ledger.IsValidSacredWordFormat(word) {
                 fmt.Println("⚠️ Invalid format. Must start with uppercase, ≥4 chars, letters and '-' allowed.")
                 continue
             }
+
             words[i] = word
             break
         }
     }
 
-    newPass := readPassword(scanner, "Enter a new password for restoration: ")
+    // --- New password for this device ---
+    newPass := readPassword(scanner, "Enter a NEW password for this device: ")
+    if len(newPass) < 6 {
+        fmt.Println("❌ Password too short (minimum 6 characters).")
+        return nil
+    }
 
-    miner, msg, err := ledger.RestoreMiner(id, words, newPass, db)
+    // --- Universal restoration ---
+    miner, guardianMsg, err := ledger.RestoreMinerUniversal(
+        id,
+        words,
+        newPass,
+        db, // ledger used ONLY for local persistence
+    )
     if err != nil {
         fmt.Println("❌ Failed to restore miner:", err)
         return nil
     }
 
-    err = db.PutObject([]byte("miner:"+id), miner)
-    if err != nil {
-        fmt.Println("❌ Failed to save restored miner:", err)
-        return nil
-    }
-
     fmt.Println("✅ Miner restored successfully:", miner.ID)
-    fmt.Println("💬 Guardian says:", msg)
+    fmt.Println("🔐 Identity regenerated deterministically and secured for this device.")
+    fmt.Println("💬 Guardian says:", guardianMsg)
+
     return miner
 }
 
@@ -592,7 +650,7 @@ func handleMine(db *ledger.Ledger, scanner *bufio.Scanner, miner *ledger.Miner, 
         break
     }
 
-    if err := ledger.Mine(db, miner, state, donation); err != nil {
+    if err := ledger.Mine(db, miner, state, donation, node); err != nil {
         fmt.Println("❌ Mining failed:", err)
         return
     }
@@ -655,9 +713,9 @@ func handleMine(db *ledger.Ledger, scanner *bufio.Scanner, miner *ledger.Miner, 
                 Timestamp:       md.Timestamp,
                 MaxSupply:       md.MaxSupply,
                 Circulating:     md.Circulating,
-                TotalHolders:    md.TotalHolders,
-                MinersCount:     md.MinersCount,
-                MinersRemaining: md.MinersRemaining,
+                TotalHolders:    int(md.TotalHolders),
+                MinersCount:     int(md.MinersCount),
+                MinersRemaining: int(md.MinersRemaining),
             }
             node.UpdateGlobalMetrics(pm)
             fmt.Println("📊 Global metrics updated after mining.")

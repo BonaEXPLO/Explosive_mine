@@ -11,12 +11,12 @@ import (
 
 // MetricsData holds live chain statistics.
 type MetricsData struct {
-    Timestamp       int64   `json:"timestamp"`
-    MaxSupply       uint64  `json:"max_supply"`
-    Circulating     float64 `json:"circulating"`
-    TotalHolders    int     `json:"total_holders"`
-    MinersCount     int     `json:"miners_count"`
-    MinersRemaining int     `json:"miners_remaining"`
+	Timestamp       int64   `json:"timestamp"`
+	MaxSupply       float64 `json:"max_supply"`   // in EXPLO for human readability
+	Circulating     float64 `json:"circulating"`
+	TotalHolders    int     `json:"total_holders"`
+	MinersCount     int     `json:"miners_count"`
+	MinersRemaining int     `json:"miners_remaining"`
 }
 
 // GatherMetrics calculates live metrics directly from the ledger DB.
@@ -35,9 +35,9 @@ func GatherMetrics(l *ledger.Ledger) (*MetricsData, error) {
     balanceHasMiner := make(map[string]bool)
 
     // 1️⃣ MaxSupply
-    if ledger.MaxSupplyEXPLO > 0 {
-        maxSupply = ledger.MaxSupplyEXPLO
-    }
+    if maxSupply == 0 {
+	maxSupply = ledger.MaxPastaboSupply
+}
 
     // try read from DB
     _ = db.View(func(txn *badger.Txn) error {
@@ -113,7 +113,7 @@ func GatherMetrics(l *ledger.Ledger) (*MetricsData, error) {
     // return metrics
     return &MetricsData{
         Timestamp:       time.Now().Unix(),
-        MaxSupply:       maxSupply,
+        MaxSupply: float64(maxSupply) / float64(ledger.PastaboPerEXPLO),
         Circulating:     circulating,
         TotalHolders:    totalHolders,
         MinersCount:     minersCount,

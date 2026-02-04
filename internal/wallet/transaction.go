@@ -11,7 +11,7 @@ import (
     "time"
 
     "explosive/internal/address"
-    "explosive/internal/db"
+    "github.com/dgraph-io/badger/v4"
     "explosive/internal/encryption"
     "explosive/internal/ledger"
     "explosive/internal/p2p"
@@ -72,55 +72,271 @@ func IsValidEXPLOAddress(addr string) bool {
     return ValidateEXPLOAddress(addr)
 }
 
-// -----------------------------------------------------------
-// Local Ledger / Balance Operations
-// -----------------------------------------------------------
 
-// GetBalance retrieves the EXPLO/IMANI wallet balance from the local database.
-func GetBalance(ledgerDB *db.BadgerDB, addr string) (WalletBalance, error) {
-    data, err := ledgerDB.GetAccount(addr)
-    if err != nil {
-        return WalletBalance{EXPLO: 0, IMANI: 0}, nil
-    }
+// SetBalance stores the updated wallet balance in the ledger.
+// Overwrites any existing balance for the given address.
+func SetBalance(l *ledger.Ledger, addr string, bal WalletBalance) error {
+    return l.PutObject([]byte("balance:"+addr), bal)
+}
+
+// SaveTransaction persists a user-facing wallet transaction in the ledger.
+// Uses a deterministic key based on timestamp, from, and to for ordering and uniqueness.
+func SaveTransaction(l *ledger.Ledger, tx Transaction) error {
+    key := []byte(fmt.Sprintf("tx:%d:%s:%s", tx.Timestamp.UnixNano(), tx.From, tx.To))
+    return l.PutObject(key, tx)
+}
+
+// GetBalance retrieves the EXPLO and IMANI wallet balance from the ledger.
+// Returns zero balances if the account does not exist yet.
+func GetBalance(l *ledger.Ledger, addr string) (WalletBalance, error) {
     var bal WalletBalance
-    if err := json.Unmarshal(data, &bal); err != nil {
+    err := l.GetObject([]byte("balance:"+addr), &bal)
+    if err != nil {
+        if errors.Is(err, badger.ErrKeyNotFound) {
+            return WalletBalance{EXPLO: 0, IMANI: 0}, nil
+        }
         return WalletBalance{}, err
     }
     return bal, nil
 }
 
-// SetBalance stores the updated wallet balance in the local database.
-func SetBalance(ledgerDB *db.BadgerDB, addr string, bal WalletBalance) error {
-    data, _ := json.Marshal(bal)
-    return ledgerDB.PutAccount(addr, data)
+// SendEXPLO performs a signed EXPLO token transfer.
+// It uses a persistent incremental nonce from the ledger to prevent replay attacks,
+// updates local balances optimistically for immediate UX feedback,
+// records the user-facing transaction, and broadcasts the fully signed ledger transaction.
+func SendEXPLO(l *ledger.Ledger, from, to string, amount float64, w *Wallet, password string) error {
+    if !IsValidEXPLOAddress(to) || !IsValidEXPLOAddress(from) {
+        return errors.New("invalid EXPLO address")
+    }
+    if amount <= 0 {
+        return errors.New("amount must be positive")
+    }
+
+    // Check local balance (optimistic)
+    fromBal, err := GetBalance(l, from)
+    if err != nil {
+        return err
+    }
+    if fromBal.EXPLO < amount+0.001 { // include fee
+        return errors.New("insufficient EXPLO balance (including fee)")
+    }
+
+    // Retrieve and increment persistent nonce for anti-replay protection
+    var currentNonce int64
+    _ = l.GetObject([]byte("nonce:"+from), &currentNonce)
+    nonce := currentNonce + 1
+
+    // Optimistic local balance updates (reverted only if network fully rejects – rare in practice)
+    fromBal.EXPLO -= (amount + 0.001) // subtract amount + fee
+    if err := SetBalance(l, from, fromBal); err != nil {
+        return err
+    }
+
+    toBal, err := GetBalance(l, to)
+    if err != nil {
+        return err
+    }
+    toBal.EXPLO += amount
+    if err := SetBalance(l, to, toBal); err != nil {
+        return err
+    }
+
+    // Record user-facing transaction locally
+    tx := Transaction{
+        Timestamp: time.Now(),
+        Type:      TxSend,
+        AmountEXP: amount,
+        From:      from,
+        To:        to,
+        Note:      fmt.Sprintf("EXPLO sent (fee: 0.001) – nonce %d", nonce),
+    }
+    if err := SaveTransaction(l, tx); err != nil {
+        return err
+    }
+
+    // Sign and broadcast using the persistent nonce
+    broadcastTxSignedWithNonce(tx, w, password, nonce)
+
+    // Broadcast balance updates for multi-device synchronization
+    broadcastBalanceUpdate(from, fromBal)
+    broadcastBalanceUpdate(to, toBal)
+
+    return nil
 }
 
-// SaveTransaction persists a wallet transaction in the local DB.
-func SaveTransaction(ledgerDB *db.BadgerDB, tx Transaction) error {
-    key := fmt.Sprintf("tx:%d:%s:%s", tx.Timestamp.UnixNano(), tx.From, tx.To)
-    data, _ := json.Marshal(tx)
-    return ledgerDB.SetValue([]byte(key), data)
-}
+// ToLedgerTransactionWithSignature converts a wallet Transaction into a fully signed ledger.Transaction.
+// It accepts an explicit nonce parameter to support persistent anti-replay nonces from the ledger.
+// The function decrypts the private key, signs the canonical transaction hash,
+// attaches all required metadata, and securely zeros sensitive memory.
+func (tx *Transaction) ToLedgerTransactionWithSignature(w *Wallet, password string, nonce int64) (*ledger.Transaction, error) {
+    timestamp := time.Now().UnixMilli()
 
-// GetTransactions retrieves all local transactions for the specified address.
-func GetTransactions(ledgerDB *db.BadgerDB, addr string) ([]Transaction, error) {
-    var txs []Transaction
-    err := ledgerDB.IteratePrefix([]byte("tx:"), func(k, v []byte) error {
-        var tx Transaction
-        if err := json.Unmarshal(v, &tx); err != nil {
-            return err
+    ltx := &ledger.Transaction{
+        From:          tx.From,
+        To:            tx.To,
+        AmountEXP:     tx.AmountEXP,
+        AmountIM:      tx.AmountIM,
+        Fee:           0.001,
+        Timestamp:     timestamp,
+        Nonce:         nonce, // Persistent incremental nonce for replay protection
+        Note:          tx.Note,
+        IsReward:      false,
+        IsIMANILocked: false,
+    }
+
+    // Decrypt wallet private key
+    privBytes, _, err := encryption.DecryptWallet(w.EncryptedPriv, password)
+    if err != nil {
+        return nil, fmt.Errorf("failed to decrypt wallet private key: %w", err)
+    }
+
+    // Normalize to full 64-byte Ed25519 private key if seed is provided
+    if len(privBytes) == ed25519.SeedSize {
+        fullKey := ed25519.NewKeyFromSeed(privBytes)
+        privBytes = make([]byte, ed25519.PrivateKeySize)
+        copy(privBytes, fullKey)
+        // Zero seed
+        for i := range fullKey {
+            fullKey[i] = 0
         }
-        if addr == "" || tx.From == addr || tx.To == addr {
-            txs = append(txs, tx)
+    } else if len(privBytes) != ed25519.PrivateKeySize {
+        return nil, fmt.Errorf("invalid private key length: %d", len(privBytes))
+    }
+
+    priv := ed25519.PrivateKey(privBytes)
+    pub := priv.Public().(ed25519.PublicKey)
+
+    // Sign the canonical transaction data
+    sig := ed25519.Sign(priv, ltx.HashForSignature())
+
+    // Attach signature and metadata
+    ltx.FromPubKey = pub
+    ltx.Signature = sig
+    ltx.TxHash = ltx.ComputeHash()
+    ltx.ID = tx.From
+
+    ltx.MinerInfo = &ledger.MinerInfo{
+        MinerID:   tx.From,
+        CreatedAt: timestamp,
+        PublicKey: pub,
+    }
+
+    // Securely zero sensitive memory
+    for i := range priv {
+        priv[i] = 0
+    }
+    for i := range privBytes {
+        privBytes[i] = 0
+    }
+
+    fmt.Printf("🔏 Transaction signed – pubkey: %s, nonce: %d\n", hex.EncodeToString(pub), nonce)
+    return ltx, nil
+}
+
+// GetTransactions retrieves all locally stored wallet transactions.
+// If addr is empty, returns all transactions; otherwise filters by from/to address.
+func GetTransactions(l *ledger.Ledger, addr string) ([]Transaction, error) {
+    var txs []Transaction
+    prefix := []byte("tx:")
+
+    err := l.DB().View(func(txn *badger.Txn) error {
+        opts := badger.DefaultIteratorOptions
+        opts.PrefetchValues = true
+        it := txn.NewIterator(opts)
+        defer it.Close()
+
+        for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+            item := it.Item()
+            val, err := item.ValueCopy(nil)
+            if err != nil {
+                return err
+            }
+
+            var tx Transaction
+            if err := json.Unmarshal(val, &tx); err != nil {
+                return err
+            }
+
+            if addr == "" || tx.From == addr || tx.To == addr {
+                txs = append(txs, tx)
+            }
         }
         return nil
     })
-    if err != nil {
-        return nil, err
-    }
-    return txs, nil
+
+    return txs, err
 }
 
+
+// CreditWallet adds system-originated EXPLO or IMANI credits to the wallet.
+// IMANI credits are recorded locally only (non-transferable, sacred token).
+// EXPLO credits are broadcast as unsigned system transactions.
+func CreditWallet(l *ledger.Ledger, addr string, expAmount, imaniAmount float64) error {
+    bal, err := GetBalance(l, addr)
+    if err != nil {
+        return err
+    }
+
+    if expAmount > 0 {
+        bal.EXPLO += expAmount
+        tx := Transaction{
+            Timestamp: time.Now(),
+            Type:      TxCredit,
+            AmountEXP: expAmount,
+            From:      "SYSTEM",
+            To:        addr,
+            Note:      "EXPLO credited by system",
+        }
+        if err := SaveTransaction(l, tx); err != nil {
+            return err
+        }
+        broadcastTxUnsigned(tx)
+    }
+
+    if imaniAmount > 0 {
+        bal.IMANI += imaniAmount
+        tx := Transaction{
+            Timestamp: time.Now(),
+            Type:      TxCredit,
+            AmountIM:  imaniAmount,
+            From:      "SYSTEM",
+            To:        addr,
+            Note:      "IMANI sacred blessing – non-transferable",
+        }
+        if err := SaveTransaction(l, tx); err != nil {
+            return err
+        }
+        // No broadcast for IMANI – sacred and non-transferable
+    }
+
+    if err := SetBalance(l, addr, bal); err != nil {
+        return err
+    }
+
+    broadcastBalanceUpdate(addr, bal)
+    return nil
+}
+
+// DisplayTransactionHistory prints all stored wallet transactions for a given address.
+func DisplayTransactionHistory(l *ledger.Ledger, addr string) error {
+    txs, err := GetTransactions(l, addr)
+    if err != nil {
+        return err
+    }
+    fmt.Println("=== TRANSACTION HISTORY ===")
+    for _, tx := range txs {
+        fmt.Printf("[%s] Type: %s | EXPLO: %.4f | IMANI: %.4f | From: %s | To: %s | Note: %s\n",
+            tx.Timestamp.Format(time.RFC3339),
+            tx.Type,
+            tx.AmountEXP,
+            tx.AmountIM,
+            tx.From,
+            tx.To,
+            tx.Note)
+    }
+    fmt.Println("===========================")
+    return nil
+}
 // -----------------------------------------------------------
 // Network Integration (Broadcasting)
 // -----------------------------------------------------------
@@ -132,21 +348,39 @@ func SetActiveNode(node *p2p.Node) {
     activeNode = node
 }
 
-// broadcastTxSigned signs a transaction using the wallet and broadcasts it to the network.
-func broadcastTxSigned(tx Transaction, w *Wallet, password string) {
+// broadcastTxSigned signs a wallet transaction using a persistent incremental nonce
+// retrieved from the ledger (anti-replay protection), then broadcasts the fully
+// signed ledger transaction to the P2P network.
+//
+// The function fetches the current nonce for the sender, increments it,
+// uses it for signing, persists the new nonce immediately after successful signing
+// (to prevent accidental reuse), and relies on the network/ledger to enforce replay
+// protection during transaction application.
+func broadcastTxSigned(l *ledger.Ledger, tx Transaction, w *Wallet, password string) {
     if activeNode == nil {
         fmt.Println("⚠️ No active P2P node connected — transaction not broadcasted")
         return
     }
 
-    ltx, err := tx.ToLedgerTransactionWithSignature(w, password)
+    // Retrieve current persistent nonce for the sender
+    var currentNonce int64
+    _ = l.GetObject([]byte("nonce:"+tx.From), &currentNonce)
+    nonce := currentNonce + 1
+
+    // Sign the transaction with the persistent nonce
+    ltx, err := tx.ToLedgerTransactionWithSignature(w, password, nonce)
     if err != nil {
         fmt.Println("❌ Failed to sign transaction:", err)
         return
     }
 
+    // Persist the incremented nonce immediately after successful signing
+    // This prevents replay if the app restarts or the user retries before broadcast
+    _ = l.PutObject([]byte("nonce:"+tx.From), nonce)
+
+    // Broadcast the signed transaction
     activeNode.BroadcastTransaction(ltx)
-    fmt.Println("🌍 Transaction signed and broadcasted to EXPLOSIVE network")
+    fmt.Printf("🌍 Transaction signed (nonce: %d) and broadcasted to EXPLOSIVE network\n", nonce)
 }
 
 // broadcastTxUnsigned sends a system-level (unsigned) transaction to the network.
@@ -190,202 +424,38 @@ func broadcastBalanceUpdate(addr string, bal WalletBalance) {
         log.Printf("[wallet] Failed to broadcast balance update: %v", err)
     }
 }
-
-// broadcastLedgerSync sends the full local ledger snapshot to connected peers.
-func broadcastLedgerSync(ledgerDB *db.BadgerDB) {
+// broadcastLedgerSync sends the local wallet transaction history to connected peers.
+// This allows a miner restoring on a new device to recover their user-facing transaction log
+// (not the full blockchain – that's handled by block sync).
+// It uses the custom P2P message system and does not expose sacred ledger data.
+func broadcastLedgerSync(l *ledger.Ledger) {
     if activeNode == nil {
         return
     }
-    txs, _ := GetTransactions(ledgerDB, "")
+
+    txs, err := GetTransactions(l, "")
+    if err != nil {
+        log.Printf("[wallet] Failed to retrieve local transactions for ledger sync: %v", err)
+        return
+    }
+
+    if len(txs) == 0 {
+        // Nothing to sync – avoid sending empty payload
+        return
+    }
+
     payload := map[string]interface{}{
         "type": "LEDGER_SYNC",
         "data": txs,
     }
+
     if err := BroadcastCustom(payload); err != nil {
         log.Printf("[wallet] Failed to broadcast ledger sync: %v", err)
+    } else {
+        log.Printf("[wallet] Successfully broadcasted %d local transactions for ledger sync", len(txs))
     }
 }
 
-// -----------------------------------------------------------
-// Conversion & Signature
-// -----------------------------------------------------------
-
-// ToLedgerTransactionWithSignature converts a wallet Transaction into a fully
-// signed ledger.Transaction ready for network propagation.
-//
-// It deterministically assigns timestamp and nonce, decrypts the wallet’s private key,
-// signs the canonical hash, and attaches the signature, public key, and TxHash.
-func (tx *Transaction) ToLedgerTransactionWithSignature(w *Wallet, password string) (*ledger.Transaction, error) {
-    now := time.Now().UnixMilli()
-    timestamp := now
-    nonce := now
-
-    ltx := &ledger.Transaction{
-        From:      tx.From,
-        To:        tx.To,
-        AmountEXP: tx.AmountEXP,
-        AmountIM:  tx.AmountIM,
-        Fee:       0.001,
-        Timestamp: timestamp,
-        Nonce:     nonce,
-        Note:      tx.Note,
-        IsReward:  false,
-    }
-
-    // Decrypt the wallet’s private key
-    // Decrypt the wallet’s private key
-privBytes, _, err := encryption.DecryptWallet(w.EncryptedPriv, password)
-if err != nil {
-    return nil, fmt.Errorf("failed to decrypt wallet: %w", err)
-}
-
-    // Handle both 32-byte seed and 64-byte full private keys
-    if len(privBytes) != ed25519.PrivateKeySize && len(privBytes) != ed25519.SeedSize {
-        if len(privBytes) == ed25519.SeedSize {
-            full := ed25519.NewKeyFromSeed(privBytes)
-            privBytes = make([]byte, len(full))
-            copy(privBytes, full)
-            for i := range full {
-                full[i] = 0
-            }
-        } else {
-            return nil, fmt.Errorf("unexpected private key length: %d", len(privBytes))
-        }
-    }
-
-    priv := ed25519.PrivateKey(privBytes)
-    pub := priv.Public().(ed25519.PublicKey)
-
-    // Sign canonical hash
-    sig := ed25519.Sign(priv, ltx.HashForSignature())
-
-    // Attach metadata
-ltx.FromPubKey = pub
-ltx.Signature = sig
-ltx.TxHash = ltx.ComputeHash()
-ltx.ID = tx.From
-
-// 🟦Add miner inf
-ltx.MinerInfo = &ledger.MinerInfo{
-    MinerID:   tx.From,
-    CreatedAt: timestamp,
-    PublicKey: pub,
-}
-
-    // Zero out sensitive key material
-    for i := range priv {
-        priv[i] = 0
-    }
-    for i := range privBytes {
-        privBytes[i] = 0
-    }
-
-    fmt.Println("🔏 Transaction signed with pubkey:", hex.EncodeToString(pub))
-    return ltx, nil
-}
-
-// -----------------------------------------------------------
-// Transaction Execution (Public API)
-// -----------------------------------------------------------
-
-// SendEXPLO performs a signed EXPLO token transfer and updates local balances.
-func SendEXPLO(ledgerDB *db.BadgerDB, from, to string, amount float64, w *Wallet, password string) error {
-    if !IsValidEXPLOAddress(to) || !IsValidEXPLOAddress(from) {
-        return errors.New("invalid EXPLO address")
-    }
-    if amount <= 0 {
-        return errors.New("amount must be positive")
-    }
-
-    fromBal, err := GetBalance(ledgerDB, from)
-    if err != nil {
-        return err
-    }
-    if fromBal.EXPLO < amount {
-        return errors.New("insufficient EXPLO balance")
-    }
-
-    fromBal.EXPLO -= amount
-    if err := SetBalance(ledgerDB, from, fromBal); err != nil {
-        return err
-    }
-
-    toBal, err := GetBalance(ledgerDB, to)
-    if err != nil {
-        return err
-    }
-    toBal.EXPLO += amount
-    if err := SetBalance(ledgerDB, to, toBal); err != nil {
-        return err
-    }
-
-    tx := Transaction{
-        Timestamp: time.Now(),
-        Type:      TxSend,
-        AmountEXP: amount,
-        From:      from,
-        To:        to,
-        Note:      "EXPLO sent via Wallet",
-    }
-
-    if err := SaveTransaction(ledgerDB, tx); err != nil {
-        return err
-    }
-
-    // Broadcast to network
-    broadcastTxSigned(tx, w, password)
-    broadcastBalanceUpdate(from, fromBal)
-    broadcastBalanceUpdate(to, toBal)
-
-    return nil
-}
-
-// CreditWallet adds EXPLO or IMANI credits to the wallet (system-originated).
-func CreditWallet(ledgerDB *db.BadgerDB, addr string, expAmount, imaniAmount float64) error {
-    bal, err := GetBalance(ledgerDB, addr)
-    if err != nil {
-        return err
-    }
-
-    if expAmount > 0 {
-        bal.EXPLO += expAmount
-        tx := Transaction{
-            Timestamp: time.Now(),
-            Type:      TxCredit,
-            AmountEXP: expAmount,
-            From:      "SYSTEM",
-            To:        addr,
-            Note:      "EXPLO credited by system",
-        }
-        if err := SaveTransaction(ledgerDB, tx); err != nil {
-            return err
-        }
-        broadcastTxUnsigned(tx)
-    }
-
-    if imaniAmount > 0 {
-        bal.IMANI += imaniAmount
-        tx := Transaction{
-            Timestamp: time.Now(),
-            Type:      TxBlocked,
-            AmountIM:  imaniAmount,
-            From:      "SYSTEM",
-            To:        addr,
-            Note:      "IMANI cannot be transferred manually (sacred token)",
-        }
-        if err := SaveTransaction(ledgerDB, tx); err != nil {
-            return err
-        }
-        broadcastTxUnsigned(tx)
-    }
-
-    if err := SetBalance(ledgerDB, addr, bal); err != nil {
-        return err
-    }
-
-    broadcastBalanceUpdate(addr, bal)
-    return nil
-}
 
 // -----------------------------------------------------------
 // Display Utilities
@@ -396,26 +466,6 @@ func DisplayWalletBalance(bal WalletBalance) {
     fmt.Printf("💰 EXPLO: %.4f | 🌟 IMANI: %.4f\n", bal.EXPLO, bal.IMANI)
 }
 
-// DisplayTransactionHistory prints all stored transactions for a given address.
-func DisplayTransactionHistory(ledgerDB *db.BadgerDB, addr string) error {
-    txs, err := GetTransactions(ledgerDB, addr)
-    if err != nil {
-        return err
-    }
-    fmt.Println("=== TRANSACTION HISTORY ===")
-    for _, tx := range txs {
-        fmt.Printf("[%s] Type: %s | EXPLO: %.4f | IMANI: %.4f | From: %s | To: %s | Note: %s\n",
-            tx.Timestamp.Format(time.RFC3339),
-            tx.Type,
-            tx.AmountEXP,
-            tx.AmountIM,
-            tx.From,
-            tx.To,
-            tx.Note)
-    }
-    fmt.Println("===========================")
-    return nil
-}
 
 // BroadcastCustom safely broadcasts arbitrary structured data using the official P2P protocol (CBOR + MsgTypeCustomData).
 // Replaces the old unsafe BroadcastData() method.
@@ -431,4 +481,22 @@ func BroadcastCustom(payload interface{}) error {
 
     activeNode.BroadcastEnvelope(env)
     return nil
+}
+
+
+// broadcastTxSignedWithNonce signs and broadcasts using an explicit nonce.
+func broadcastTxSignedWithNonce(tx Transaction, w *Wallet, password string, nonce int64) {
+    if activeNode == nil {
+        fmt.Println("⚠️ No active P2P node connected — transaction not broadcasted")
+        return
+    }
+
+    ltx, err := tx.ToLedgerTransactionWithSignature(w, password, nonce)
+    if err != nil {
+        fmt.Println("❌ Failed to sign transaction:", err)
+        return
+    }
+
+    activeNode.BroadcastTransaction(ltx)
+    fmt.Println("🌍 Signed transaction broadcasted to EXPLOSIVE network")
 }

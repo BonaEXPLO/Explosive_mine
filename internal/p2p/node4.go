@@ -1,36 +1,32 @@
 // internal/p2p/node4.go
-
 package p2p
-
 import (
         "context"
         "fmt"
+        "encoding/hex"
+        "github.com/fxamacker/cbor/v2"
         "log"
         "strings"
-        "crypto/ed25519"
         "sync"
         "time"
-
         "explosive/internal/ledger"
 )
-
-// ProtocolVersion returns the node's protocol version.
-func (n *Node) ProtocolVersion() uint16 {
-        return n.protocolVersion
-}
 
 /* -------------------------------------------------------------------------
    Deterministic port derivation helpers
    - These helpers are intentionally non-invasive: they do not change Node
-     constructors or startup flow. Call ApplyDerivedListenAddrToNode(n, id, words)
-     after restoring the miner identity to set the derived listen address.
+     constructors or startup flow. Call ApplyDerivedListenAddrToNode(n, id, words)                               after restoring the miner identity to set the derived listen address.
    - Default port range: [31000, 61000]
 --------------------------------------------------------------------------- */
-
 const (
         defaultMinPort = 31000
         defaultMaxPort = 61000
 )
+
+// ProtocolVersion returns the node's protocol version.
+func (n *Node) ProtocolVersion() uint16 {
+	return n.protocolVersion
+}
 
 // normalizeAndJoinWords does light normalized join of 4 sacred words.
 // It trims spaces and collapses internal whitespace, then joins with '-'.
@@ -53,7 +49,9 @@ func normalizeAndJoinWords(words []string) string {
 // - All other handlers remain efficient and mobile-friendly
 func (n *Node) registerDefaultHandlers() {
     // --- Handshake handler (CRITICAL - must be registered first) ---
-    n.RegisterHandler(MsgTypeHandshake, func(p *Peer, env *Envelope) {
+n.RegisterHandler(MsgTypeHandshake, func(p *Peer, env *Envelope) {
+    // Ensure handshake logic executes only once per peer
+    p.handshakeOnce.Do(func() {
         var hs HandshakePayload
         if err := UnmarshalPayload(env.Payload, &hs); err != nil {
             log.Printf("[p2p] Invalid handshake payload from %s: %v", p.addr, err)
@@ -64,53 +62,65 @@ func (n *Node) registerDefaultHandlers() {
         log.Printf("[p2p] Handshake received from %s (id=%s, version=%s, listen=%s)",
             p.addr, hs.PeerID, hs.Version, hs.ListenAddr)
 
-        // Enforce correct network
+        // Enforce network isolation
         if hs.Network != n.networkID {
-            log.Printf("[p2p] Handshake rejected from %s: wrong network '%s' (expected '%s')",
-                p.addr, hs.Network, n.networkID)
+            log.Printf("[p2p] Handshake rejected from %s: wrong network '%s' (expected '%s')", p.addr, hs.Network, n.networkID)
             p.Close()
             return
         }
 
-        // Optional version warning (tolerant for now)
+        // Log version mismatch (non-fatal, for monitoring)
         if hs.Version != n.userAgent {
-            log.Printf("[p2p] Version mismatch from %s: remote='%s' local='%s' – connection allowed",
-                p.addr, hs.Version, n.userAgent)
+            log.Printf("[p2p] Version mismatch with %s: remote='%s' local='%s'", p.addr, hs.Version, n.userAgent)
         }
 
-        // V3 trustless identity verification if MinerInfo and signature are present
+        // === V3 Miner Authentication (optional but rewarded) ===
         if env.MinerInfo != nil && len(env.Signature) > 0 && len(env.PubKey) > 0 {
-            if env.MinerInfo.MinerID == "" || len(env.MinerInfo.PubKey) != ed25519.PublicKeySize {
-                log.Printf("[p2p] Invalid MinerInfo in handshake from %s", p.addr)
-                p.Penalize(1, 0)
+            ok, err := VerifyEnvelopeSignature(env)
+            if err != nil {
+                log.Printf("[p2p] V3 signature verification error from %s: %v", p.addr, err)
+                p.Penalize(5, 0)
+            } else if ok {
+                p.mu.Lock()
+                p.verifiedMinerID = env.MinerInfo.MinerID
+                p.verifiedPubKey = env.MinerInfo.PubKey
+                p.verifiedMiner = true
+                p.mu.Unlock()
+                log.Printf("[p2p] ✅ Verified conscious miner connected: %s", env.MinerInfo.MinerID)
             } else {
-                ok, err := VerifyEnvelopeSignature(env)
-                if err != nil {
-                    log.Printf("[p2p] Handshake signature error from %s: %v", p.addr, err)
-                    p.Penalize(1, 0)
-                } else if !ok {
-                    log.Printf("[p2p] Invalid handshake signature from claimed miner %s (%s)", env.MinerInfo.MinerID, p.addr)
-                    p.Penalize(1, 0)
-                } else {
-                    log.Printf("[p2p] Verified V3 miner identity in handshake: %s", env.MinerInfo.MinerID)
-                }
+                log.Printf("[p2p] Invalid V3 signature from claimed miner %s (peer %s)", env.MinerInfo.MinerID, p.addr)
+                p.Penalize(10, time.Hour)
+                p.Close()
+                return
             }
         }
 
-        // Accept the peer
+        // Accept and store the remote peer's declared identity
         p.id = PeerID(hs.PeerID)
 
-        log.Printf("[p2p] HANDSHAKE SUCCESSFUL → Peer authenticated: id=%s addr=%s", p.id, p.addr)
-
-        // Accelerate discovery
-        req := &Envelope{
-            Version:   n.protocolVersion,
-            Type:      MsgTypeRequestPeers,
-            Payload:   nil,
-            Timestamp: time.Now().UnixMilli(),
+        // Determine role for logging
+        role := "observer/investor"
+        if p.IsVerifiedMiner() {
+            role = "verified conscious miner"
         }
+
+        // Mark handshake as complete (bidirectional exchange achieved)
+        p.mu.Lock()
+        p.handshakeDone = true
+        p.mu.Unlock()
+
+        log.Printf("[p2p] ✅ BIDIRECTIONAL HANDSHAKE COMPLETE → Peer=%s addr=%s (%s)", p.id, p.addr, role)
+
+        // Note: Our handshake was already sent proactively (with jitter) either:
+        // - in handleNewConnection() for inbound connections
+        // - or in Connect() goroutine for outbound
+        // → No need to send it again here
+
+        // Accelerate peer discovery by requesting known peers
+        req, _ := NewEnvelopeFromPayload(n.ProtocolVersion(), MsgTypeRequestPeers, struct{}{})
         _ = p.SendEnvelope(req)
     })
+})
 
     // --- Ping / Pong ---
     n.RegisterHandler(MsgTypePing, func(p *Peer, env *Envelope) {
@@ -122,51 +132,170 @@ func (n *Node) registerDefaultHandlers() {
         reply, _ := NewEnvelopeFromPayload(n.protocolVersion, MsgTypePong, pong)
         _ = p.SendEnvelope(reply)
     })
-
     n.RegisterHandler(MsgTypePong, func(p *Peer, env *Envelope) {
         // Presence of pong is sufficient for liveness tracking
     })
 
-    // --- Block handler (V3 strict enforcement) ---
-    n.RegisterHandler(MsgTypeBlock, func(p *Peer, env *Envelope) {
-        var blk ledger.Block
-        if err := UnmarshalPayload(env.Payload, &blk); err != nil {
-            log.Printf("[p2p] Failed to unmarshal block from %s: %v", p.addr, err)
-            return
+    // --- Inventory handler: receive announced blocks (Inv) ---
+n.RegisterHandler(MsgTypeInv, func(p *Peer, env *Envelope) {
+    inv, err := DecodeInvPayload(env.Payload)
+    if err != nil {
+        log.Printf("[p2p] Invalid INV payload from %s: %v", p.addr, err)
+        return
+    }
+
+    if inv.Kind != InvKindBlockHeader && inv.Kind != InvKindBlockFull {
+        log.Printf("[p2p] Unknown INV kind from %s: %s", p.addr, inv.Kind)
+        return
+    }
+
+    var requestHashes [][]byte
+
+    for _, h := range inv.Hashes {
+        hashStr := hex.EncodeToString(h)
+
+        // Check if we already have this block
+        height, ok := n.Ledger.GetHeightByBlockHash(hashStr)
+        if ok && height != ^uint64(0) {
+            continue // Already have it
         }
 
-        currentHeight := n.Ledger.GetLatestBlockHeight()
-        if blk.Header.Height <= currentHeight {
-            return // Already processed or older
-        }
+        // Missing → request it
+        requestHashes = append(requestHashes, h)
+    }
 
-        // Strict V3 signature verification
-        valid, err := blk.VerifySignature()
+    if len(requestHashes) > 0 {
+        getEnv, err := NewGetDataMessage(InvKindBlockHeader, requestHashes)
         if err != nil {
-            log.Printf("[p2p] Block %d signature verification error from %s: %v", blk.Header.Height, p.addr, err)
-            p.Penalize(1, 0)
-            return
-        }
-        if !valid && n.config.RequireStrictBlockSig {
-            log.Printf("[p2p] Rejecting unsigned/invalid block %d from %s (strict mode enabled)", blk.Header.Height, p.addr)
-            p.Penalize(1, 0)
-            if p.errCount >= n.config.PeerInvalidMsgThreshold {
-                p.Penalize(0, 5*time.Minute)
-                log.Printf("[p2p] Temporary ban applied to %s for repeated invalid blocks", p.addr)
-            }
+            log.Printf("[p2p] Failed to create GetData for headers from %s: %v", p.addr, err)
             return
         }
 
-        if err := n.Ledger.AddBlock(&blk); err != nil {
-            log.Printf("[p2p] Failed to add block %d from %s: %v", blk.Header.Height, p.addr, err)
-            return
+        if err := p.SendEnvelope(getEnv); err != nil {
+            log.Printf("[p2p] Failed to send GetData to %s: %v", p.addr, err)
+        } else {
+            log.Printf("[p2p] Requested %d missing block headers from %s", len(requestHashes), p.addr)
+        }
+    }
+})
+
+// --- GetData handler: serve requested blocks (header or full) ---
+n.RegisterHandler(MsgTypeGetData, func(p *Peer, env *Envelope) {
+    req, err := DecodeGetDataPayload(env.Payload)
+    if err != nil {
+        log.Printf("[p2p] Invalid GetData payload from %s: %v", p.addr, err)
+        return
+    }
+
+    // Limit number of blocks served per request (mobile-friendly)
+    maxServe := 50
+    if len(req.Hashes) > maxServe {
+        req.Hashes = req.Hashes[:maxServe]
+    }
+
+    served := 0
+    for _, hashBytes := range req.Hashes {
+        hashStr := hex.EncodeToString(hashBytes)
+
+        blk, err := n.Ledger.GetBlockByHash(hashStr)
+        if err != nil || blk == nil {
+            log.Printf("[p2p] Requested block %x not found (peer %s)", hashBytes[:8], p.addr)
+            continue
         }
 
-        log.Printf("[p2p] Block %d successfully added from %s", blk.Header.Height, p.addr)
+        var payloadData []byte
+        var kind string
 
-        // Relay to other peers
-        n.BroadcastExcept(env, p)
-    })
+        if req.Kind == InvKindBlockHeader || blk.IsLightBlock() {
+            // Serve header-only
+            headerOnly := *blk
+            headerOnly.Transactions = nil
+            payloadData, err = cbor.Marshal(headerOnly)
+            kind = InvKindBlockHeader
+        } else {
+            payloadData, err = cbor.Marshal(blk)
+            kind = InvKindBlockFull
+        }
+
+        if err != nil {
+            log.Printf("[p2p] Failed to marshal block %x for %s: %v", hashBytes[:8], p.addr, err)
+            continue
+        }
+
+        blockPayload := BlockPayload{
+            Kind: kind,
+            Data: payloadData,
+        }
+
+        blockEnv, err := NewEnvelopeFromPayload(n.ProtocolVersion(), MsgTypeBlock, blockPayload)
+        if err != nil {
+            log.Printf("[p2p] Failed to create block response for %x: %v", hashBytes[:8], err)
+            continue
+        }
+
+        if err := p.SendEnvelope(blockEnv); err != nil {
+            log.Printf("[p2p] Failed to send block %x to %s: %v", hashBytes[:8], p.addr, err)
+            continue
+        }
+
+        served++
+        log.Printf("[p2p] Served %s block %x to %s", kind, hashBytes[:8], p.addr)
+    }
+
+    if served > 0 {
+        log.Printf("[p2p] Served %d blocks to %s", served, p.addr)
+    }
+})
+
+// --- Block handler: accept full/header blocks, then announce via Inv ---
+n.RegisterHandler(MsgTypeBlock, func(p *Peer, env *Envelope) {
+    var blockPayload BlockPayload
+    if err := UnmarshalPayload(env.Payload, &blockPayload); err != nil {
+        log.Printf("[p2p] Failed to unmarshal block payload from %s: %v", p.addr, err)
+        p.Penalize(5, 0)
+        return
+    }
+
+    var blk ledger.Block
+    if err := cbor.Unmarshal(blockPayload.Data, &blk); err != nil {
+        log.Printf("[p2p] Failed to decode block from %s: %v", p.addr, err)
+        p.Penalize(5, 0)
+        return
+    }
+
+    if !p.IsVerifiedMiner() {
+        log.Printf("[p2p] Rejected block from unverified peer %s", p.addr)
+        p.Penalize(20, 24*time.Hour)
+        return
+    }
+
+    currentHeight := n.Ledger.GetLatestBlockHeight()
+    if blk.Header.Height <= currentHeight {
+        return
+    }
+
+    valid, err := blk.VerifySignature()
+    if err != nil || !valid {
+        log.Printf("[p2p] Invalid block signature from %s (height %d)", p.addr, blk.Header.Height)
+        p.Penalize(10, 6*time.Hour)
+        return
+    }
+
+    if err := n.Ledger.AddBlock(&blk); err != nil {
+        log.Printf("[p2p] Failed to add block %d from %s: %v", blk.Header.Height, p.addr, err)
+        return
+    }
+
+    log.Printf("[p2p] ✅ Block #%d accepted from conscious miner %s", blk.Header.Height, p.verifiedMinerID)
+
+    // Announce via lightweight Inv
+    blockHashBytes, _ := hex.DecodeString(blk.BlockHash)
+    preferredKind := InvKindBlockFull
+    if blk.IsLightBlock() {
+        preferredKind = InvKindBlockHeader
+    }
+    n.BroadcastBlockInv(blockHashBytes, preferredKind)
+})
 
     // --- GetBlocksRange & BlocksResponse (sync) ---
     n.RegisterHandler(MsgTypeGetBlocksRange, func(p *Peer, env *Envelope) {
@@ -180,7 +309,6 @@ func (n *Node) registerDefaultHandlers() {
             return
         }
 
-        // Limit response size for mobile bandwidth
         if req.To-req.From+1 > 50 {
             req.To = req.From + 49
         }
@@ -220,7 +348,7 @@ func (n *Node) registerDefaultHandlers() {
         }
     })
 
-    // --- Transaction handler ---
+    // --- Transaction handler — OPEN TO ALL (investors included) ---
     n.RegisterHandler(MsgTypeTx, func(p *Peer, env *Envelope) {
         var tx ledger.Transaction
         if err := UnmarshalPayload(env.Payload, &tx); err != nil {
@@ -228,7 +356,6 @@ func (n *Node) registerDefaultHandlers() {
             return
         }
 
-        // Retrocompatibility rule enforcement
         if !tx.IsReward && tx.AmountIM > 0 {
             log.Printf("[p2p] Invalid IMANI transfer rejected from %s", tx.From)
             p.Penalize(1, 0)
@@ -246,28 +373,24 @@ func (n *Node) registerDefaultHandlers() {
         n.BroadcastExcept(env, p)
     })
 
-    // --- Metrics handler (with optional V3 authentication) ---
+    // --- Metrics handler — RESERVED TO VERIFIED V3 MINERS ---
     n.RegisterHandler(MsgTypeMetrics, func(p *Peer, env *Envelope) {
+        if !p.IsVerifiedMiner() {
+            log.Printf("[p2p] ⚠️ Rejected metrics from unverified peer %s — only conscious miners can share global stats", p.addr)
+            p.Penalize(5, 0)
+            return
+        }
+
         var m MetricsData
         if err := UnmarshalPayload(env.Payload, &m); err != nil {
             log.Printf("[p2p] Failed to unmarshal metrics from %s: %v", p.addr, err)
             return
         }
 
-        // Verify source if signed with miner identity
-        if env.MinerInfo != nil && len(env.Signature) > 0 && len(env.PubKey) > 0 {
-            if ok, _ := VerifyEnvelopeSignature(env); !ok {
-                log.Printf("[p2p] Invalid signed metrics from claimed miner %s", env.MinerInfo.MinerID)
-                p.Penalize(1, 0)
-                return
-            }
-            log.Printf("[p2p] Authenticated metrics received from miner %s", env.MinerInfo.MinerID)
-        }
-
         n.metricsMu.Lock()
         n.GlobalMetrics = MetricsPayload{
             Timestamp:       m.Timestamp,
-            MaxSupply:       m.MaxSupply,
+            MaxSupply: uint64(m.MaxSupply * float64(ledger.PastaboPerEXPLO)),
             Circulating:     m.Circulating,
             TotalHolders:    m.TotalHolders,
             MinersCount:     m.MinersCount,
@@ -277,46 +400,39 @@ func (n *Node) registerDefaultHandlers() {
         n.cachedMetricsOnce = true
         n.metricsMu.Unlock()
 
-        log.Printf("[p2p] Metrics updated — Circulating:%.3f  Holders:%d  Miners:%d",
-            m.Circulating, m.TotalHolders, m.MinersCount)
+        log.Printf("[p2p] Authenticated metrics updated by conscious miner %s — Circulating: %.3f EXPLO", p.verifiedMinerID, m.Circulating)
     })
 
-    // --- Peer discovery handlers
-n.RegisterHandler(MsgTypePeers, func(p *Peer, env *Envelope) {
-    var pl PeersPayload
-    if err := UnmarshalPayload(env.Payload, &pl); err != nil {
-        return
-    }
-
-    log.Printf("[p2p] Received %d peer(s) from %s", len(pl.Addrs), p.addr)
-
-    for _, addr := range pl.Addrs {
-        if addr == n.listenAddr || addr == p.addr {
-            continue
+    // --- Peer discovery handlers ---
+    n.RegisterHandler(MsgTypePeers, func(p *Peer, env *Envelope) {
+        var pl PeersPayload
+        if err := UnmarshalPayload(env.Payload, &pl); err != nil {
+            return
         }
 
-        // Check if already known via sharded map (source of truth)
-        pid := PeerID(fmt.Sprintf("%x", sha256Sum(addr)))
-        sh := n.shard(pid)
-        sh.mu.RLock()
-        _, already := sh.peers[pid]
-        sh.mu.RUnlock()
+        log.Printf("[p2p] Received %d peer(s) from %s", len(pl.Addrs), p.addr)
 
-        if !already {
-            go n.Connect(addr)
+        for _, addr := range pl.Addrs {
+            if addr == n.listenAddr || addr == p.addr {
+                continue
+            }
+
+            pid := PeerID(fmt.Sprintf("%x", sha256Sum(addr)))
+            sh := n.shard(pid)
+            sh.mu.RLock()
+            _, already := sh.peers[pid]
+            sh.mu.RUnlock()
+
+            if !already {
+                go n.Connect(addr)
+            }
         }
-    }
-})
-
-n.RegisterHandler(MsgTypeRequestPeers, func(p *Peer, env *Envelope) {
-    n.SendKnownPeers(p)
-})
+    })
 
     n.RegisterHandler(MsgTypeRequestPeers, func(p *Peer, env *Envelope) {
         n.SendKnownPeers(p)
     })
 }
-
 func (n *Node) PeerReconnectLoop() {
     ticker := time.NewTicker(30 * time.Second)
     defer ticker.Stop()
@@ -342,7 +458,6 @@ func (n *Node) PeerReconnectLoop() {
         }
     }
 }
-
 
 // SendKnownPeers sends a list of known connected peers to the requesting peer.
 func (n *Node) SendKnownPeers(p *Peer) {
@@ -434,7 +549,6 @@ func (n *Node) SyncLedgerFromBestPeer(ctx context.Context) {
     fetchSegment := func(from, to uint64) {
         defer wg.Done()
         attempt := 0
-
         for attempt < maxRetries {
             attempt++
             select {
@@ -481,7 +595,6 @@ func (n *Node) SyncLedgerFromBestPeer(ctx context.Context) {
             }
 
             close(resCh)
-
             if success {
                 return
             }
@@ -567,5 +680,3 @@ func (n *Node) IsLedgerComplete() bool {
     }
     return true
 }
-
-

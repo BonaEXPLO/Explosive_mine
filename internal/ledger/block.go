@@ -2,39 +2,40 @@
 package ledger
 
 import (
-        "bytes"
-        "crypto/sha256"
         "errors"
-        "os"
         "time"
-        "path/filepath"
+        "explosive/internal/address"
         "log"
         "crypto/ed25519"
         "encoding/base64"
-        "encoding/binary"
-        "encoding/hex"
         "fmt"
-        "sync"
-
-        "explosive/internal/compressor"
 
         "github.com/dgraph-io/badger/v4"
         "github.com/fxamacker/cbor/v2"
-        "golang.org/x/crypto/sha3"
 )
 
 var prefixBlock = []byte("block:")
 
 var ErrNotFound = errors.New("not found")
 
+// Sentinel error used internally to stop IterateBlocks early (not a real failure)
+var errIterStop = errors.New("ledger iteration stopped")
 // ---------------- BlockHeader ----------------
 type BlockHeader struct {
-        Height       uint64 `cbor:"height"`
-        PrevHash     string `cbor:"prev_hash"`
-        Timestamp    int64  `cbor:"timestamp"`
-        Nonce        uint64 `cbor:"nonce"`
-        MinerAddress string `cbor:"miner_address"`
-        MerkleRoot   string `cbor:"merkle_root"`
+    Height       uint64     `cbor:"height"`
+    PrevHash     string     `cbor:"prev_hash"`
+    Timestamp    int64      `cbor:"timestamp"`
+    Nonce        uint64     `cbor:"nonce"`
+    MinerAddress string     `cbor:"miner_address"`
+    MerkleRoot   string     `cbor:"merkle_root"`
+
+    // ⛏️ Daily Proof-of-Work (1 block / day / miner)
+    DailyPoW     *MiningPoW `cbor:"daily_pow,omitempty"`
+
+    // Version field for backward compatibility and future upgrades
+    // 0 = legacy blocks (no network anchoring in DailyPoW)
+    // 1 = modern blocks (network-anchored PoW with PrevBlockHash)
+    Version      uint8      `cbor:"version"`
 }
 
 // ---------------- Block ----------------
@@ -49,23 +50,335 @@ type Block struct {
         PublicKey string `cbor:"pub_key,omitempty"` // base64-encoded ed25519 public key
 }
 
-// ---------------- Block Creation ----------------
-func NewBlock(height uint64, prevHash string, miner string, txs []Transaction, nonce uint64) *Block {
-        header := BlockHeader{
-                Height:       height,
-                PrevHash:     prevHash,
-                Timestamp:    NowMillis(),
-                Nonce:        nonce,
-                MinerAddress: miner,
-                MerkleRoot:   ComputeMerkleRoot(txs),
+// ==================== SCALABILITY: FULL PRUNING + AGGRESSIVE COMPRESSION ====================
+
+// Configurable: number of recent blocks to keep in FULL detail (with transactions).
+// Older blocks are pruned to header-only (light mode) → massive storage saving on mobile.
+// Recommended: 3000–8000 (~6 months to 2 years). Set to 0 to disable.
+const FullBlocksToKeep = 5000
+
+// IsLightBlock reports whether the block is stored in its "light" form.
+//
+// A light block contains only the block header and metadata,
+// with the transaction list intentionally omitted to reduce memory
+// and disk usage after the block has reached finality.
+func (b *Block) IsLightBlock() bool {
+    return b.Transactions == nil || len(b.Transactions) == 0
+}
+
+// PruneToLight converts a full block into a light block.
+//
+// This method explicitly releases the transaction slice,
+// allowing the garbage collector to reclaim memory and
+// ensuring that only the minimal block representation
+// (header + metadata) is retained.
+func (b *Block) PruneToLight() {
+    // Explicitly release transaction data
+    b.Transactions = nil
+}
+
+// PruneOldBlocks reduces storage and memory usage by pruning
+// finalized blocks into their light representation.
+//
+// The function keeps only the most recent `FullBlocksToKeep` blocks
+// in full form. Older blocks are converted in-place to light blocks
+// while preserving headers, hashes, and consensus-critical data.
+//
+// Pruning is:
+//   - idempotent (safe to call multiple times)
+//   - concurrency-safe (protected by a mutex)
+//   - non-destructive to consensus validity
+func (l *Ledger) PruneOldBlocks() error {
+    // Pruning disabled by configuration
+    if FullBlocksToKeep == 0 {
+        return nil
+    }
+
+    // Ensure only one pruning operation runs at a time
+    l.pruningMu.Lock()
+    defer l.pruningMu.Unlock()
+
+    // Determine current chain tip
+    tip := l.GetLatestBlockHeight()
+    if tip <= uint64(FullBlocksToKeep) {
+        return nil
+    }
+
+    // Calculate the highest height eligible for pruning
+    pruneUpTo := tip - uint64(FullBlocksToKeep)
+
+    // Avoid re-pruning blocks already processed
+    if l.lastPrunedHeight >= pruneUpTo {
+        return nil
+    }
+
+    // Determine pruning start height
+    start := l.lastPrunedHeight + 1
+    if start == 0 {
+        start = 1 // Never prune the genesis block
+    }
+
+    log.Printf(
+        "[scalability] 🔪 Pruning blocks %d → %d (keeping last %d full)",
+        start,
+        pruneUpTo,
+        FullBlocksToKeep,
+    )
+
+    pruned := 0
+
+    // Iterate over all blocks and prune eligible ones
+    err := l.IterateBlocks(func(b *Block) error {
+        h := b.Header.Height
+
+        // Skip blocks outside the pruning window
+        if h < start || h > pruneUpTo {
+            return nil
         }
 
-        b := &Block{
-                Header:       header,
-                Transactions: txs,
+        // Skip blocks already in light form
+        if b.IsLightBlock() {
+            return nil
         }
-        b.BlockHash = b.ComputeFinalHash()
-        return b
+
+        // Convert to light block and persist the change
+        b.PruneToLight()
+
+        if err := l.PutBlock(h, b); err != nil {
+            // Log and continue — pruning must never halt the node
+            log.Printf("[pruning] ⚠️ failed to prune block %d: %v", h, err)
+            return nil
+        }
+
+        pruned++
+        l.lastPrunedHeight = h
+        return nil
+    })
+
+    if err != nil {
+        return err
+    }
+
+    log.Printf(
+        "[scalability] ✅ Pruning completed: %d blocks pruned (last=%d)",
+        pruned,
+        l.lastPrunedHeight,
+    )
+
+    return nil
+}
+
+// ApplyBlock validates, persists, and commits a block to the ledger.
+//
+// Responsibilities:
+//   1. Enforce single-chain (no fork at same height)
+//   2. Perform full consensus validation
+//   3. Persist block atomically using compressed batch storage
+//   4. Trigger controlled asynchronous pruning (non-blocking)
+//
+// This function is part of the critical consensus path.
+// Any expensive maintenance task (e.g. pruning) is deliberately
+// executed asynchronously to preserve low block acceptance latency.
+func (l *Ledger) ApplyBlock(blk *Block) error {
+    if l == nil || l.db == nil {
+        return fmt.Errorf("ledger not initialized")
+    }
+
+    // ------------------------------------------------------------------
+// 1) Load previous block by HASH (ledger authority)
+// ------------------------------------------------------------------
+var prev *Block
+
+if blk.Header.PrevHash != "" {
+    var err error
+    prev, err = l.GetBlockByHash(blk.Header.PrevHash)
+    if err != nil || prev == nil {
+        return fmt.Errorf(
+            "missing previous block with hash %s",
+            blk.Header.PrevHash,
+        )
+    }
+
+    // ✅ Ledger assigns height
+    blk.Header.Height = prev.Header.Height + 1
+} else {
+    // Genesis case
+    blk.Header.Height = 0
+}
+
+// ------------------------------------------------------------------
+// 2) Enforce UniLedger rule: no fork at same height
+// ------------------------------------------------------------------
+if existing, err := l.GetBlockByHeight(blk.Header.Height); err == nil && existing != nil {
+    return fmt.Errorf(
+        "fork rejected: block already exists at height %d",
+        blk.Header.Height,
+    )
+}
+
+// ------------------------------------------------------------------
+// 3) Consensus validation
+// ------------------------------------------------------------------
+if err := blk.Validate(prev, l); err != nil {
+    log.Printf("❌ Block #%d rejected: %v", blk.Header.Height, err)
+
+    _ = l.PutObject(
+        []byte(fmt.Sprintf("quarantine:block:%d", blk.Header.Height)),
+        blk,
+    )
+
+    return fmt.Errorf("block validation failed: %w", err)
+}
+
+    // ------------------------------------------------------------------
+// 4) Atomic persistence (CONSENSUS CRITICAL)
+// ------------------------------------------------------------------
+if err := l.DB().Update(func(txn *badger.Txn) error {
+
+    // --------------------------------------------------
+    // a) Persist block (canonical CBOR)
+// --------------------------------------------------
+    blockKey := []byte(fmt.Sprintf("block:%d", blk.Header.Height))
+
+    data, err := cbor.Marshal(blk)
+    if err != nil {
+        return fmt.Errorf("CBOR marshal failed: %w", err)
+    }
+
+    if err := txn.Set(blockKey, data); err != nil {
+        return fmt.Errorf("block persist failed: %w", err)
+    }
+
+    // --------------------------------------------------
+    // b) Daily PoW anti-replay index
+    // --------------------------------------------------
+    if blk.Header.DailyPoW != nil {
+        powKey := []byte(fmt.Sprintf(
+            "daily_pow:%s:%d",
+            blk.Header.MinerAddress,
+            blk.Header.DailyPoW.DayStart,
+        ))
+
+        if err := txn.Set(powKey, []byte{1}); err != nil {
+            return fmt.Errorf("daily PoW index write failed: %w", err)
+        }
+    }
+
+    // --------------------------------------------------
+    // c) Circulating supply (incremental, legacy-safe)
+    // --------------------------------------------------
+    var minted uint64
+
+    for _, tx := range blk.Transactions {
+        if tx.IsReward && tx.AmountEXP > 0 {
+            minted += uint64(tx.AmountEXP * 1e8)
+        }
+    }
+
+    if minted > 0 {
+        if err := incU64(txn, "meta:circulating_pastabo", minted); err != nil {
+            return err
+        }
+    }
+
+    // --------------------------------------------------
+    // d) Miner first-seen tracking (idempotent)
+    // --------------------------------------------------
+    minerKey := []byte("miner_seen:" + blk.Header.MinerAddress)
+
+    if _, err := txn.Get(minerKey); err == badger.ErrKeyNotFound {
+
+        if err := txn.Set(minerKey, []byte{1}); err != nil {
+            return err
+        }
+
+        if err := incU64(txn, "meta:miners_count", 1); err != nil {
+            return err
+        }
+    }
+
+    return nil
+}); err != nil {
+    return fmt.Errorf("atomic block commit failed: %w", err)
+}
+
+    // ------------------------------------------------------------------
+    // 5) Async pruning (NON-CONSENSUS)
+    // ------------------------------------------------------------------
+    if blk.Header.Height > 0 && blk.Header.Height%100 == 0 {
+        go func(h uint64) {
+            if err := l.PruneOldBlocks(); err != nil {
+                log.Printf("[scaling] prune error at %d: %v", h, err)
+            }
+        }(blk.Header.Height)
+    }
+
+    // ------------------------------------------------------------------
+    // 6) Confirmation
+    // ------------------------------------------------------------------
+    log.Printf(
+        "✅ Block #%d committed — %s",
+        blk.Header.Height,
+        blk.BlockHash,
+    )
+
+    return nil
+}
+
+// ---------------- Block Creation (Mainnet Ready) ----------------
+// NewBlock constructs a new block with the given parameters.
+// It initializes version-aware fields for backward compatibility and modern anchoring.
+// - Version 0: legacy blocks (no network anchor in DailyPoW)
+// - Version 1: modern blocks (network-anchored PoW with PrevBlockHash)
+func NewBlock(
+    height uint64,
+    prevHash string,
+    miner string,
+    txs []Transaction,
+    nonce uint64,
+) (*Block, error) {
+    // Basic structural validation
+    if miner == "" {
+        return nil, errors.New("miner address cannot be empty")
+    }
+
+    // Genesis rule: prevHash must be empty ONLY for height 0
+    if height == 0 {
+        if prevHash != "" {
+            return nil, errors.New("genesis block must have empty prevHash")
+        }
+    } else {
+        if prevHash == "" {
+            return nil, errors.New("non-genesis block must have a prevHash")
+        }
+    }
+
+    // Compute Merkle root using consensus-grade function
+    merkleRoot, err := ComputeMerkleRoot(txs)
+    if err != nil {
+        return nil, fmt.Errorf("invalid transactions: %w", err)
+    }
+
+    // Modern block header with version
+    header := BlockHeader{
+        Height:       height,
+        PrevHash:     prevHash,
+        Timestamp:    NowMillis(), // validated at acceptance time
+        Nonce:        nonce,
+        MinerAddress: miner,
+        MerkleRoot:   merkleRoot,
+        Version:      1,           // All newly created blocks are version 1+
+    }
+
+    block := &Block{
+        Header:       header,
+        Transactions: txs,
+    }
+
+    // Final block hash (must hash header ONLY, canonically)
+    block.BlockHash = block.ComputeFinalHash()
+
+    return block, nil
 }
 
 // SignBlock signs the block using the miner's Ed25519 private key.
@@ -122,531 +435,147 @@ func (b *Block) VerifySignature() (bool, error) {
     return true, nil
 }
 
-// ---------------- Actual Merkle Root ----------------
-func ComputeMerkleRoot(txs []Transaction) string {
-    if len(txs) == 0 {
-        return ""
-    }
+// Validate performs full consensus validation of the block against the previous block and ledger state.
+// This function is backward-compatible: legacy blocks (without network anchoring) are accepted with minimal checks.
+// Modern blocks (with PrevBlockHash anchor) undergo strict network-bound validation.
+func (b *Block) Validate(prevBlock *Block, ledger *Ledger) error {
 
-    // Convert each transaction to a SHA256 hash
-    hashes := make([][]byte, len(txs))
-    for i, tx := range txs {
-        h := sha256.Sum256([]byte(tx.Hash()))
-        hashes[i] = h[:]
-    }
-
-    // Build the Merkle tree
-    for len(hashes) > 1 {
-        var newLevel [][]byte
-        for i := 0; i < len(hashes); i += 2 {
-            left := hashes[i]
-            var right []byte
-            if i+1 < len(hashes) {
-                right = hashes[i+1]
-            } else {
-                right = left // duplicate last hash if odd number
-            }
-            combined := append(left, right...)
-            h := sha256.Sum256(combined)
-            newLevel = append(newLevel, h[:])
-        }
-        hashes = newLevel
-    }
-
-    return hex.EncodeToString(hashes[0])
-}
-
-// ---------------- Mainnet Block Validation ----------------
-func (b *Block) Validate(prevBlock *Block) error {
-    // 1️⃣ Verify block hash
+    // ------------------------------------------------------------------
+    // 1) Hash integrity
+    // ------------------------------------------------------------------
     if b.BlockHash != b.ComputeFinalHash() {
-        return fmt.Errorf("invalid block hash")
+        return errors.New("invalid block hash")
     }
 
-    // 2️⃣ Verify previous hash
+    // ------------------------------------------------------------------
+    // 2) Chain continuity
+    // ------------------------------------------------------------------
     if b.Header.Height == 0 {
-        if prevBlock != nil {
-            return fmt.Errorf("genesis block should not have previous block")
+        if prevBlock != nil || b.Header.PrevHash != "" {
+            return errors.New("invalid genesis linkage")
         }
     } else {
         if prevBlock == nil {
-            return fmt.Errorf("missing previous block for height %d", b.Header.Height)
+            return errors.New("missing previous block")
         }
+        // Height is informational; continuity is hash-based
+if b.Header.Height != prevBlock.Header.Height+1 {
+    log.Printf(
+        "⚠️ height adjusted: expected %d got %d",
+        prevBlock.Header.Height+1,
+        b.Header.Height,
+    )
+}
         if b.Header.PrevHash != prevBlock.BlockHash {
-            return fmt.Errorf("prevHash mismatch — fork attempt")
+            return errors.New("prevHash mismatch")
         }
     }
 
-    // 3️⃣ Verify MerkleRoot
-    if ComputeMerkleRoot(b.Transactions) != b.Header.MerkleRoot {
-        return fmt.Errorf("invalid Merkle root")
+    // ------------------------------------------------------------------
+    // 3) Time strictly chained (not wall-clock trusted)
+    // ------------------------------------------------------------------
+    if b.Header.Timestamp <= 0 {
+        return errors.New("invalid timestamp")
     }
 
-    // 4️⃣ Verify signature (backward compatible)
+    if prevBlock != nil && b.Header.Timestamp <= prevBlock.Header.Timestamp {
+        return errors.New("timestamp must increase from previous block")
+    }
+
+    // soft drift safety
+    now := time.Now().UnixMilli()
+    if b.Header.Timestamp > now+2*60*60*1000 {
+        return errors.New("timestamp too far in future")
+    }
+
+    // ------------------------------------------------------------------
+    // 4) Merkle root (full blocks only)
+    // ------------------------------------------------------------------
+    if !b.IsLightBlock() {
+        root, err := ComputeMerkleRoot(b.Transactions)
+        if err != nil {
+            return err
+        }
+        if root != b.Header.MerkleRoot {
+            return errors.New("merkle root mismatch")
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 5) Signature
+    // ------------------------------------------------------------------
     ok, err := b.VerifySignature()
-    if err != nil {
-        return fmt.Errorf("signature verification error: %v", err)
-    }
-    if !ok {
-        return fmt.Errorf("block signature invalid")
+    if err != nil || !ok {
+        return errors.New("invalid block signature")
     }
 
-    return nil
-}
-
-// ---------------- Mainnet Ready ApplyBlock ----------------
-// ApplyBlock validates and commits a block into the ledger database.
-// It prevents forks, isolates corrupted blocks, and preserves scalability.
-func (l *Ledger) ApplyBlock(blk *Block) error {
-    if l == nil || l.db == nil {
-        return fmt.Errorf("ledger not initialized")
-    }
-
-    // 1️⃣ Check for fork at the same height
-    existing, err := l.GetBlockByHeight(blk.Header.Height)
-    if err == nil && existing != nil {
-        return fmt.Errorf("block at height %d already exists — fork rejected", blk.Header.Height)
-    }
-
-    // 2️⃣ Retrieve previous block (if not genesis)
-    var prev *Block
-    if blk.Header.Height > 0 {
-        prev, err = l.GetBlockByHeight(blk.Header.Height - 1)
-        if err != nil {
-            return fmt.Errorf("failed to get previous block: %v", err)
+    // ------------------------------------------------------------------
+    // 6) Legacy-tolerant miner binding
+    // ------------------------------------------------------------------
+    if b.PublicKey != "" {
+        pub, _ := base64.StdEncoding.DecodeString(b.PublicKey)
+        if len(pub) == ed25519.PublicKeySize {
+            addr := address.FromEd25519PublicKey(ed25519.PublicKey(pub))
+            if addr != b.Header.MinerAddress {
+                log.Printf("legacy miner accepted: %s → %s",
+                    addr, b.Header.MinerAddress)
+            }
         }
     }
 
-    // 3️⃣ Validate hash, MerkleRoot, PrevHash, and miner signature
-    if err := blk.Validate(prev); err != nil {
-        log.Printf("❌ Block #%d validation failed: %v", blk.Header.Height, err)
-
-        // Automatically isolate corrupted block
-        corruptedName := fmt.Sprintf("corrupted_%d_%s", blk.Header.Height, time.Now().Format("20060102_150405"))
-        oldPath := filepath.Join(l.dbPath, fmt.Sprintf("block_%d", blk.Header.Height))
-        newPath := filepath.Join(l.dbPath, corruptedName)
-        _ = os.Rename(oldPath, newPath)
-
-        log.Printf("⚠️ Block #%d renamed to %s for forensic audit", blk.Header.Height, corruptedName)
-        return fmt.Errorf("block validation failed and was quarantined: %v", err)
+    // ------------------------------------------------------------------
+    // 7) Daily PoW (legacy + modern)
+    // ------------------------------------------------------------------
+    if b.Header.DailyPoW == nil {
+        return errors.New("missing DailyPoW")
     }
 
-    // 4️⃣ Store the block atomically
-    if err := l.StoreBlockBatch(blk); err != nil {
-        return fmt.Errorf("failed to store block: %v", err)
-    }
+    pow := b.Header.DailyPoW
 
-    // 5️⃣ Log confirmation using existing ComputeFinalHash()
-    computedHash := blk.ComputeFinalHash()
-    log.Printf("✅ Block #%d committed successfully — Hash: %s", blk.Header.Height, computedHash)
+    if pow.PrevBlockHash == "" {
 
-    return nil
-}
-
-// ---------------- Hashing ----------------
-func (b *Block) ComputeFastHash() string {
-        data, _ := cbor.Marshal(b.Header)
-        h := sha256.Sum256(data)
-        return hex.EncodeToString(h[:])
-}
-
-func (b *Block) ComputeHashData() []byte {
-        // IMPORTANT: exclude signature and public key from the signed/hashable data.
-        // Only header + transactions are used for hashing/signing.
-        tmp := struct {
-                Header       BlockHeader
-                Transactions []Transaction
-        }{
-                Header:       b.Header,
-                Transactions: b.Transactions,
-        }
-        data, _ := cbor.Marshal(tmp)
-        return data
-}
-
-func (b *Block) ComputeFinalHash() string {
-        h := sha3.Sum256(b.ComputeHashData())
-        return hex.EncodeToString(h[:])
-}
-
-
-// ---------------- Concurrent Block Iteration ----------------
-func (l *Ledger) IterateBlocks(cb func(*Block) error) error {
-        if l == nil || l.db == nil {
-                return fmt.Errorf("ledger not initialized")
+        // 🕯 legacy mode
+        if !VerifyDailyPoWLegacy(b.Header.MinerAddress, *pow) {
+            return errors.New("invalid legacy PoW")
         }
 
-        return l.db.View(func(txn *badger.Txn) error {
-                opts := badger.DefaultIteratorOptions
-                opts.PrefetchValues = true
-                it := txn.NewIterator(opts)
-                defer it.Close()
-
-                for it.Seek(prefixBlock); it.ValidForPrefix(prefixBlock); it.Next() {
-                        item := it.Item()
-                        val, err := item.ValueCopy(nil)
-                        if err != nil {
-                                return err
-                        }
-
-                        data, err := compressor.DecompressZSTD(val)
-                        if err != nil {
-                                return err
-                        }
-
-                        var blk Block
-                        if err := cbor.Unmarshal(data, &blk); err != nil {
-                                return err
-                        }
-
-                        if err := cb(&blk); err != nil {
-                                return err
-                        }
-                }
-                return nil
-        })
-}
-
-func (l *Ledger) ScanBlocksStream(process func(blk *Block) error) error {
-        if l == nil || l.db == nil {
-                return fmt.Errorf("ledger not initialized")
-        }
-
-        return l.db.View(func(txn *badger.Txn) error {
-                opts := badger.DefaultIteratorOptions
-                opts.PrefetchValues = false
-                it := txn.NewIterator(opts)
-                defer it.Close()
-
-                for it.Seek(prefixBlock); it.ValidForPrefix(prefixBlock); it.Next() {
-                        item := it.Item()
-                        val, err := item.ValueCopy(nil)
-                        if err != nil {
-                                return err
-                        }
-
-                        data, err := compressor.DecompressZSTD(val)
-                        if err != nil {
-                                return err
-                        }
-
-                        var blk Block
-                        if err := cbor.Unmarshal(data, &blk); err != nil {
-                                return err
-                        }
-
-                        if err := process(&blk); err != nil {
-                                return err
-                        }
-                }
-                return nil
-        })
-}
-
-// ---------------- Batch Block Storage ----------------
-var (
-        batchMu      sync.Mutex
-        batchQueueA  []*Block
-        batchQueueB  []*Block
-        activeQueueA = true
-        batchSize    = 500
-)
-
-func (l *Ledger) StoreBlockBatch(blk *Block) error {
-        if l == nil || l.db == nil {
-                return fmt.Errorf("ledger not initialized")
-        }
-
-        batchMu.Lock()
-        if activeQueueA {
-                batchQueueA = append(batchQueueA, blk)
-                if len(batchQueueA) >= batchSize {
-                        toWrite := batchQueueA
-                        batchQueueA = nil
-                        activeQueueA = false
-                        batchMu.Unlock()
-                        return flushBlockBatch(l, toWrite)
-                }
-        } else {
-                batchQueueB = append(batchQueueB, blk)
-                if len(batchQueueB) >= batchSize {
-                        toWrite := batchQueueB
-                        batchQueueB = nil
-                        activeQueueA = true
-                        batchMu.Unlock()
-                        return flushBlockBatch(l, toWrite)
-                }
-        }
-        batchMu.Unlock()
-        return nil
-}
-
-func flushBlockBatch(l *Ledger, blocks []*Block) error {
-        return l.db.Update(func(txn *badger.Txn) error {
-                for _, b := range blocks {
-                        key := blockKeyByHeight(b.Header.Height)
-
-                        // marshal + compress
-                        val, err := cbor.Marshal(b)
-                        if err != nil {
-                                return err
-                        }
-                        comp, err := compressor.CompressZSTD(val)
-                        if err != nil {
-                                // fallback to raw if compression fails
-                                comp = val
-                        }
-
-                        if err := txn.Set(key, comp); err != nil {
-                                return err
-                        }
-                }
-                return nil
-        })
-}
-
-func (l *Ledger) ForceFlushBlocks() error {
-        if l == nil || l.db == nil {
-                return fmt.Errorf("ledger not initialized")
-        }
-
-        batchMu.Lock()
-        defer batchMu.Unlock()
-
-        if len(batchQueueA) > 0 {
-                if err := flushBlockBatch(l, batchQueueA); err != nil {
-                        return err
-                }
-                batchQueueA = nil
-        }
-        if len(batchQueueB) > 0 {
-                if err := flushBlockBatch(l, batchQueueB); err != nil {
-                        return err
-                }
-                batchQueueB = nil
-        }
-        return nil
-}
-
-
-func (l *Ledger) GetLatestBlockHeight() uint64 {
-        var lastHeight uint64
-        _ = l.IterateBlocks(func(b *Block) error {
-                if b.Header.Height > lastHeight {
-                        lastHeight = b.Header.Height
-                }
-                return nil
-        })
-        return lastHeight
-}
-
-
-// GetLatestBlock returns the most recent block.
-func (l *Ledger) GetLatestBlock() (*Block, error) {
-        var last *Block
-
-        err := l.db.View(func(txn *badger.Txn) error {
-                opts := badger.DefaultIteratorOptions
-                opts.Reverse = true
-                it := txn.NewIterator(opts)
-                defer it.Close()
-
-                // Seek to the end of the prefix range
-                it.Seek(append(prefixBlock, 0xFF))
-                for it.Valid() {
-                        item := it.Item()
-                        k := item.Key()
-                        if !bytes.HasPrefix(k, prefixBlock) {
-                                break
-                        }
-
-                        val, err := item.ValueCopy(nil)
-                        if err != nil {
-                                return err
-                        }
-
-                        data, err := compressor.DecompressZSTD(val)
-                        if err != nil {
-                                return err
-                        }
-
-                        var blk Block
-                        if err := cbor.Unmarshal(data, &blk); err != nil {
-                                return fmt.Errorf("failed to decode block: %w", err)
-                        }
-
-                        last = &blk
-                        break
-                }
-
-                if last == nil {
-                        return fmt.Errorf("no blocks in ledger")
-                }
-                return nil
-        })
-
-        if err != nil {
-                return nil, err
-        }
-        return last, nil
-}
-
-// blockKeyByHeight returns the DB key for a block at a specific height.
-func blockKeyByHeight(height uint64) []byte {
-        b := make([]byte, 8)
-        binary.BigEndian.PutUint64(b, height)
-        return append(prefixBlock, b...)
-}
-
-// PutBlock stores a block compressed with ZSTD asynchronously.
-func (l *Ledger) PutBlock(height uint64, blk *Block) error {
-        bufVal, err := cbor.Marshal(blk)
-        if err != nil {
-                return err
-        }
-        compData, err := compressor.CompressZSTD(bufVal)
-        if err != nil {
-                compData = bufVal
-        }
-        l.AsyncPut(blockKeyByHeight(height), compData)
-
-        hb := make([]byte, 8)
-        binary.BigEndian.PutUint64(hb, height)
-        return l.PutBytes(MetaChainTip, hb)
-}
-
-// GetBlockByHeight retrieves and decompresses a block by its height.
-func (l *Ledger) GetBlockByHeight(height uint64) (*Block, error) {
-        data, err := l.GetBytes(blockKeyByHeight(height))
-        if err != nil {
-                return nil, err
-        }
-
-        data, err = compressor.DecompressZSTD(data)
-        if err != nil {
-                return nil, err
-        }
-
-        var blk Block
-        if err := cbor.Unmarshal(data, &blk); err != nil {
-                return nil, err
-        }
-        return &blk, nil
-}
-
-func (l *Ledger) AddBlock(blk *Block) error {
-        return l.ApplyBlock(blk)
-}
-
-
-// DumpLedger prints all blocks, detects corrupted blocks, and flags forks.
-// Maintains chronological order and preserves all blocks.
-func (l *Ledger) DumpLedger() error {
-    if l == nil || l.db == nil {
-        return fmt.Errorf("ledger not initialized")
-    }
-
-    fmt.Println("📜 ====== LEDGER DUMP START ======")
-    var prevHash string
-    corruptionDetected := false
-    forksDetected := false
-    blockHeights := make(map[uint64][]string)
-    count := 0
-
-    // Iterate all blocks in ascending order
-    err := l.IterateBlocks(func(b *Block) error {
-        isCorrupt := false
-
-        // Track blocks by height to detect forks
-        blockHeights[b.Header.Height] = append(blockHeights[b.Header.Height], b.BlockHash)
-        if len(blockHeights[b.Header.Height]) > 1 {
-            forksDetected = true
-        }
-
-        // Determine expected hash
-        expected := b.ComputeFinalHash()
-        if b.Header.Height == 0 {
-            expected = GenesisHash
-        }
-
-        // Validate block hash
-        if b.BlockHash != expected {
-            fmt.Printf("❌ Block #%d has invalid hash!\n", b.Header.Height)
-            fmt.Printf("   Expected: %s\n", expected)
-            fmt.Printf("   Found   : %s\n", b.BlockHash)
-            isCorrupt = true
-            corruptionDetected = true
-        }
-
-        // Validate previous hash (except genesis)
-        if b.Header.Height > 0 && b.Header.PrevHash != prevHash {
-            fmt.Printf("❌ Block #%d has mismatched PrevHash!\n", b.Header.Height)
-            fmt.Printf("   Expected PrevHash: %s\n", prevHash)
-            fmt.Printf("   Found PrevHash   : %s\n", b.Header.PrevHash)
-            isCorrupt = true
-            corruptionDetected = true
-        }
-
-        // Print block info
-        label := ""
-        if isCorrupt {
-            label = "(CORRUPTED)"
-        } else if len(blockHeights[b.Header.Height]) > 1 {
-            label = "(FORK)"
-        }
-
-        fmt.Printf("🔗 Block #%d %s\n", b.Header.Height, label)
-        fmt.Printf("   ⏱️  Timestamp: %d\n", b.Header.Timestamp)
-        fmt.Printf("   👤 Miner: %s\n", b.Header.MinerAddress)
-        fmt.Printf("   🔑 PrevHash: %s\n", b.Header.PrevHash)
-        fmt.Printf("   � Hash: %s\n", b.BlockHash)
-        fmt.Printf("   💰 Transactions: %d\n", len(b.Transactions))
-        fmt.Println("   -----------------------------")
-
-        prevHash = b.BlockHash
-        count++
-        return nil
-    })
-    if err != nil {
-        return fmt.Errorf("failed to iterate blocks: %v", err)
-    }
-
-    if count == 0 {
-        fmt.Println("⚠️ No blocks found in the ledger.")
     } else {
-        fmt.Printf("✅ %d blocks found in the ledger.\n", count)
+
+        // 🔐 modern anchored mode
+        if !VerifyDailyPoW(
+            b.Header.MinerAddress,
+            *pow,
+            prevBlock.BlockHash,
+        ) {
+            return errors.New("anchored PoW verification failed")
+        }
+
+        expectedDiff := getDailyPoWDifficulty(ledger)
+        if pow.Difficulty != expectedDiff {
+            return fmt.Errorf(
+                "difficulty mismatch: expected %d got %d",
+                expectedDiff,
+                pow.Difficulty,
+            )
+        }
     }
 
-    if forksDetected {
-        fmt.Println("⚠️ Forks detected — multiple blocks exist at the same height. They are logged but preserved.")
-    }
-
-    fmt.Println("📜 ====== LEDGER DUMP END ======")
-
-    if corruptionDetected {
-        fmt.Println("🚨 Ledger corruption detected! Local ledger operations are now blocked.")
-        return fmt.Errorf("ledger is corrupted — halting local operations")
+    // ------------------------------------------------------------------
+    // 8) One PoW per day per miner (chain-based)
+    // ------------------------------------------------------------------
+    if ledger != nil {
+        mined, err := ledger.HasDailyPoW(
+            b.Header.MinerAddress,
+            pow.DayStart,
+        )
+        if err != nil {
+            return err
+        }
+        if mined {
+            return errors.New("double daily PoW detected")
+        }
     }
 
     return nil
 }
 
-// GetBlocksRange returns all available blocks in the range [from, to] inclusive.
-// It is used by the P2P layer to serve block synchronization requests from peers.
-// Missing blocks (gaps) are skipped — this should not occur in a healthy chain.
-func (l *Ledger) GetBlocksRange(from, to uint64) ([]*Block, error) {
-    if l == nil || l.db == nil {
-        return nil, errors.New("ledger not initialized")
-    }
-
-    var blocks []*Block
-    for h := from; h <= to; h++ {
-        blk, err := l.GetBlockByHeight(h)
-        if err != nil {
-            // Log if you want, but continue — gaps should be rare
-            continue
-        }
-        blocks = append(blocks, blk)
-    }
-    return blocks, nil
-}

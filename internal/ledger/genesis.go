@@ -51,17 +51,20 @@ func CreateGenesisBlock(db *Ledger) (*Block, error) {
     }
 
     // Compute Merkle root deterministically
-    merkle := ComputeMerkleRoot([]Transaction{genesisTx})
+merkle, err := ComputeMerkleRoot([]Transaction{genesisTx})
+if err != nil {
+    return nil, fmt.Errorf("failed to compute genesis Merkle root: %w", err)
+}
 
-    // Build the block header
-    header := BlockHeader{
-        Height:       0,
-        PrevHash:     "",
-        Timestamp:    GenesisTimestamp,
-        Nonce:        0,
-        MinerAddress: GenesisMinerAddress,
-        MerkleRoot:   merkle,
-    }
+// Build the block header
+header := BlockHeader{
+    Height:       0,
+    PrevHash:     "",
+    Timestamp:    GenesisTimestamp,
+    Nonce:        0,
+    MinerAddress: GenesisMinerAddress,
+    MerkleRoot:   merkle,
+}
 
     // Assemble the genesis block
     genesisBlock := &Block{

@@ -67,7 +67,7 @@ func GetMinerCount(db *badger.DB) (uint64, error) {
 
 // ------------------- Halving Logic -------------------
 
-// GetHalvingLevel returns the halving level based on number of miners.
+// GetHalvingLevel returns the halving level based on number of miners
 func GetHalvingLevel(db *badger.DB) (int, error) {
 	count, err := GetMinerCount(db)
 	if err != nil {
@@ -94,7 +94,7 @@ func GetHalvingLevel(db *badger.DB) (int, error) {
 	return level, nil
 }
 
-// GetCurrentReward returns the current reward for mining based on halving level.
+// GetCurrentReward returns the current reward for mining based on halving level
 func GetCurrentReward(db *badger.DB) (float64, error) {
 	level, err := GetHalvingLevel(db)
 	if err != nil {
@@ -106,6 +106,11 @@ func GetCurrentReward(db *badger.DB) (float64, error) {
 	reward := halvingRewards[level]
 	log.Printf("🎁 Current reward: %.8f EXPLO (Level %d)", reward, level)
 	return reward, nil
+}
+
+// GetCurrentRewardPastabo returns the reward for Daily PoW Pastabo (same as GetCurrentReward for now)
+func GetCurrentRewardPastabo(db *badger.DB) (float64, error) {
+	return GetCurrentReward(db)
 }
 
 // ------------------- Signatures -------------------

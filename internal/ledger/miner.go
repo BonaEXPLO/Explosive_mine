@@ -142,7 +142,7 @@ func CreateMiner(id, password string, words []string, ipOrHash string, ledger *L
     }
 
     // ✅ Step 1: Device lock check (currently disabled)
-    //if err := guardian.CanCreateNewAccount(); err != nil { //return nil, "", err //}
+    if err := guardian.CanCreateNewAccount(); err != nil { return nil, "", err }
 
     words = normalizeWords(words)
 
@@ -212,101 +212,111 @@ func CreateMiner(id, password string, words []string, ipOrHash string, ledger *L
     }
 
     // ✅ Step 2: Register local device lock (currently disabled)
-    //if err := guardian.RegisterDeviceLock(id); err != nil { // return nil, "", fmt.Errorf("failed to register device lock: %w", err) //}
+    if err := guardian.RegisterDeviceLock(id); err != nil {  return nil, "", fmt.Errorf("failed to register device lock: %w", err) 
+}
 
     return miner, msg, nil
 }
 
-// -----------------------------
-// Restore miner account (legacy + V3 compatible)
-// -----------------------------
-func RestoreMiner(id string, words []string, newPassword string, ledger *Ledger) (*Miner, string, error) {
+// RestoreMinerUniversal restores or initializes a miner account deterministically.
+// This function is device-agnostic and allows universal account restoration
+// using the miner ID, 4 sacred words, and a new password.
+//
+// Parameters:
+//   - id: the miner's unique ID (EX: explo + 40 hex + 8 checksum).
+//   - words: the miner's 4 sacred words in order.
+//   - password: the password to encrypt the identity bundle on the current device.
+//   - ledger: optional local storage for persisting the restored miner.
+//
+// Returns:
+//   - *Miner: the restored miner object with deterministic identity and encrypted bundle.
+//   - string: a philosophical / guardian message associated with the miner.
+//   - error: any error encountered during validation, encryption, or persistence.
+func RestoreMinerUniversal(
+    id string,
+    words []string,
+    password string,
+    ledger *Ledger,
+) (*Miner, string, error) {
+
+    // Strict input validation
+    // Ensure the ID matches the EXPLO address format.
     if !address.IsValidEXPLOAddress(id) {
         return nil, "", errors.New("invalid miner ID")
     }
+
+    // Ensure the sacred words are valid: 4 words, uppercase first letter, letters or hyphen.
     if !IsValidSacredWords(words) {
-        return nil, "", errors.New("invalid sacred words")
-    }
-    if !IsValidPassword(newPassword) {
-        return nil, "", errors.New("invalid new password format")
+        return nil, "", errors.New("invalid sacred words format")
     }
 
+    // Ensure password meets security requirements: length, complexity, etc.
+    if !IsValidPassword(password) {
+        return nil, "", errors.New("invalid password format")
+    }
+
+    // Normalize sacred words to canonical form (trimming, capitalization, etc.)
     words = normalizeWords(words)
-    msg := guardian.EncourageMessageEphemeral(words)
-    var miner *Miner
 
-    // 1️⃣ Try to load from Ledger (allow restoration)
-    if ledger != nil {
-        key := []byte("miner:" + id)
-        var existing Miner
-        _ = ledger.GetObject(key, &existing)
+    // Generate a guardian / motivational message consistent with the miner creation philosophy
+    guardianMsg := guardian.EncourageMessageEphemeral(words)
 
-        if existing.ID == id && equalWords(existing.ConsciousnessFingerprint, words) {
-            // Ensure deterministic V3 signature is present
-            if err := EnsureMinerSignature(&existing); err != nil {
-                return nil, "", fmt.Errorf("failed to upgrade miner to V3 deterministic identity: %w", err)
-            }
-
-            // Re-encrypt bundle with new password (restore on new device)
-            salt := make([]byte, 16)
-            if _, err := rand.Read(salt); err != nil {
-                return nil, "", fmt.Errorf("failed to generate salt: %w", err)
-            }
-
-            bundle := map[string]interface{}{"id": id, "words": words}
-            bundleJSON, err := json.Marshal(bundle)
-            if err != nil {
-                return nil, "", fmt.Errorf("failed to marshal identity bundle: %w", err)
-            }
-
-            encrypted, err := encryption.EncryptBundle(bundleJSON, newPassword, salt)
-            if err != nil {
-                return nil, "", fmt.Errorf("failed to encrypt bundle: %w", err)
-            }
-
-            existing.EncryptedBundle = encrypted
-            existing.Salt = salt
-
-            _ = ledger.PutObject(key, &existing)
-            return &existing, msg, nil
-        }
+    // Initialize a new miner struct with Version 3 (deterministic identity)
+    miner := &Miner{
+        ID:                       id,
+        ConsciousnessFingerprint: words,
+        Version:                  3,
     }
 
-    // 2️⃣ No existing miner → create a fresh miner
+    // Generate deterministic V3 identity (public key + signature) from ID and sacred words
+    // Ensures the same identity is restored across devices.
+    if err := EnsureMinerSignature(miner); err != nil {
+        return nil, "", fmt.Errorf("failed to generate deterministic miner identity: %w", err)
+    }
+
+    // Generate a random salt for AES-GCM encryption of the identity bundle
+    // Each device will have a unique encrypted bundle even for the same miner.
     salt := make([]byte, 16)
     if _, err := rand.Read(salt); err != nil {
         return nil, "", fmt.Errorf("failed to generate salt: %w", err)
     }
 
-    bundle := map[string]interface{}{"id": id, "words": words}
+    // Construct the identity bundle to encrypt: contains ID and sacred words
+    bundle := map[string]interface{}{
+        "id":   id,
+        "words": words,
+    }
+
     bundleJSON, err := json.Marshal(bundle)
     if err != nil {
-        return nil, "", fmt.Errorf("failed to marshal identity bundle: %w", err)
+        return nil, "", err
     }
 
-    encrypted, err := encryption.EncryptBundle(bundleJSON, newPassword, salt)
+    // Encrypt the bundle with AES-GCM using the provided password and salt
+    encrypted, err := encryption.EncryptBundle(bundleJSON, password, salt)
     if err != nil {
-        return nil, "", fmt.Errorf("failed to encrypt bundle: %w", err)
+        return nil, "", err
     }
 
-    miner = &Miner{
-        ID:                       id,
-        EncryptedBundle:          encrypted,
-        Salt:                     salt,
-        ConsciousnessFingerprint: words,
+    // Zero-out the bundle in memory for security after encryption
+    for i := range bundleJSON {
+        bundleJSON[i] = 0
     }
 
-    // Immediately apply deterministic V3 identity
-    if err := EnsureMinerSignature(miner); err != nil {
-        return nil, "", fmt.Errorf("failed to generate V3 identity: %w", err)
-    }
+    miner.EncryptedBundle = encrypted
+    miner.Salt = salt
 
+    // Optional: persist the restored miner locally in the ledger DB
     if ledger != nil {
         key := []byte("miner:" + id)
-        _ = ledger.PutObject(key, miner)
+        if err := ledger.PutObject(key, miner); err != nil {
+            // Could optionally log instead of returning error to avoid blocking restoration
+            return nil, "", fmt.Errorf("failed to persist miner locally: %w", err)
+        }
     }
 
-    return miner, msg, nil
+    // Return the miner struct and the guardian message
+    return miner, guardianMsg, nil
 }
 
 // DeriveMinerKey deterministically derives an Ed25519 key pair

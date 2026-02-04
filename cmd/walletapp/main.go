@@ -10,11 +10,15 @@ import (
         "sort"
         "path/filepath"
         "crypto/ed25519"
+        "errors"
         "strings"
         "sync"
+        "log"
         "time"
 
         "explosive/internal/ledger"
+        "github.com/dgraph-io/badger/v4"
+        "explosive/internal/imanifund"
         "explosive/internal/encryption"
         "explosive/internal/p2p"
         "explosive/internal/wallet"
@@ -145,6 +149,64 @@ func pick4Indices(n int) ([]int, error) {
         return out, nil
 }
 
+// startP2PAfterWalletReady initializes and starts the P2P node only after a wallet
+// has been successfully created or restored.
+//
+// The listen port is derived deterministically from the wallet address using
+// DeriveInvestorPort(), ensuring:
+//   - no hardcoded or user-defined ports
+//   - stable port allocation across devices for the same wallet
+//   - natural port separation between different wallets
+//
+// This design enables mobile-first, multi-instance-safe operation and guarantees
+// that a node never starts without a valid cryptographic identity.
+//
+// Parameters:
+//   - w   : the initialized wallet containing a valid EXPLO address
+//   - ldb : the already opened local ledger instance
+//
+// Returns:
+//   - an error if the wallet is not ready, port derivation fails,
+//     or the P2P node cannot be started.
+func startP2PAfterWalletReady(w *wallet.Wallet, ldb *ledger.Ledger) error {
+    if w == nil {
+        return fmt.Errorf("wallet not ready")
+    }
+
+    // 🔐 Port déterministe basé sur l'adresse wallet
+    port, err := p2p.DeriveInvestorPort(w.Address)
+    if err != nil {
+        return fmt.Errorf("failed to derive investor port: %w", err)
+    }
+
+    listenAddr := fmt.Sprintf("0.0.0.0:%d", port)
+
+    // 🚫 Wallet ≠ mineur → pas d'identité consciente
+    minerID := ""
+    var sacredWords []string = nil
+
+    node, err := p2p.NewNode(
+        listenAddr,
+        "explosive-mainnet",
+        "ExplosiveWallet/1.0",
+        minerID,
+        sacredWords,
+    )
+    if err != nil {
+        return fmt.Errorf("failed to create P2P node: %w", err)
+    }
+
+    node.Ledger = ldb
+
+    if err := node.Start(); err != nil {
+        return fmt.Errorf("failed to start P2P node: %w", err)
+    }
+
+    p2pNode = node
+
+    fmt.Printf("✅ P2P Wallet Node started securely on %s\n", listenAddr)
+    return nil
+}
 // ---------- Wallet flows ----------
 func flowCreateWallet() error {
         printlnL("🧠 You will receive a 24-word mnemonic. Save it safely; Explosive cannot recover it.",
@@ -229,6 +291,12 @@ func flowCreateWallet() error {
 
         printlnL("🎉 Wallet created successfully!", " 🎉 Wallet créé avec succès!")
         fmt.Println("📬 Address:", w.Address)
+
+        // 🚀 Start P2P AFTER wallet creation
+        if err := startP2PAfterWalletReady(currentWallet, p2pNode.Ledger); err != nil {
+                fmt.Println("⚠️ P2P not started:", err)
+        }
+
         return nil
 }
 
@@ -295,6 +363,10 @@ func flowRestoreWallet() error {
     printlnL("✅ Wallet restored successfully!", "✅ Wallet restauré avec succès!")
     fmt.Println("📬 Address:", currentWallet.Address)
 
+    // 🚀 Start P2P AFTER wallet restoration
+    if err := startP2PAfterWalletReady(currentWallet, p2pNode.Ledger); err != nil {
+        fmt.Println("⚠️ P2P not started:", err)
+    }
     return nil
 }
 
@@ -758,27 +830,32 @@ func main() {
         }()
         fmt.Println("✅ Ledger opened successfully at", ledgerPath)
 
-        // Start P2P node
-        p2pNode = p2p.NewNode(":9101", "explosive-mainnet", "ExplosiveWallet/1.0")
-        if err := p2pNode.Start(); err != nil {
-                fmt.Println("❌ Failed to start P2P node:", err)
-                return
+       // Initialize the sacred IMANI Fund — critical for collecting transaction fees and future blessings
+        if err := imanifund.Init(func(minerID string, amount float64) error {
+                // This callback is used during sacred redistributions (blessings)
+                // It directly credits EXPLO to the recipient's balance in the ledger
+                balanceKey := []byte("balance:" + minerID)
+                var bal ledger.Balance
+                if err := ldb.GetObject(balanceKey, &bal); err != nil {
+                        if errors.Is(err, badger.ErrKeyNotFound) {
+                                bal = ledger.Balance{}
+                        } else {
+                                return err
+                        }
+                }
+                bal.EXPLO += amount
+                return ldb.PutObject(balanceKey, &bal)
+        }); err != nil {
+                log.Fatalf("❌ Failed to initialize sacred IMANI Fund: %v", err)
         }
-        defer func() {
-                p2pNode.Stop()
-                fmt.Println("🛑 P2P Node stopped")
-        }()
-        fmt.Println("✅ P2P Node started on port :9101")
+        fmt.Println("✅ Sacred IMANI Fund initialized — ready to receive offerings and bless pure souls")
 
-        // Attach ledger to P2P node
-        p2pNode.Ledger = ldb
-        fmt.Println("✅ Ledger attached to P2P node")
+        // Ledger kept ready — P2P starts AFTER wallet creation/restoration
+        p2pNode = &p2p.Node{Ledger: ldb}
 
         // Start inactivity watcher
         startInactivityWatcher()
         fmt.Println("✅ Inactivity watcher running")
-
-        fmt.Printf("ℹ️ Ready. WalletDB=%s Ledger=%s P2PAddr=%s\n", filepath.Join(dataDir, "walletdb"), ledgerPath, ":9101")
 
         // Launch main menu
         mainMenu()

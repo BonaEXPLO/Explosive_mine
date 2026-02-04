@@ -3,7 +3,6 @@ package ledger
 import (
         "crypto/ed25519"
         "encoding/binary"
-        "crypto/sha256"
         "encoding/hex"
         "errors"
         "fmt"
@@ -55,27 +54,73 @@ func IsValidEXPLOAddress(addr string) bool {
         return address.IsValidMinerID(addr)
 }
 
-// Hash returns the deterministic SHA256 hash of the transaction content.
-func (tx *Transaction) Hash() string {
-    // Combine key fields for deterministic hash
-    data := fmt.Sprintf("%s|%s|%f|%f|%d|%v|%t|%s",
-        tx.From,
-        tx.To,
-        tx.AmountEXP,
-        tx.AmountIM,
-        tx.Timestamp,
-        tx.Fee,
-        tx.IsReward,
-        tx.Note,
-    )
 
-    h := sha256.Sum256([]byte(data))
-    return hex.EncodeToString(h[:])
+// ---------------- Hash & Signature ----------------
+
+// ComputeHash is the SINGLE canonical hash function for transactions.
+// Uses deterministic CBOR encoding of core fields + SHA3-256.
+// This is the TxHash stored in the struct and used for Merkle root.
+func (tx *Transaction) ComputeHash() string {
+    data, err := cbor.Marshal(struct {
+        From          string  `cbor:"from"`
+        To            string  `cbor:"to"`
+        AmountEXP     float64 `cbor:"amount_explo"`
+        AmountIM      float64 `cbor:"amount_imani"`
+        Fee           float64 `cbor:"fee"`
+        Timestamp     int64   `cbor:"timestamp"`
+        Nonce         int64   `cbor:"nonce"`
+        IsReward      bool    `cbor:"is_reward"`
+        IsIMANILocked bool    `cbor:"is_imani_locked"`
+        Note          string  `cbor:"note,omitempty"`
+    }{
+        From:          tx.From,
+        To:            tx.To,
+        AmountEXP:     tx.AmountEXP,
+        AmountIM:      tx.AmountIM,
+        Fee:           tx.Fee,
+        Timestamp:     tx.Timestamp,
+        Nonce:         tx.Nonce,
+        IsReward:      tx.IsReward,
+        IsIMANILocked: tx.IsIMANILocked,
+        Note:          tx.Note,
+    })
+    if err != nil {
+        // Should never happen with valid struct
+        return ""
+    }
+    return Sha3Hex(data)
 }
 
-// ---------------- Transaction Helpers ----------------
+// HashForSignature returns the exact same data as used for ComputeHash,
+// but as raw bytes for Ed25519 signing.
+// Ensures signature is over the same content as the stored TxHash.
+func (tx *Transaction) HashForSignature() []byte {
+    data, _ := cbor.Marshal(struct {
+        From          string  `cbor:"from"`
+        To            string  `cbor:"to"`
+        AmountEXP     float64 `cbor:"amount_explo"`
+        AmountIM      float64 `cbor:"amount_imani"`
+        Fee           float64 `cbor:"fee"`
+        Timestamp     int64   `cbor:"timestamp"`
+        Nonce         int64   `cbor:"nonce"`
+        IsReward      bool    `cbor:"is_reward"`
+    }{
+        From:      tx.From,
+        To:        tx.To,
+        AmountEXP: tx.AmountEXP,
+        AmountIM:  tx.AmountIM,
+        Fee:       tx.Fee,
+        Timestamp: tx.Timestamp,
+        Nonce:     tx.Nonce,
+        IsReward:  tx.IsReward,
+    })
+    return data
+}
+
+// NewTransaction now uses only the canonical ComputeHash
 func NewTransaction(from, to string, exp, im float64, miningReward bool, nonce int64) (*Transaction, error) {
-        if from != "SYSTEM" && !IsValidEXPLOAddress(from) {
+
+if from != "SYSTEM" && !IsValidEXPLOAddress(from) {
                 return nil, errors.New("❌ invalid sender address")
         }
         if !IsValidEXPLOAddress(to) {
@@ -93,51 +138,24 @@ func NewTransaction(from, to string, exp, im float64, miningReward bool, nonce i
                 }
         }
 
-        tx := &Transaction{
-                From:          from,
-                ID:            from,
-                To:            to,
-                AmountEXP:     exp,
-                AmountIM:      im,
-                Fee:           fee,
-                Timestamp:     time.Now().UnixMilli(),
-                Nonce:         nonce,
-                IsReward:      miningReward,
-                IsIMANILocked: !miningReward && im > 0,
-        }
+    tx := &Transaction{
+        From:          from,
+        ID:            from,
+        To:            to,
+        AmountEXP:     exp,
+        AmountIM:      im,
+        Fee:           fee,
+        Timestamp:     time.Now().UnixMilli(),
+        Nonce:         nonce,
+        IsReward:      miningReward,
+        IsIMANILocked: !miningReward && im > 0,
+        Note:          "",
+    }
 
-        tx.TxHash = tx.ComputeHash()
-        return tx, nil
+    tx.TxHash = tx.ComputeHash() // Canonical hash only
+    return tx, nil
 }
 
-// ---------------- Hash & Signature ----------------
-func (tx *Transaction) ComputeHash() string {
-        data, _ := cbor.Marshal(struct {
-                From      string  `cbor:"from"`
-                To        string  `cbor:"to"`
-                AmountEXP float64 `cbor:"amount_explo"`
-                AmountIM  float64 `cbor:"amount_imani"`
-                Fee       float64 `cbor:"fee"`
-                Timestamp int64   `cbor:"timestamp"`
-                Nonce     int64   `cbor:"nonce"`
-                IsReward  bool    `cbor:"is_reward"`
-        }{
-                From:      tx.From,
-                To:        tx.To,
-                AmountEXP: tx.AmountEXP,
-                AmountIM:  tx.AmountIM,
-                Fee:       tx.Fee,
-                Timestamp: tx.Timestamp,
-                Nonce:     tx.Nonce,
-                IsReward:  tx.IsReward,
-        })
-        return Sha3Hex(data)
-}
-
-// HashForSignature returns deterministic bytes for Ed25519 signing
-func (tx *Transaction) HashForSignature() []byte {
-        return []byte(fmt.Sprintf("%s|%s|%f|%f|%f|%d|%d", tx.From, tx.To, tx.AmountEXP, tx.AmountIM, tx.Fee, tx.Timestamp, tx.Nonce))
-}
 
 // ---------------- Mining Reward ----------------
 func NewMiningReward(minerAddr string, rewardEXP, rewardIM float64, nonce int64) (*Transaction, error) {

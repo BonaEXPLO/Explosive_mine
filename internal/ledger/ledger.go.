@@ -4,7 +4,6 @@ package ledger
 import (
 	"bytes"
 	"errors"
-        "strings"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -475,7 +474,6 @@ func incU64(txn *badger.Txn, key string, delta uint64) error {
     return writeU64(txn, key, cur+delta)
 }
 
-// RebuildMetaValuesFromBlocks recalculates circulating supply, miners count and holders count
 func (l *Ledger) RebuildMetaValuesFromBlocks() error {
     return l.DB().Update(func(txn *badger.Txn) error {
         var circulating uint64
@@ -493,7 +491,7 @@ func (l *Ledger) RebuildMetaValuesFromBlocks() error {
 
             // Only consider block entries
             if strings.HasPrefix(key, "block:") {
-                var blk Block // ✅ not ledger.Block
+                var blk Block.
                 val, _ := item.ValueCopy(nil)
                 if err := cbor.Unmarshal(val, &blk); err != nil {
                     continue
