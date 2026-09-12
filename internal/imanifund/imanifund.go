@@ -1,195 +1,194 @@
-// internal/imanifund/imanifund.go
-// IMANI FUND — The Sacred Heart of EXPLOSIVE
-//
-// IMANI is NOT an economic token.
-// IMANI is the spiritual fingerprint — proof of consciousness, presence, and soul alignment.
-// It is non-transferable, non-speculative, and will never be listed on any exchange.
-//
-// Its sole purpose: to grant access to the sacred redistribution of the IMANI Fund.
-// EXPLO remains the only economic, transferable token in the ecosystem.
-//
-// This module is fully persistent, crash-resilient, and runs automatically.
-// All donations, soul gifts, and LUMEN records survive node restarts.
-
 package imanifund
 
 import (
 	"errors"
+	"fmt"
 	"log"
-	"os"
-	"path/filepath"
-	"sync"
-	"time"
 
-	"github.com/fxamacker/cbor/v2"
 	"explosive/internal/guardian"
 )
 
 const (
-	// Persistent state file — the sacred ledger of the IMANI Fund
-	stateFile = "data/imanifund/sacred_state.cbor"
+	// Eligibility bounds (UX layer only — never consensus critical)
+	MinLumenEligible = 15.0
+	MaxLumenAllowed  = 50.0
 
-	// Base threshold: minimum EXPLO required to trigger a sacred blessing
-	baseThreshold = 1000.0
-	// Maximum threshold cap — ensures frequent redistribution at global scale
-	maxThreshold = 10000.0
+	// Fixed sacred reward per redistribution round (EXPLO — human readable)
+	RewardPerMiner = 1.0
 )
 
-// SacredState represents the persistent, on-disk state of the IMANI Fund
-type SacredState struct {
-	Donpool      float64            `cbor:"donpool_exp"`         // Total EXPLO donated to the sacred fund
-	SoulGifts    map[string]float64 `cbor:"soul_gifts"`          // Total EXPLO received by each soul via blessings
-	SoulLumen    map[string]float64 `cbor:"soul_lumen"`          // Latest recorded LUMEN value per miner
-	LastBlessing int64              `cbor:"last_blessing_unix"`  // Unix timestamp of the last redistribution
+//
+// ─────────────────────────────────────────────────────────────
+// LedgerAdapter Interface
+// ─────────────────────────────────────────────────────────────
+//
+// IMPORTANT PRINCIPLE:
+// This interface speaks ONLY in EXPLO (float64).
+// It is UX-level communication.
+// The Ledger implementation is responsible for converting
+// EXPLO → Pastabo internally for consensus safety.
+//
+
+type LedgerAdapter interface {
+	AddTransaction(tx TransactionLite) error
+
+	// All values below are expressed in EXPLO (human readable layer)
+	GetIMANIPool() float64
+	DeductIMANIPool(amount float64) error
+
+	GetEligibleMinersRange(minLumen, maxLumen float64) []string
+	GetTotalReceivedFromIMANI(minerID string) float64
 }
 
-// Callback injected by ledger at startup to credit EXPLO to a miner
-var CreditSoul func(minerID string, amount float64) error
+//
+// ─────────────────────────────────────────────────────────────
+// TransactionLite — UX-Level Transaction
+// ─────────────────────────────────────────────────────────────
+//
+// Amount is expressed in EXPLO (float64).
+// Conversion to Pastabo happens inside the Ledger.
+//
 
-var (
-	mu    sync.Mutex
-	state *SacredState
-)
-
-// Init must be called once at node startup.
-// Loads the sacred state from disk (or initializes it) and starts the automatic distributor.
-func Init(creditFunc func(string, float64) error) error {
-	CreditSoul = creditFunc
-
-	// Ensure persistence directory exists
-	if err := os.MkdirAll(filepath.Dir(stateFile), 0755); err != nil {
-		return err
-	}
-
-	state = &SacredState{
-		SoulGifts:    make(map[string]float64),
-		SoulLumen:    make(map[string]float64),
-	}
-
-	// Load existing sacred state if present
-	if data, err := os.ReadFile(stateFile); err == nil {
-		if err := cbor.Unmarshal(data, state); err != nil {
-			return errors.New("corrupted sacred IMANI state file")
-		}
-		log.Printf("Sacred IMANI Fund loaded — %.3f EXPLO awaiting blessing", state.Donpool)
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-
-	// Start the eternal heartbeat of redistribution
-	go sacredDistributor()
-	return nil
+type TransactionLite struct {
+	Type    string
+	From    string
+	To      string
+	Amount  float64 // EXPLO (human layer)
+	Message string
 }
 
-// persist writes the current sacred state to disk (idempotent, atomic-safe)
-func persist() {
-	data, _ := cbor.Marshal(state)
-	_ = os.WriteFile(stateFile, data, 0644)
-}
+//
+// ─────────────────────────────────────────────────────────────
+// AddDonation
+// ─────────────────────────────────────────────────────────────
+// Adds EXPLO donation into IMANI pool (UX layer).
+//
 
-// AddDonation — Compatible avec ton mine.go actuel
-func AddDonation(minerID string, amount float64) error {
-	return AddToSacredFund(minerID, amount)
-}
-
-// RegisterLumen — Compatible avec ton mine.go actuel
-func RegisterLumen(minerID string, lumen float64) {
-	RegisterSoulLumen(minerID, lumen)
-}
-
-// AddToSacredFund records a voluntary donation or transaction fee into the sacred pool.
-// Only EXPLO is accepted — IMANI remains immaterial.
-func AddToSacredFund(minerID string, amount float64) error {
+func AddDonation(minerID string, amount float64, db LedgerAdapter) error {
 	if amount <= 0 {
-		return errors.New("invalid offering amount")
+		return errors.New("invalid donation amount")
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	tx := TransactionLite{
+		Type:    "IMANI_DONATION",
+		From:    minerID,
+		To:      "IMANI_POOL",
+		Amount:  amount, // EXPLO
+		Message: fmt.Sprintf("IMANI donation by %s", shortID(minerID)),
+	}
 
-	state.Donpool += amount
-	persist()
+	if err := db.AddTransaction(tx); err != nil {
+		return fmt.Errorf("IMANI donation failed: %w", err)
+	}
 
-	log.Printf("Sacred offering: %.4f EXPLO from %s → IMANI Fund = %.4f EXPLO",
-		amount, minerID[:12], state.Donpool)
+	log.Printf("⛑️ IMANI FUND +%.6f EXPLO from %s", amount, shortID(minerID))
 	return nil
 }
 
-// RegisterSoulLumen records the current LUMEN value of a miner.
-// Used to determine eligibility for sacred blessings (LUMEN ≥ 15).
-func RegisterSoulLumen(minerID string, lumen float64) {
-	mu.Lock()
-	defer mu.Unlock()
-	state.SoulLumen[minerID] = lumen
-	persist()
+//
+// ─────────────────────────────────────────────────────────────
+// RegisterLumen
+// ─────────────────────────────────────────────────────────────
+// Stores LUMEN value (UX symbolic layer only).
+//
+
+func RegisterLumen(minerID string, lumen float64, db LedgerAdapter) error {
+	if lumen < 0 {
+		return errors.New("invalid lumen value")
+	}
+
+	tx := TransactionLite{
+		Type:    "LUMEN_REGISTER",
+		From:    minerID,
+		To:      minerID,
+		Amount:  0,
+		Message: fmt.Sprintf("LUMEN update %.2f", lumen),
+	}
+
+	if err := db.AddTransaction(tx); err != nil {
+		return fmt.Errorf("LUMEN register failed: %w", err)
+	}
+
+	return nil
 }
 
-// GetSoulGift returns the total EXPLO a soul has received from past blessings.
-func GetSoulGift(minerID string) float64 {
-	mu.Lock()
-	defer mu.Unlock()
-	return state.SoulGifts[minerID]
+//
+// ─────────────────────────────────────────────────────────────
+// DistributeRewards
+// ─────────────────────────────────────────────────────────────
+//
+// Sacred redistribution logic (UX layer).
+// All arithmetic is in EXPLO (float64).
+// Ledger enforces real supply & Pastabo safety.
+//
+
+func DistributeRewards(db LedgerAdapter) error {
+	donpool := db.GetIMANIPool() // EXPLO
+
+	if donpool < RewardPerMiner {
+		return nil
+	}
+
+	miners := db.GetEligibleMinersRange(MinLumenEligible, MaxLumenAllowed)
+	count := len(miners)
+	if count == 0 {
+		return nil
+	}
+
+	required := float64(count) * RewardPerMiner
+	if donpool < required {
+		return nil
+	}
+
+	for _, minerID := range miners {
+		tx := TransactionLite{
+			Type:    "IMANI_REWARD",
+			From:    "IMANI_POOL",
+			To:      minerID,
+			Amount:  RewardPerMiner, // EXPLO
+			Message: "IMANI blessing",
+		}
+
+		if err := db.AddTransaction(tx); err != nil {
+			log.Printf("⚠️ IMANI reward failed for %s: %v", shortID(minerID), err)
+			continue
+		}
+
+		msg := guardian.EncourageMessageEphemeral([]string{
+			"blessing", "gratitude", "unity", "light", "sacred",
+		})
+
+		log.Printf("✨ IMANI → %s +1 EXPLO | %s", shortID(minerID), msg)
+	}
+
+	// Deduct in EXPLO (ledger converts internally)
+	if err := db.DeductIMANIPool(required); err != nil {
+		log.Printf("⚠️ Failed to deduct IMANI pool: %v", err)
+	}
+
+	return nil
 }
 
-// sacredDistributor runs forever, checking every 10 minutes for a blessing opportunity.
-func sacredDistributor() {
-	for {
-		time.Sleep(10 * time.Minute)
-		blessThePure()
-	}
+//
+// ─────────────────────────────────────────────────────────────
+// GetSoulGift
+// ─────────────────────────────────────────────────────────────
+// Returns total EXPLO received via IMANI blessings.
+//
+
+func GetSoulGift(minerID string, db LedgerAdapter) float64 {
+	return db.GetTotalReceivedFromIMANI(minerID)
 }
 
-// blessThePure performs the sacred redistribution when conditions are met.
-// Dynamic threshold ensures fairness as the network grows.
-func blessThePure() {
-	mu.Lock()
-	defer mu.Unlock()
+//
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+//
 
-	// Dynamic sacred threshold based on network size
-	minerCount := len(state.SoulLumen)
-	threshold := baseThreshold
-	if minerCount > 1000 {
-		threshold = baseThreshold + float64(minerCount-1000)*0.5
-		if threshold > maxThreshold {
-			threshold = maxThreshold
-		}
+func shortID(id string) string {
+	if len(id) <= 12 {
+		return id
 	}
-
-	if state.Donpool < threshold || CreditSoul == nil {
-		return
-	}
-
-	// Identify pure souls (LUMEN ≥ 15)
-	var pureSouls []string
-	for id, lumen := range state.SoulLumen {
-		if lumen >= 15.0 {
-			pureSouls = append(pureSouls, id)
-		}
-	}
-
-	if len(pureSouls) == 0 {
-		return
-	}
-
-	gift := state.Donpool / float64(len(pureSouls))
-
-	for _, soul := range pureSouls {
-		state.SoulGifts[soul] += gift
-		if err := CreditSoul(soul, gift); err != nil {
-			log.Printf("Failed to credit soul %s: %v", soul[:12], err)
-		} else {
-			msg := guardian.EncourageMessageEphemeral([]string{
-				"blessing", "gratitude", "unity", "light", "sacred",
-			})
-			log.Printf("IMANI BLESSING → %s receives %.5f EXPLO | LUMEN=%.2f | %s",
-				soul[:12], gift, state.SoulLumen[soul], msg)
-		}
-	}
-
-	log.Printf("SACRED REDEMPTION — %.3f EXPLO shared among %d pure souls", state.Donpool, len(pureSouls))
-
-	// Reset the sacred pool
-	state.Donpool = 0
-	state.LastBlessing = time.Now().Unix()
-	persist()
+	return id[:12]
 }

@@ -1,34 +1,39 @@
-// internal/ledger/ledger.go
 package ledger
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
         "strings"
 	"fmt"
+	"log"
+	"math"
+	"encoding/hex"
 	"path/filepath"
 	"sync"
 	"time"
-        "encoding/binary"
 
 	"github.com/dgraph-io/badger/v4"
+        "explosive/internal/address"
+        "explosive/internal/compressor"
 	"github.com/fxamacker/cbor/v2"
 )
 
 // ---------------- Constants ----------------
 
-// MaxSupplyEXPLO defines the maximum amount of EXPLO tokens that can ever exist.
 const (
-    PastaboPerEXPLO    uint64 = 1_000_000_000 // 1 EXPLO = 1 milliard pastabo
-    MaxEXPLOSupply     uint64 = 50_000_000    // Cap max en EXPLO (pour UX et checks)
-    MaxPastaboSupply   uint64 = MaxEXPLOSupply * PastaboPerEXPLO // Cap max en pastabo
+	PastaboPerEXPLO uint64 = 1_000_000_000
+	MaxEXPLOSupply  uint64 = 50_000_000
+	MaxPastaboSupply       = MaxEXPLOSupply * PastaboPerEXPLO
 )
-// Exported key prefixes for block, transaction, account, and metadata storage.
+
 var (
-	PrefixBlock     = []byte("blk:")                  // blk:<8byte-height> -> compressed CBOR block bytes
-	PrefixTx        = []byte("tx:")                   // tx:<txhash> -> transaction CBOR bytes
-	PrefixAccount   = []byte("acct:")                 // acct:<address> -> account CBOR bytes
-	PrefixMeta      = []byte("meta:")                 // meta:<key> -> metadata
+	PrefixBlock   = []byte("blk:")
+	PrefixTx      = []byte("tx:")
+	PrefixAccount = []byte("acct:")
+	PrefixMiner   = []byte("miner:")
+	PrefixMeta    = []byte("meta:")
+
 	MetaTotalIssued = append(PrefixMeta, []byte("total_issued")...)
 	MetaChainTip    = append(PrefixMeta, []byte("chain_tip")...)
 )
@@ -36,95 +41,87 @@ var (
 // ---------------- Ledger Struct ----------------
 
 type Ledger struct {
-    // --- Storage ---
-    db        *badger.DB
-    dbPath    string        // chemin du dossier ledger
+	db     *badger.DB
+	dbPath string
 
-    // --- Async write pipeline ---
-    asyncCh   chan kvPair   // channel for async batch writes
-    stopAsync chan struct{} // signal to stop async writer
+	asyncCh   chan kvPair
+	stopAsync chan struct{}
 
-    // --- Encoding / pools ---
-    cborPool  sync.Pool     // CBOR buffer pool for reuse
+	cborPool sync.Pool
 
-    // --- Scalability / pruning ---
-    pruningMu        sync.Mutex
-    lastPrunedHeight uint64
+	pruningMu        sync.Mutex
+	lastPrunedHeight uint64
 }
 
-// kvPair represents a key/value pair for async batch writes.
 type kvPair struct {
-    key []byte
-    val []byte
+	key []byte
+	val []byte
 }
 
 // ---------------- OpenLedger ----------------
 
-// OpenLedger opens (or creates) a BadgerDB instance at the specified path
-// and returns a Ledger instance with asynchronous write support and CBOR pooling.
-// It also ensures the genesis block is initialized deterministically.
 func OpenLedger(path string) (*Ledger, error) {
-    // Configure BadgerDB options for high throughput
-    opts := badger.DefaultOptions(path)
-    opts.SyncWrites = false  // disable fsync for faster writes
-    opts.Logger = nil        // disable default logging
+	opts := badger.DefaultOptions(path)
+	opts.SyncWrites = false
+	opts.Logger = nil
 
-    // Open (or create) the database
-    db, err := badger.Open(opts)
-    if err != nil {
-        return nil, fmt.Errorf("failed to open ledger DB: %w", err)
-    }
+	db, err := badger.Open(opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open ledger DB: %w", err)
+	}
 
-    // Initialize Ledger struct with async channel and CBOR buffer pool
-    l := &Ledger{
-    db:        db,
-    asyncCh:   make(chan kvPair, 100_000),
-    stopAsync: make(chan struct{}),
-    cborPool: sync.Pool{
-        New: func() interface{} { return new(bytes.Buffer) },
-    },
-    dbPath: path,
+	l := &Ledger{
+		db:       db,
+		dbPath:   path,
+		asyncCh:  make(chan kvPair, 100_000),
+		stopAsync: make(chan struct{}),
+		cborPool: sync.Pool{
+			New: func() interface{} { return new(bytes.Buffer) },
+		},
+		lastPrunedHeight: 0,
+	}
 
-    // pruning init
-    lastPrunedHeight: 0,
+	go l.asyncWriter()
+
+	if err := InitLedger(l); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	return l, nil
 }
 
-    // Start asynchronous batch writer in a separate goroutine
-    go l.asyncWriter()
-
-    // ----------------- INIT GENESIS BLOCK -----------------
-    // Ensure the genesis block exists and is valid; create if absent
-    err = InitLedger(l)
-    if err != nil {
-        _ = db.Close() // cleanup on failure
-        return nil, fmt.Errorf("ledger initialization failed: %v", err)
-    }
-
-    return l, nil
-}
-
-func InitLedger(db *Ledger) error {
-    if db == nil || db.db == nil {
+func InitLedger(l *Ledger) error {
+    if l == nil || l.db == nil {
         return fmt.Errorf("ledger not initialized")
     }
 
-    block0, err := db.GetBlockByHeight(0)
+    // Try to fetch existing Genesis
+    block0, err := l.GetBlockByHeight(0)
     if err == nil && block0 != nil {
-        if err := VerifyGenesis(db); err != nil {
-            return fmt.Errorf("ledger corruption detected: %v", err)
+        if err := VerifyGenesis(l); err != nil {
+            return err
         }
         fmt.Println("✅ Genesis block already exists and verified.")
+        fmt.Printf("⚠️  %d EXPLO are permanently locked and cannot be spent.\n", GenesisEXPLO)
         return nil
     }
 
-    _, err = CreateGenesisBlock(db)
+    // Genesis does not exist — create it
+    block0, err = CreateGenesisBlock(l)
     if err != nil {
-        return fmt.Errorf("failed to create genesis block: %v", err)
+        return fmt.Errorf("failed to create genesis: %w", err)
     }
+
+    // Double-check block 0 is now readable
+    blockCheck, err := l.GetBlockByHeight(0)
+    if err != nil || blockCheck == nil {
+        return fmt.Errorf("genesis block created but cannot be read: %w", err)
+    }
+
     return nil
 }
 
-// Close safely closes the ledger, flushing any pending async writes.
 func (l *Ledger) Close() error {
 	if l == nil || l.db == nil {
 		return nil
@@ -133,60 +130,39 @@ func (l *Ledger) Close() error {
 	return l.db.Close()
 }
 
-// ---------------- Async Batch Writer ----------------
+// ---------------- Async Writer ----------------
 
-// asyncWriter runs in a goroutine to batch writes asynchronously for high TPS.
+// asyncWriter listens on asyncCh and flushes writes to the DB
 func (l *Ledger) asyncWriter() {
-	ticker := time.NewTicker(2 * time.Millisecond) // frequent flush for low latency
-	defer ticker.Stop()
-
-	batch := l.db.NewWriteBatch()
-	defer batch.Cancel()
-	count := 0
-
 	for {
 		select {
 		case kv := <-l.asyncCh:
-			_ = batch.Set(kv.key, kv.val)
-			count++
-			if count >= 2000 { // flush small batches frequently
-				_ = batch.Flush()
-				batch = l.db.NewWriteBatch()
-				count = 0
-			}
-		case <-ticker.C:
-			if count > 0 {
-				_ = batch.Flush()
-				batch = l.db.NewWriteBatch()
-				count = 0
-			}
+			_ = l.db.Update(func(txn *badger.Txn) error {
+				return txn.Set(kv.key, kv.val)
+			})
 		case <-l.stopAsync:
-			if count > 0 {
-				_ = batch.Flush()
-			}
 			return
 		}
 	}
 }
 
-// AsyncPut enqueues a key/value pair for async write. Falls back to sync write if channel is full.
+// AsyncPut is a fire-and-forget write using asyncCh
 func (l *Ledger) AsyncPut(key, val []byte) {
 	if l == nil || l.db == nil {
 		return
 	}
+
 	select {
 	case l.asyncCh <- kvPair{key, val}:
 	default:
-		// fallback synchronous write
 		_ = l.db.Update(func(txn *badger.Txn) error {
 			return txn.Set(key, val)
 		})
 	}
 }
 
-// ---------------- Generic KV Helpers ----------------
+// ---------------- Generic KV ----------------
 
-// PutBytes writes raw bytes to the DB synchronously.
 func (l *Ledger) PutBytes(key, value []byte) error {
 	if l == nil || l.db == nil {
 		return errors.New("ledger not initialized")
@@ -196,7 +172,6 @@ func (l *Ledger) PutBytes(key, value []byte) error {
 	})
 }
 
-// GetBytes reads raw bytes from the DB.
 func (l *Ledger) GetBytes(key []byte) ([]byte, error) {
 	if l == nil || l.db == nil {
 		return nil, errors.New("ledger not initialized")
@@ -207,42 +182,41 @@ func (l *Ledger) GetBytes(key []byte) ([]byte, error) {
 		if err != nil {
 			return err
 		}
-		v, err := item.ValueCopy(nil)
-		if err != nil {
-			return err
-		}
-		out = v
-		return nil
+		out, err = item.ValueCopy(nil)
+		return err
 	})
 	return out, err
 }
 
-// DeleteBytes removes a key from the ledger database.
-// Safe for concurrent use and returns an error if the DB isn't initialized.
 func (l *Ledger) DeleteBytes(key []byte) error {
-    if l == nil || l.db == nil {
-        return fmt.Errorf("ledger not initialized")
-    }
-
-    return l.db.Update(func(txn *badger.Txn) error {
-        err := txn.Delete(key)
-        if err == badger.ErrKeyNotFound {
-            return nil // Not fatal — key simply didn't exist
-        }
-        return err
-    })
-}
-
-// PutObject marshals an object to CBOR and stores it in the DB.
-func (l *Ledger) PutObject(key []byte, v interface{}) error {
-	data, err := cbor.Marshal(v)
-	if err != nil {
-		return err
+	if l == nil || l.db == nil {
+		return errors.New("ledger not initialized")
 	}
-	return l.PutBytes(key, data)
+	return l.db.Update(func(txn *badger.Txn) error {
+		err := txn.Delete(key)
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		return err
+	})
 }
 
-// GetObject retrieves and unmarshals a CBOR object from the DB.
+// ---------------- CBOR ----------------
+
+func (l *Ledger) PutObject(key []byte, v interface{}) error {
+	if l == nil || l.db == nil {
+		return errors.New("ledger not initialized")
+	}
+	buf := l.cborPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer l.cborPool.Put(buf)
+
+	if err := cbor.NewEncoder(buf).Encode(v); err != nil {
+		return fmt.Errorf("CBOR marshal failed: %w", err)
+	}
+	return l.PutBytes(key, buf.Bytes())
+}
+
 func (l *Ledger) GetObject(key []byte, out interface{}) error {
 	data, err := l.GetBytes(key)
 	if err != nil {
@@ -251,111 +225,121 @@ func (l *Ledger) GetObject(key []byte, out interface{}) error {
 	return cbor.Unmarshal(data, out)
 }
 
-// ---------------- Metadata Helpers ----------------
+// ---------------- Async KV ----------------
 
-// GetChainTipHeight returns the latest block height stored.
-func (l *Ledger) GetChainTipHeight() (uint64, error) {
-	data, err := l.GetBytes(MetaChainTip)
-	if err != nil {
-		if err == badger.ErrKeyNotFound {
-			return 0, nil
-		}
-		return 0, err
+// PutBytesAsync writes a KV pair asynchronously to the ledger
+func (l *Ledger) PutBytesAsync(key, value []byte) error {
+	if l == nil || l.db == nil {
+		return errors.New("ledger not initialized")
 	}
-	if len(data) != 8 {
-		return 0, fmt.Errorf("invalid chain tip meta")
+
+	select {
+	case l.asyncCh <- kvPair{key: key, val: value}:
+		return nil
+	default:
+		// Channel full → fallback to synchronous write
+		return l.PutBytes(key, value)
 	}
-	return binary.BigEndian.Uint64(data), nil
 }
 
+// PutObjectAsync serializes a value with CBOR and stores it asynchronously
+func (l *Ledger) PutObjectAsync(key []byte, v interface{}) error {
+	buf := l.cborPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer l.cborPool.Put(buf)
 
-// ---------------- Time Helper ----------------
+	if err := cbor.NewEncoder(buf).Encode(v); err != nil {
+		return fmt.Errorf("CBOR marshal failed: %w", err)
+	}
 
-// NowMillis returns the current Unix time in milliseconds.
-func NowMillis() int64 {
-	return time.Now().UnixMilli()
+	return l.PutBytesAsync(key, buf.Bytes())
 }
 
-// ---------------- Utility ----------------
+// PutBytesAsyncWait writes asynchronously but waits for confirmation
+func (l *Ledger) PutBytesAsyncWait(key, value []byte) error {
+	done := make(chan error, 1)
+	if l == nil || l.db == nil {
+		return errors.New("ledger not initialized")
+	}
 
-// DBPathUnderHome returns a clean, absolute path for the DB.
-func DBPathUnderHome(dir string) string {
-	return filepath.Clean(dir)
+	go func() {
+		err := l.PutBytes(key, value)
+		done <- err
+	}()
+
+	return <-done
 }
 
-// ApplyTransaction applies a transaction to the ledger.
-// Placeholder: adapt selon ta logique réelle (mise à jour comptes, soldes, etc.)
-func (l *Ledger) ApplyTransaction(tx *Transaction) error {
-    // TODO: Implement actual transaction application logic
-    // For now, just log and return nil
-    fmt.Printf("Applying transaction %v\n", tx)
-    return nil
+// PutObjectAsyncWait serializes CBOR, writes async, and waits confirmation
+func (l *Ledger) PutObjectAsyncWait(key []byte, v interface{}) error {
+	buf := l.cborPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer l.cborPool.Put(buf)
+
+	if err := cbor.NewEncoder(buf).Encode(v); err != nil {
+		return fmt.Errorf("CBOR marshal failed: %w", err)
+	}
+
+	return l.PutBytesAsyncWait(key, buf.Bytes())
 }
 
-// ListAllMiners returns all miners currently stored in the ledger.
+// ---------------- Helpers ----------------
+
+func NowMillis() int64 { return time.Now().UnixMilli() }
+
+func DBPathUnderHome(dir string) string { return filepath.Clean(dir) }
+
+
+// ---------------- Miner & Meta ----------------
+
+// ListAllMiners returns all miners efficiently for large-scale ledgers
 func (l *Ledger) ListAllMiners() ([]Miner, error) {
     if l == nil || l.db == nil {
-        return nil, fmt.Errorf("ledger not initialized")
+        return nil, errors.New("ledger not initialized")
     }
 
-    miners := []Miner{}
-    prefix := []byte("miner:") // Tous les mineurs sont stockés avec cette clé
+    var miners []Miner
+    prefix := []byte(PrefixMiner)
 
     err := l.db.View(func(txn *badger.Txn) error {
-        it := txn.NewIterator(badger.DefaultIteratorOptions)
+        opts := badger.DefaultIteratorOptions
+        opts.PrefetchValues = true
+        opts.Prefix = prefix
+        it := txn.NewIterator(opts)
         defer it.Close()
 
-        for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+        for it.Rewind(); it.Valid(); it.Next() {
             item := it.Item()
-
             val, err := item.ValueCopy(nil)
             if err != nil {
-                return err
+                return fmt.Errorf("failed to read miner value: %w", err)
             }
-
             var m Miner
             if err := cbor.Unmarshal(val, &m); err != nil {
-                return err
+                return fmt.Errorf("failed to decode miner: %w", err)
             }
-
             miners = append(miners, m)
         }
-
         return nil
     })
-
-    if err != nil {
-        return nil, err
-    }
-
-    return miners, nil
+    return miners, err
 }
 
-// MarkRegistrationAttempt stores the timestamp (ms) of the last registration attempt for a miner
 func (l *Ledger) MarkRegistrationAttempt(minerID string) error {
-    key := []byte("reg_attempt:" + minerID)
-    ts := NowMillis()
-    return l.PutObject(key, ts)
+    return l.PutObjectAsync([]byte("reg_attempt:"+minerID), NowMillis())
 }
 
-// HasRecentRegAttempt checks if the last registration attempt was within windowMs milliseconds
 func (l *Ledger) HasRecentRegAttempt(minerID string, windowMs int64) bool {
-    key := []byte("reg_attempt:" + minerID)
     var ts int64
-    if err := l.GetObject(key, &ts); err != nil {
-        return false // no record => no recent attempt
+    if err := l.GetObject([]byte("reg_attempt:"+minerID), &ts); err != nil {
+        return false
     }
     return NowMillis()-ts < windowMs
 }
 
-// HasMinerOnChain checks if the miner is already registered on-chain
-// This is a placeholder; adapt selon ton état de ledger ou bucket miners_confirmed
-// HasMinerOnChain checks if the miner is already registered on-chain
 func (l *Ledger) HasMinerOnChain(minerID string) (bool, error) {
-    key := []byte("onchain_miner:" + minerID)
     var flag bool
-
-    err := l.GetObject(key, &flag)
+    err := l.GetObject([]byte("onchain_miner:"+minerID), &flag)
     if err != nil {
         if errors.Is(err, badger.ErrKeyNotFound) {
             return false, nil
@@ -364,164 +348,349 @@ func (l *Ledger) HasMinerOnChain(minerID string) (bool, error) {
     }
     return flag, nil
 }
-// SetMinerOnChain marks a miner as registered on-chain (à utiliser après réception du Tx signé)
+
 func (l *Ledger) SetMinerOnChain(minerID string) error {
-    key := []byte("onchain_miner:" + minerID)
-    return l.PutObject(key, true)
+    return l.PutObjectAsync([]byte("onchain_miner:"+minerID), true)
 }
 
-func projectTotalSupply(l *Ledger, newRewardPastabo uint64) (uint64, error) {
 
-    currentPastabo, err := l.GetTotalIssued()
+// ---------------- Supply ----------------
+
+func projectTotalSupply(l *Ledger, reward uint64) (uint64, error) {
+    current, err := l.GetTotalIssued()
     if err != nil {
         return 0, err
     }
-
-    projected := currentPastabo + newRewardPastabo
-
-    if projected > MaxPastaboSupply {
-        return 0, errors.New("mining would exceed maximum EXPLO supply cap")
+    if reward > MaxPastaboSupply-current {
+        return 0, errors.New("supply cap exceeded")
     }
-
-    return projected, nil
-}
-
-func (l *Ledger) GetTotalIssuedEXPLO() (float64, error) {
-    pastabo, err := l.GetTotalIssued()
-    if err != nil {
-        return 0, err
-    }
-    return float64(pastabo) / float64(PastaboPerEXPLO), nil
-}
-
-func (l *Ledger) GetGlobalBalances() (map[string]interface{}, error) {
-    if l == nil {
-        return nil, fmt.Errorf("ledger not initialized")
-    }
-
-    // Total EXPLO issued (stored in pastabo on-chain)
-    totalPastabo, err := l.GetTotalIssued()
-    if err != nil {
-        return nil, err
-    }
-
-    // Total IMANI
-    var totalIMANI float64
-    _ = l.GetObject([]byte("total_imani"), &totalIMANI)
-
-    // Total LUMEN index
-    var totalLUMEN float64
-    _ = l.GetObject([]byte("total_lumen"), &totalLUMEN)
-
-    // Human + consensus views
-    data := map[string]interface{}{
-        "total_pastabo_issued": totalPastabo,
-        "total_explo_issued":   float64(totalPastabo) / float64(PastaboPerEXPLO),
-        "total_imani_issued":   totalIMANI,
-        "total_lumen_index":    totalLUMEN,
-    }
-
-    return data, nil
+    return current + reward, nil
 }
 
 func (l *Ledger) GetTotalIssued() (uint64, error) {
     data, err := l.GetBytes(MetaTotalIssued)
-    if err != nil {
-        return 0, err
-    }
-    if len(data) != 8 {
-        return 0, fmt.Errorf("invalid MetaTotalIssued data")
-    }
-    return binary.BigEndian.Uint64(data), nil
-}
-
-func readU64(txn *badger.Txn, key string) (uint64, error) {
-    item, err := txn.Get([]byte(key))
     if err != nil {
         if err == badger.ErrKeyNotFound {
             return 0, nil
         }
         return 0, err
     }
-    val, err := item.ValueCopy(nil)
+    if len(data) != 8 {
+        return 0, fmt.Errorf("invalid MetaTotalIssued")
+    }
+    return binary.BigEndian.Uint64(data), nil
+}
+
+func (l *Ledger) GetTotalIssuedEXPLO() (float64, error) {
+    total, err := l.GetTotalIssued()
     if err != nil {
         return 0, err
     }
-    if len(val) != 8 {
-        return 0, fmt.Errorf("invalid u64 length for key %s", key)
-    }
+    return float64(total) / float64(PastaboPerEXPLO), nil
+}
 
-    var v uint64
-    for _, b := range val {
-        v = (v << 8) | uint64(b)
+func (l *Ledger) GetChainTipHeight() (uint64, error) {
+    data, err := l.GetBytes(MetaChainTip)
+    if err != nil {
+        if err == badger.ErrKeyNotFound {
+            return 0, nil
+        }
+        return 0, err
     }
-    return v, nil
+    if len(data) != 8 {
+        return 0, fmt.Errorf("invalid chain tip meta")
+    }
+    return binary.BigEndian.Uint64(data), nil
+}
+
+// RebuildMetaValuesFromBlocks performs a full and strict reconstruction
+// of critical ledger metadata by scanning the entire blockchain from genesis.
+//
+// PRODUCTION MODE:
+// - Full scan only (no resume mode)
+// - Strict height continuity validation
+// - Strict PrevHash validation
+// - Strict block hash recomputation
+// - Strict decompression validation
+// - Supply overflow protection
+// - Supply cap enforcement
+// - Atomic metadata commit
+//
+// This function is safety-critical and intended for:
+// - Genesis bootstrap
+// - Corruption recovery
+// - Explicit admin rebuild
+func (l *Ledger) RebuildMetaValuesFromBlocks(progressInterval uint64) error {
+	start := time.Now()
+	log.Println("[META-REBUILD] Starting FULL blockchain scan")
+
+	if l == nil || l.db == nil {
+		return errors.New("ledger not initialized")
+	}
+
+	var (
+		circulatingPastabo uint64
+		expectedHeight     uint64
+		lastHash           string
+		maxHeight          uint64
+		blockCount         uint64
+	)
+
+	seenMiners := make(map[string]struct{})
+
+	// minerBalances accumulates EXPLO and IMANI per miner during the scan.
+	// This allows atomic reconstruction of all balances in the second pass.
+	type minerBalance struct {
+		EXPLO              uint64
+		IMANI              uint64
+		TotalIMANIReceived uint64
+	}
+	minerBalances := make(map[string]*minerBalance)
+
+	// ------------------ First pass: scan all blocks ------------------
+	err := l.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = PrefixBlock
+		opts.PrefetchValues = true
+
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.ValidForPrefix(PrefixBlock); it.Next() {
+			item := it.Item()
+			key := item.Key()
+
+			height, err := extractHeightFromBlockKey(key)
+			if err != nil {
+				return fmt.Errorf("invalid block key %s: %w", string(key), err)
+			}
+
+			// Strict height continuity.
+			if height != expectedHeight {
+				return fmt.Errorf("height discontinuity: expected %d, found %d", expectedHeight, height)
+			}
+
+			val, err := item.ValueCopy(nil)
+			if err != nil {
+				return fmt.Errorf("failed to read block #%d: %w", height, err)
+			}
+
+			// Strict decompression.
+			data, err := compressor.DecompressZSTD(val)
+			if err != nil {
+				return fmt.Errorf("ZSTD decompression failed at block #%d: %w", height, err)
+			}
+
+			var blk Block
+			if err := cbor.Unmarshal(data, &blk); err != nil {
+				return fmt.Errorf("CBOR decode failed at block #%d: %w", height, err)
+			}
+
+			// Validate height consistency.
+			if blk.Header.Height != height {
+				return fmt.Errorf("block height mismatch: key=%d header=%d", height, blk.Header.Height)
+			}
+
+			// Validate PrevHash chain.
+			if height == 0 {
+				lastHash = blk.BlockHash
+			} else {
+				if blk.Header.PrevHash != lastHash {
+					return fmt.Errorf("PrevHash mismatch at block #%d", height)
+				}
+				lastHash = blk.BlockHash
+			}
+
+			// Recompute block hash.
+			if blk.ComputeFinalHash() != blk.BlockHash {
+				return fmt.Errorf("block hash mismatch at block #%d", height)
+			}
+
+			// Accumulate EXPLO supply and reconstruct IMANI balances.
+			for _, tx := range blk.Transactions {
+				if !tx.IsReward {
+					continue
+				}
+
+				// FIX: use AmountPastabo (uint64) directly instead of
+				// converting from AmountEXP (float64) to avoid precision drift
+				// over millions of blocks.
+				if tx.AmountPastabo > 0 {
+					if math.MaxUint64-circulatingPastabo < tx.AmountPastabo {
+						return fmt.Errorf("supply overflow at block %d", height)
+					}
+					circulatingPastabo += tx.AmountPastabo
+
+					// Accumulate EXPLO balance per miner.
+					if tx.To != "" {
+						if minerBalances[tx.To] == nil {
+							minerBalances[tx.To] = &minerBalance{}
+						}
+						minerBalances[tx.To].EXPLO += tx.AmountPastabo
+					}
+				}
+
+				// IMANI is the accumulated consciousness of the miner on-chain.
+				// Without this reconstruction, IMANI is lost on device restore.
+				if tx.AmountIMPastabo > 0 && tx.To != "" {
+					if minerBalances[tx.To] == nil {
+						minerBalances[tx.To] = &minerBalance{}
+					}
+					minerBalances[tx.To].IMANI += tx.AmountIMPastabo
+					minerBalances[tx.To].TotalIMANIReceived += tx.AmountIMPastabo
+				}
+			}
+
+			// Track unique miners.
+			minerAddr := strings.TrimSpace(blk.Header.MinerAddress)
+			if minerAddr != "" && minerAddr != "genesis" && address.IsValidEXPLOAddress(minerAddr) {
+				seenMiners[minerAddr] = struct{}{}
+			}
+
+			blockCount++
+			expectedHeight++
+			maxHeight = height
+
+			if progressInterval > 0 && blockCount%progressInterval == 0 {
+				log.Printf("[META-REBUILD] %d blocks processed...", blockCount)
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("meta rebuild scan failed: %w", err)
+	}
+
+	if blockCount == 0 {
+		return errors.New("no blocks found in ledger")
+	}
+
+	// Final supply cap validation.
+	if circulatingPastabo > MaxPastaboSupply {
+		return fmt.Errorf("supply cap exceeded: %d > %d", circulatingPastabo, MaxPastaboSupply)
+	}
+
+	minersCount := uint64(len(seenMiners))
+
+	// ------------------ Second pass: atomic commit of meta + balances ------------------
+	err = l.db.Update(func(txn *badger.Txn) error {
+		writeU64 := func(keySuffix string, value uint64) error {
+			key := append(PrefixMeta, []byte(keySuffix)...)
+			buf := make([]byte, 8)
+			binary.BigEndian.PutUint64(buf, value)
+			return txn.Set(key, buf)
+		}
+
+		// Write global metadata.
+		if err := writeU64("circulating_pastabo", circulatingPastabo); err != nil {
+			return err
+		}
+		if err := writeU64("miners_count", minersCount); err != nil {
+			return err
+		}
+		if err := writeU64("last_update", uint64(time.Now().Unix())); err != nil {
+			return err
+		}
+
+		// This ensures EXPLO and IMANI are both restored correctly
+		// when a miner changes device and triggers a full ledger rebuild.
+		for addr, mb := range minerBalances {
+			bal := Balance{
+				EXPLO:              mb.EXPLO,
+				IMANI:              mb.IMANI,
+				TotalIMANIReceived: mb.TotalIMANIReceived,
+			}
+			enc, err := cbor.Marshal(&bal)
+			if err != nil {
+				return fmt.Errorf("failed to marshal balance for %s: %w", addr, err)
+			}
+			if err := txn.Set([]byte("balance:"+addr), enc); err != nil {
+				return fmt.Errorf("failed to write balance for %s: %w", addr, err)
+			}
+		}
+
+		// Update chain tip.
+		tipBuf := make([]byte, 8)
+		binary.BigEndian.PutUint64(tipBuf, maxHeight)
+		if err := txn.Set(MetaChainTip, tipBuf); err != nil {
+			return fmt.Errorf("failed to update MetaChainTip: %w", err)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("meta commit failed: %w", err)
+	}
+
+	duration := time.Since(start)
+	log.Printf(
+		"[META-REBUILD] SUCCESS: %d blocks | %d miners | %d Pastabo | tip=%d | duration=%v",
+		blockCount,
+		minersCount,
+		circulatingPastabo,
+		maxHeight,
+		duration,
+	)
+
+	return nil
+}
+
+func extractHeightFromBlockKey(key []byte) (uint64, error) {
+	if len(key) < len(PrefixBlock)+8 {
+		return 0, errors.New("invalid block key length")
+	}
+	return binary.BigEndian.Uint64(key[len(PrefixBlock):]), nil
+}
+// ---------------- Low-level U64 ----------------
+
+func readU64(txn *badger.Txn, key string) (uint64, error) {
+    item, err := txn.Get([]byte(key))
+    if err != nil {
+        if err == badger.ErrKeyNotFound { return 0, nil }
+        return 0, err
+    }
+    val, err := item.ValueCopy(nil)
+    if err != nil { return 0, err }
+    if len(val) != 8 { return 0, fmt.Errorf("invalid u64 length") }
+    return binary.BigEndian.Uint64(val), nil
 }
 
 func writeU64(txn *badger.Txn, key string, v uint64) error {
     buf := make([]byte, 8)
-    for i := 7; i >= 0; i-- {
-        buf[i] = byte(v)
-        v >>= 8
-    }
+    binary.BigEndian.PutUint64(buf, v)
     return txn.Set([]byte(key), buf)
 }
 
 func incU64(txn *badger.Txn, key string, delta uint64) error {
     cur, err := readU64(txn, key)
-    if err != nil {
-        return err
+    if err != nil { return err }
+    if delta > math.MaxUint64-cur {
+        return fmt.Errorf("uint64 overflow on incU64")
     }
     return writeU64(txn, key, cur+delta)
 }
 
-// RebuildMetaValuesFromBlocks recalculates circulating supply, miners count and holders count
-func (l *Ledger) RebuildMetaValuesFromBlocks() error {
-    return l.DB().Update(func(txn *badger.Txn) error {
-        var circulating uint64
-        var miners uint64
-        var holders uint64
+// ---------------- Identity Commitments ----------------
 
-        opts := badger.DefaultIteratorOptions
-        opts.PrefetchValues = true
-        it := txn.NewIterator(opts)
-        defer it.Close()
+func (l *Ledger) HasCommitment(commitment []byte) (bool, error) {
+    key := []byte("identity:" + hex.EncodeToString(commitment))
+    var tmp struct { PubKey, Signature []byte }
+    if err := l.GetObject(key, &tmp); err != nil {
+        if errors.Is(err, badger.ErrKeyNotFound) { return false, nil }
+        return false, err
+    }
+    return true, nil
+}
 
-        for it.Rewind(); it.Valid(); it.Next() {
-            item := it.Item()
-            key := string(item.Key())
+func (l *Ledger) AddCommitment(commitment, pubKey, signature []byte) error {
+    key := []byte("identity:" + hex.EncodeToString(commitment))
+    exists, err := l.HasCommitment(commitment)
+    if err != nil { return err }
+    if exists { return fmt.Errorf("identity already exists") }
 
-            // Only consider block entries
-            if strings.HasPrefix(key, "block:") {
-                var blk Block // ✅ not ledger.Block
-                val, _ := item.ValueCopy(nil)
-                if err := cbor.Unmarshal(val, &blk); err != nil {
-                    continue
-                }
-
-                // Sum rewards for circulating EXPLO
-                for _, tx := range blk.Transactions {
-                    if tx.IsReward {
-                        circulating += uint64(tx.AmountEXP * 1e8) // pastabo precision
-                    }
-                }
-
-                // Count unique miners
-                minerKey := "miner_seen:" + blk.Header.MinerAddress
-                if _, err := txn.Get([]byte(minerKey)); err == badger.ErrKeyNotFound {
-                    txn.Set([]byte(minerKey), []byte{1})
-                    miners++
-                }
-            }
-        }
-
-        holders = miners // Or calculate separately if holders ≠ miners
-
-        // Write atomically to meta-values
-        writeU64(txn, "meta:circulating_pastabo", circulating)
-        writeU64(txn, "meta:miners_count", miners)
-        writeU64(txn, "meta:holders_count", holders)
-
-        return nil
-    })
+    record := struct { PubKey, Signature []byte }{pubKey, signature}
+    return l.PutObject(key, record)
 }

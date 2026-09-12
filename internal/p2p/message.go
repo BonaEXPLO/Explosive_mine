@@ -126,16 +126,22 @@ type GetBlocksRangePayload struct {
         To   uint64 `cbor:"to"`
 }
 
-// ✅ New: MetricsPayload used for broadcasting Exploscan metrics to all peers.
+// MetricsPayload used for broadcasting Exploscan metrics to all peers.
+// Fully aligned with canonical scan.MetricsData.
 type MetricsPayload struct {
-        Timestamp       int64   `cbor:"timestamp"`
-        MaxSupply       uint64  `cbor:"max_supply"`
-        Circulating     float64 `cbor:"circulating"`
-        TotalHolders    int     `cbor:"total_holders"`
-        MinersCount     int     `cbor:"miners_count"`
-        MinersRemaining int     `cbor:"miners_remaining"`
-}
+    Timestamp        int64   `cbor:"timestamp"`
 
+    MaxSupplyEXPLO   float64 `cbor:"max_supply_explo"`
+    CirculatingEXPLO float64 `cbor:"circulating_explo"`
+
+    TotalIMANI       float64 `cbor:"total_imani"`       // EXPLO donnés * 1000
+    TotalLUMEN       float64 `cbor:"total_lumen"`       // √IMANI
+    ImaniFundEXPLO   float64 `cbor:"imani_fund_explo"`  // EXPLO collectés pour le pool
+
+    TotalHolders     uint64  `cbor:"total_holders"`
+    MinersCount      uint64  `cbor:"miners_count"`
+    MinersRemaining  uint64  `cbor:"miners_remaining"`
+}
 // -------------------- ENCODING/DECODING --------------------
 
 func EncodeEnvelope(e *Envelope) ([]byte, error) {

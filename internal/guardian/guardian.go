@@ -2,282 +2,378 @@
 package guardian
 
 import (
-        "bufio"
-        "crypto/rand"
-        "encoding/json"
-        "errors"
-        "fmt"
-        "math/big"
-        "os"
-        "path/filepath"
-        "strings"
-        "sync"
-        "time"
-        "unicode"
+    "crypto/hmac"
+    "crypto/rand"
+    "crypto/sha256"
+    "encoding/binary"
+    "encoding/hex"
+    "errors"
+    "fmt"
+    "log"
+    "os"
+    "path/filepath"
+    "strings"
+    "sync"
+    "time"
+    "unicode"
+
+    "github.com/fxamacker/cbor/v2"
+    "golang.org/x/crypto/sha3"
+    "math/big"
+    mathrand "math/rand"
 )
 
 var (
-        // default data folder for guardian persistence
-        defaultGuardianDir  = filepath.Join(mustHomeDir(), ".explosive_guardian")
-        fingerprintFileName = "fingerprints.jsonl"
+    guardianMu       sync.Mutex
+    loaded           = false
+    usedFingerprints = make(map[string]struct{})
 )
 
-// internal registry and mutex for thread-safety
-var (
-        registryMutex sync.RWMutex
-        // usedSequences maps concatenated 4-word fingerprints (order-sensitive)
-        usedSequences = map[string]struct{}{}
-        loaded        = false
-)
+var defaultGuardianDir = filepath.Join(mustHomeDir(), ".explosive_guardian")
+const guardianHMACKey = "EXPLOSIVE_GUARDIAN_HMAC_V1"
 
-// mustHomeDir returns $HOME or "." if not available
 func mustHomeDir() string {
-        hd, err := os.UserHomeDir()
-        if err != nil || hd == "" {
-                return "."
-        }
-        return hd
+    hd, err := os.UserHomeDir()
+    if err != nil || hd == "" {
+        return "."
+    }
+    return hd
 }
 
-// ---------------------------
-// Persistence helpers
-// ---------------------------
-func ensurePersistenceDir() error {
-        return os.MkdirAll(defaultGuardianDir, 0o700)
-}
+// ------------------- Word Validation & Normalization -------------------
+func isvalidWordFormat(word string) bool {
+    word = strings.ToLower(strings.TrimSpace(word))
+    runes := []rune(word)
 
-func fingerprintFilePath() string {
-        return filepath.Join(defaultGuardianDir, fingerprintFileName)
-}
+    if len(runes) < 6 || len(runes) > 16 {
+        return false
+    }
 
-func loadRegistryFromDisk() error {
-        registryMutex.Lock()
-        defer registryMutex.Unlock()
-        if loaded {
-                return nil
+    for i, r := range runes {
+
+        // Allow letters
+        if unicode.IsLetter(r) {
+            continue
         }
 
-        if err := ensurePersistenceDir(); err != nil {
-                return err
+        // Allow hyphen or apostrophe (but not at start/end)
+        if r == '-' || r == '\'' {
+
+            // Not first or last character
+            if i == 0 || i == len(runes)-1 {
+                return false
+            }
+
+            // Prevent double separators (-- or '')
+            if runes[i-1] == r {
+                return false
+            }
+
+            continue
         }
 
-        fpath := fingerprintFilePath()
-        f, err := os.OpenFile(fpath, os.O_RDONLY|os.O_CREATE, 0o600)
-        if err != nil {
-                return err
-        }
-        defer f.Close()
+        return false
+    }
 
-        scanner := bufio.NewScanner(f)
-        for scanner.Scan() {
-                line := scanner.Text()
-                var rec struct {
-                        Words []string `json:"words"`
-                }
-                if err := json.Unmarshal([]byte(line), &rec); err != nil {
-                        continue
-                }
-                if len(rec.Words) == 4 {
-                        key := strings.Join(rec.Words, " ")
-                        usedSequences[key] = struct{}{}
-                }
-        }
-        loaded = true
-        return nil
+    return true
 }
 
-// ---------------------------
-// Persistence helpers
-// ---------------------------
-
-func persistFingerprint(words []string) error {
-    if err := ensurePersistenceDir(); err != nil {
-        return err
-    }
-    fpath := fingerprintFilePath()
-
-    f, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
-    if err != nil {
-        return err
-    }
-    defer f.Close()
-
-    rec := struct {
-        Words []string `json:"words"`
-        TS    int64    `json:"ts"`
-    }{
-        Words: words,
-        TS:    time.Now().Unix(),
-    }
-
-    b, err := json.Marshal(rec)
-    if err != nil {
-        return err
-    }
-
-    if _, err := f.Write(append(b, '\n')); err != nil {
-        return err
-    }
-
-    if err := f.Sync(); err != nil {
-        return err
-    }
-
-    return nil
-}
-// ---------------------------
-// Public API
-// ---------------------------
-
-// IsDuplicateFingerprint returns true if these 4 words (order-sensitive) are already used
-func IsDuplicateFingerprint(words []string) (bool, error) {
-    if len(words) != 4 {
-        return false, errors.New("exactly 4 words required")
-    }
-    if err := loadRegistryFromDisk(); err != nil {
-        return false, fmt.Errorf("failed to load registry: %w", err)
-    }
-
-    key := strings.Join(words, " ")
-    registryMutex.RLock()
-    _, ok := usedSequences[key]
-    registryMutex.RUnlock()
-    return ok, nil
-}
-
-// RegisterFingerprint records a new 4-word fingerprint
-func RegisterFingerprint(words []string) error {
+func validateWordsFormat(words []string) error {
     if len(words) != 4 {
         return errors.New("exactly 4 words required")
     }
+    wordSet := make(map[string]struct{})
+    for _, w := range words {
+        if !isvalidWordFormat(w) {
+            return fmt.Errorf("invalid word format: %s", w)
+        }
+        norm := strings.ToLower(strings.TrimSpace(w))
+        if _, exists := wordSet[norm]; exists {
+            return fmt.Errorf("duplicate word (case-insensitive): %s", w)
+        }
+        wordSet[norm] = struct{}{}
+    }
+    return nil
+}
 
-    if err := validateWordsFormat(words); err != nil {
+// ------------------- Exported Wrappers (Public API) -------------------
+
+// IsValidWordFormat validates a single sacred word format.
+func IsValidWordFormat(word string) bool {
+    return isvalidWordFormat(word)
+}
+
+// ValidateWordsFormat validates exactly 4 sacred words.
+func ValidateWordsFormat(words []string) error {
+    return validateWordsFormat(words)
+}
+func NormalizeWords(words []string) []string {
+    res := make([]string, len(words))
+    for i, w := range words {
+        res[i] = strings.ToLower(strings.TrimSpace(w))
+    }
+    return res
+}
+
+// ------------------- Fingerprint Hash (CONSENSUS SAFE) -------------------
+func FingerprintHash(words []string) (string, error) {
+	if err := ValidateWordsFormat(words); err != nil {
+		return "", fmt.Errorf("invalid fingerprint words: %w", err)
+	}
+
+	normalized := NormalizeWords(words)
+
+	// canonical join (consensus critical)
+	joined := strings.Join(normalized, "|")
+
+	sum := sha3.Sum256([]byte("EXPLOSIVE_GUARDIAN_V3|" + joined))
+	return hex.EncodeToString(sum[:]), nil
+}
+// Network hooks (must be provided by node / ledger layer)
+var IdentityExistsOnChain func(commitment []byte) (bool, error)
+var RegisterIdentityOnChain func(commitment []byte, pubKey []byte, signature []byte) error
+
+func RegisterOrRestoreIdentity(words []string, minerID string, networkID string, pubKey []byte, signature []byte) ([]byte, bool, error) {
+
+	if IdentityExistsOnChain == nil {
+		return nil, false, errors.New("identity check function not configured")
+	}
+	if RegisterIdentityOnChain == nil {
+		return nil, false, errors.New("identity registration function not configured")
+	}
+
+	fpHash, err := FingerprintHash(words)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// unique human anchor
+	data := []byte(fpHash + "|" + minerID + "|" + networkID)
+	sum := sha3.Sum256(data)
+	commitment := sum[:]
+
+	exists, err := IdentityExistsOnChain(commitment)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if exists {
+		return commitment, true, nil // restoration mode
+	}
+
+	if len(pubKey) == 0 || len(signature) == 0 {
+		return nil, false, errors.New("missing identity signature")
+	}
+
+	if err := RegisterIdentityOnChain(commitment, pubKey, signature); err != nil {
+		return nil, false, err
+	}
+
+	return commitment, false, nil
+}
+
+// ------------------- Fingerprint Record (LOCAL ONLY) -------------------
+type fingerprintRecord struct {
+    Version uint8  `cbor:"v"`   // 1 = current
+    Hash    string `cbor:"h"`   // fingerprint hash
+    TS      int64  `cbor:"ts"`  // creation timestamp
+    HMAC    []byte `cbor:"mac"` // HMAC-SHA256 integrity
+}
+
+// HMAC helpers
+func generateHMAC(fpHash string, ts int64) []byte {
+    key := []byte(guardianHMACKey)
+    mac := hmac.New(sha256.New, key)
+    mac.Write([]byte(fpHash))
+    tsBytes := make([]byte, 8)
+    binary.BigEndian.PutUint64(tsBytes, uint64(ts))
+    mac.Write(tsBytes)
+    return mac.Sum(nil)
+}
+
+func verifyHMAC(rec *fingerprintRecord) bool {
+    expected := generateHMAC(rec.Hash, rec.TS)
+    return hmac.Equal(rec.HMAC, expected)
+}
+
+// ------------------- Local CBOR Persistence -------------------
+// loadLocalFingerprints MUST be called under guardianMu lock
+func loadLocalFingerprints() error {
+
+    if loaded {
+        return nil
+    }
+
+    fpath := filepath.Join(defaultGuardianDir, "fingerprints.cbor")
+
+    if err := os.MkdirAll(defaultGuardianDir, 0700); err != nil {
+        log.Printf("[guardian] Failed to create dir %s: %v", defaultGuardianDir, err)
         return err
     }
 
-    key := strings.Join(words, " ")
-
-    if err := loadRegistryFromDisk(); err != nil {
-        return fmt.Errorf("failed to load registry: %w", err)
-    }
-
-    registryMutex.Lock()
-    defer registryMutex.Unlock()
-
-    if _, ok := usedSequences[key]; ok {
-        return errors.New("fingerprint already used")
-    }
-
-    usedSequences[key] = struct{}{}
-    return persistFingerprint(words)
-}
-
-// ValidateWordsFormat checks the 4-word rules (exported helper)
-func validateWordsFormat(words []string) error {
-        if len(words) != 4 {
-                return errors.New("exactly 4 words required")
-        }
-        for i, w := range words {
-                if !isValidWordFormat(w) {
-                        return fmt.Errorf("word #%d is invalid: must start with uppercase, be at least 4 letters, and contain only letters", i+1)
-                }
-        }
-        return nil
-}
-
-// isValidWordFormat enforces:
-// - at least 4 runes
-// - first rune is uppercase letter
-// - all runes are Unicode letters (no digits, no punctuation, no spaces)
-// ---------------------------
-// Validation helpers
-// ---------------------------
-
-// isValidWordFormat enforces adaptive rules depending on script:
-// - Latin: must start uppercase, ≥4 letters, letters only
-// - Han/Devanagari: ≥4 runes, all letters, uppercase not required
-// - Other scripts: ≥4 runes, all letters
-func isValidWordFormat(word string) bool {
-    word = strings.TrimSpace(word)
-    runes := []rune(word)
-    if len(runes) < 4 {
-        return false
-    }
-    first := runes[0]
-
-    switch {
-    case unicode.In(first, unicode.Han), unicode.In(first, unicode.Devanagari):
-        for _, r := range runes {
-            if !unicode.IsLetter(r) {
-                return false
-            }
-        }
-        return true
-
-    case unicode.In(first, unicode.Latin):
-        if !unicode.IsUpper(first) {
-            return false
-        }
-        for _, r := range runes {
-            if !unicode.IsLetter(r) {
-                return false
-            }
-        }
-        return true
-
-    default:
-        for _, r := range runes {
-            if !unicode.IsLetter(r) {
-                return false
-            }
-        }
-        return true
-    }
-}
-
-// ---------------------------
-// Intelligent Multilingual Mentor
-// ---------------------------
-
-// EncourageMessage generates a creative, inspiring message based on 4 sacred words.
-// All valid words are accepted. If the 4 words are all recognized as belonging to
-// the same supported language (en/fr/hi/zh), the message is in that language and more tailored.
-// Otherwise a strong generic/inspiring English message is returned.
-// EncourageMessageEphemeral generates an inspiring daily message based on 4 words,
-// supports multilingual templates, accepts all words, and increments message counter.
-func EncourageMessageEphemeral(words []string) string {
-    joined := strings.Join(words, " ")
-
-    // Accept words even if format invalid, but guide user
-    if err := validateWordsFormat(words); err != nil {
-        msg := fmt.Sprintf("Your words %s are accepted. 💡 Tip: Use capitalized words with 4+ letters for more tailored inspiration.", joined)
-        _ = incrementMessageCount()
-        return msg
-    }
-
-    // Language detection
-    lang, allSupported := detectCommonSupportedLanguage(words)
-    var templates []string
-    if allSupported {
-        templates = getInspiringTemplates(lang)
-    } else {
-        templates = getGenericTemplates()
-    }
-
-    // Choose random template and highlight word
-    idx, err := secureRandomIndex(len(templates))
+    data, err := os.ReadFile(fpath)
     if err != nil {
-        idx = 0
+        if os.IsNotExist(err) {
+            log.Printf("[guardian] fingerprints.cbor not found - starting fresh")
+            loaded = true
+            return nil
+        }
+        return err
     }
-    wordIdx, _ := secureRandomIndex(len(words))
-    msg := fmt.Sprintf(templates[idx], joined, words[wordIdx])
 
-    // Increment global message counter
-    _ = incrementMessageCount()
+    if len(data) == 0 {
+        log.Printf("[guardian] fingerprints.cbor empty - starting fresh")
+        loaded = true
+        return nil
+    }
 
-    return msg
+    var records []fingerprintRecord
+    if err := cbor.Unmarshal(data, &records); err != nil {
+        log.Printf("[guardian] Corrupted fingerprints.cbor - resetting: %v", err)
+        usedFingerprints = make(map[string]struct{})
+        loaded = true
+        return nil
+    }
+
+    count := 0
+    for _, rec := range records {
+        if rec.Version == 1 && verifyHMAC(&rec) && rec.Hash != "" {
+            usedFingerprints[rec.Hash] = struct{}{}
+            count++
+        }
+    }
+
+    loaded = true
+    log.Printf("[guardian] Loaded %d valid fingerprints", count)
+    return nil
 }
 
+func appendFingerprint(fpHash string) error {
+    // Assure que le dossier existe
+    if err := os.MkdirAll(defaultGuardianDir, 0700); err != nil {
+        log.Printf("[guardian] Failed to create dir %s: %v", defaultGuardianDir, err)
+        return err
+    }
+
+    fpath := filepath.Join(defaultGuardianDir, "fingerprints.cbor")
+    tmpPath := fpath + ".tmp"
+
+    // Charger existant
+    records := []fingerprintRecord{}
+    if data, err := os.ReadFile(fpath); err == nil && len(data) > 0 {
+        log.Printf("[guardian] Reading existing fingerprints.cbor (%d bytes)", len(data))
+        if err := cbor.Unmarshal(data, &records); err != nil {
+            log.Printf("[guardian] Failed to unmarshal existing fingerprints: %v", err)
+            records = []fingerprintRecord{} // reset pour éviter blocage
+        }
+    } else if os.IsNotExist(err) {
+        log.Printf("[guardian] fingerprints.cbor not found, creating new")
+    } else if err != nil {
+        log.Printf("[guardian] Failed to read fingerprints.cbor: %v", err)
+        return err
+    }
+
+    // Créer l’enregistrement
+    ts := time.Now().Unix()
+    rec := fingerprintRecord{
+        Version: 1,
+        Hash:    fpHash,
+        TS:      ts,
+        HMAC:    generateHMAC(fpHash, ts),
+    }
+    records = append(records, rec)
+    log.Printf("[guardian] Appending fingerprint %s", fpHash[:16])
+
+    // Marshal CBOR
+    b, err := cbor.Marshal(records)
+    if err != nil {
+        log.Printf("[guardian] Failed to marshal fingerprints: %v", err)
+        return err
+    }
+
+    // Écrire temporaire
+    if err := os.WriteFile(tmpPath, b, 0600); err != nil {
+        log.Printf("[guardian] Failed to write temp file %s: %v", tmpPath, err)
+        return err
+    }
+
+    // Rename atomique
+    if err := os.Rename(tmpPath, fpath); err != nil {
+        log.Printf("[guardian] Failed to rename temp file to %s: %v", fpath, err)
+        os.Remove(tmpPath)
+        return fmt.Errorf("atomic rename failed: %w", err)
+    }
+
+    log.Printf("[guardian] Fingerprint %s written to %s successfully", fpHash[:16], fpath)
+    return nil
+}
+
+// ------------------- Public API -------------------
+func IsDuplicateFingerprint(words []string) (bool, error) {
+	fpHash, err := FingerprintHash(words)
+	if err != nil {
+		return false, err
+	}
+
+	guardianMu.Lock()
+	defer guardianMu.Unlock()
+
+	if !loaded {
+		if err := loadLocalFingerprints(); err != nil {
+			return false, nil
+		}
+	}
+
+	_, exists := usedFingerprints[fpHash]
+	return exists, nil
+}
+
+// RegisterFingerprintLocal registers a new fingerprint locally (append-only).
+// Ultra-scalable mobile version: minimal locking, zero debug noise.
+func RegisterFingerprintLocal(words []string) (string, error) {
+	fpHash, err := FingerprintHash(words)
+	if err != nil {
+		return "", err
+	}
+
+	guardianMu.Lock()
+	defer guardianMu.Unlock()
+
+	if !loaded {
+		if err := loadLocalFingerprints(); err != nil {
+			usedFingerprints = make(map[string]struct{}, 1024)
+		}
+		loaded = true
+	}
+
+	usedFingerprints[fpHash] = struct{}{}
+
+	go func(h string) {
+		_ = appendFingerprint(h)
+	}(fpHash)
+
+	return fpHash, nil
+}
+
+
+// ------------------- Encourage Message -------------------
+func EncourageMessageEphemeral(words []string) string {
+	norm := NormalizeWords(words)
+	h := sha3.Sum256([]byte(strings.Join(norm, "|")))
+
+	seed := int64(binary.BigEndian.Uint64(h[:8]))
+	rnd := mathrand.New(mathrand.NewSource(seed))
+
+	templates := []string{
+		"The sacred words '%s' resonate with the universe.",
+		"In '%s' lies the echo of eternity.",
+		"The cosmos whispers '%s'.",
+		"With '%s' as your foundation, your path is clear.",
+		"The energy of '%s' flows through you.",
+	}
+
+	return fmt.Sprintf(templates[rnd.Intn(len(templates))], strings.Join(norm, " "))
+}
 // detectCommonSupportedLanguage returns (lang, true) if ALL words map to the same supported language.
 // Supported languages: "en" (latin ascii), "fr" (latin with accents or french hints), "hi" (Devanagari), "zh" (Han).
 // If they don't all belong to the same supported language, returns ("", false).
@@ -480,63 +576,80 @@ func getGenericTemplates() []string {
 // Utilities
 // ---------------------------
 
-// secureRandomIndex returns a secure random index in [0, n-1].
-// ---------------------------
-// Utilities
-// ---------------------------
+// secureRandomIndex returns a cryptographically secure random index in [0, n-1].
+// Uses crypto/rand for security (not math/rand).
 func secureRandomIndex(n int) (int, error) {
-    if n <= 0 {
-        return 0, errors.New("n must be > 0")
-    }
-    max := big.NewInt(int64(n))
-    v, err := rand.Int(rand.Reader, max)
-    if err != nil {
-        return 0, fmt.Errorf("crypto/rand failed: %w", err)
-    }
-    return int(v.Int64()), nil
+	if n <= 0 {
+		return 0, errors.New("n must be > 0")
+	}
+	max := big.NewInt(int64(n))
+	v, err := rand.Int(rand.Reader, max)
+	if err != nil {
+		return 0, fmt.Errorf("crypto/rand failed: %w", err)
+	}
+	return int(v.Int64()), nil
 }
-// ---------------------------
-// Daily ephemeral message
-// ---------------------------
-
-// DailyMessageCountFile tracks total messages ever generated
-var dailyMessageCountFile = filepath.Join(defaultGuardianDir, "message_count.json")
 
 // ---------------------------
 // Message counting (historical stats)
 // ---------------------------
-// ---------------------------
+
+// dailyMessageCountFile tracks total messages ever generated (CBOR format)
+var dailyMessageCountFile = filepath.Join(defaultGuardianDir, "message_count.cbor")
+
+// incrementMessageCount atomically increments the global message counter
+// using a temporary file + rename for atomicity.
 func incrementMessageCount() error {
-    if err := ensurePersistenceDir(); err != nil {
-        return err
-    }
+	if err := os.MkdirAll(defaultGuardianDir, 0700); err != nil {
+		return err
+	}
 
-    count := 0
-    if data, err := os.ReadFile(dailyMessageCountFile); err == nil {
-        _ = json.Unmarshal(data, &count)
-    }
-    count++
+	tmpFile := dailyMessageCountFile + ".tmp"
 
-    b, err := json.Marshal(count)
-    if err != nil {
-        return err
-    }
+	// Read current count (if file exists)
+	count := int64(0)
+	if data, err := os.ReadFile(dailyMessageCountFile); err == nil {
+		var num int64
+		if err := cbor.Unmarshal(data, &num); err == nil {
+			count = num
+		}
+	}
 
-    // 🔒 Correction : WriteFile avec Sync
-    tmpFile := dailyMessageCountFile + ".tmp"
-    if err := os.WriteFile(tmpFile, b, 0o600); err != nil {
-        return err
-    }
-    return os.Rename(tmpFile, dailyMessageCountFile)
+	// Increment
+	count++
+
+	// Marshal new count
+	b, err := cbor.Marshal(count)
+	if err != nil {
+		return fmt.Errorf("cbor marshal failed: %w", err)
+	}
+
+	// Atomic write: temp file → rename
+	if err := os.WriteFile(tmpFile, b, 0600); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmpFile, dailyMessageCountFile); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("atomic rename failed: %w", err)
+	}
+
+	return nil
 }
 
-// GetTotalMessages returns number of messages guardian has given until now
-func GetTotalMessages() int {
-        data, err := os.ReadFile(dailyMessageCountFile)
-        if err != nil {
-                return 0
-        }
-        var count int
-        _ = json.Unmarshal(data, &count)
-        return count
+// GetTotalMessages returns the total number of messages generated so far
+// Returns 0 if file is missing or corrupted (non-blocking)
+func GetTotalMessages() int64 {
+	data, err := os.ReadFile(dailyMessageCountFile)
+	if err != nil {
+		return 0
+	}
+
+	var count int64
+	if err := cbor.Unmarshal(data, &count); err != nil {
+		log.Printf("warning: invalid message count file: %v", err)
+		return 0
+	}
+
+	return count
 }

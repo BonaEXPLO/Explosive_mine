@@ -1,241 +1,407 @@
 // internal/p2p/node3.go
 package p2p
-
 import (
-        "fmt"
-        "math/rand"
-        "strings"
+        "encoding/hex"
+        "github.com/fxamacker/cbor/v2"
+        "log"
         "time"
-
         "explosive/internal/ledger"
-        "explosive/internal/scan"
 )
 
-// =============================================================================
-// BALANCE & TRANSACTION HISTORY
-// =============================================================================
+func (n *Node) registerDefaultHandlers() {
 
-// GetBalance retrieves the EXPLO and IMANI balance of a given address
-func (n *Node) GetBalance(address string) (float64, float64, error) {
-        if n == nil || n.Ledger == nil {
-                return 0, 0, fmt.Errorf("ledger not initialized")
-        }
+	// =========================================================
+	// HANDSHAKE (CRITICAL)
+	// =========================================================
+	n.RegisterHandler(MsgTypeHandshake, func(p *Peer, env *Envelope) {
 
-        var bal ledger.Balance
-        if err := n.Ledger.GetObject([]byte("balance:"+address), &bal); err != nil {
-                return 0, 0, nil
-        }
+		p.handshakeOnce.Do(func() {
 
-        return bal.EXPLO, bal.IMANI, nil
+			var hs HandshakePayload
+			if err := UnmarshalPayload(env.Payload, &hs); err != nil {
+				log.Printf("[p2p] Invalid handshake payload from %s: %v", p.addr, err)
+				p.Close()
+				return
+			}
+
+			log.Printf("[p2p] Handshake received from %s (id=%s, version=%s, listen=%s)",
+				p.addr, hs.PeerID, hs.Version, hs.ListenAddr)
+
+			// ---------------- NETWORK CHECK ----------------
+			if hs.Network != n.networkID {
+				log.Printf("[p2p] Handshake rejected from %s: wrong network '%s'", p.addr, hs.Network)
+				p.Close()
+				return
+			}
+
+			// ---------------- VERSION CHECK ----------------
+			if hs.Version != n.userAgent {
+				log.Printf("[p2p] Version mismatch %s remote=%s local=%s",
+					p.addr, hs.Version, n.userAgent)
+			}
+
+			// =====================================================
+// 🔥 LEDGER IDENTITY CHECK
+// =====================================================
+
+p.id = PeerID(hs.PeerID)
+
+if !n.verifyPeerOnChain(p.id) {
+        log.Printf("[p2p] 🚫 peer not in ledger identity set: %s", p.id)
+        p.Close()
+        return
 }
 
-// GetTransactionHistory retrieves transaction history for an address with pagination
-func (n *Node) GetTransactionHistory(address string, offset, limit int) ([]ledger.Transaction, error) {
-        if n == nil || n.Ledger == nil {
-                return nil, fmt.Errorf("ledger not initialized")
+			// =====================================================
+			// V3 MINER AUTH
+			// =====================================================
+			if env.MinerInfo != nil && len(env.Signature) > 0 && len(env.PubKey) > 0 {
+
+				ok, err := VerifyEnvelopeSignature(env)
+				if err != nil {
+					log.Printf("[p2p] V3 signature error %s: %v", p.addr, err)
+					p.Penalize(5, 0)
+				} else if ok {
+
+					p.mu.Lock()
+					p.verifiedMinerID = env.MinerInfo.MinerID
+					p.verifiedPubKey = env.MinerInfo.PubKey
+					p.verifiedMiner = true
+					p.mu.Unlock()
+
+					log.Printf("[p2p] ✅ Verified conscious miner: %s", env.MinerInfo.MinerID)
+				} else {
+					log.Printf("[p2p] Invalid V3 signature miner %s", env.MinerInfo.MinerID)
+					p.Penalize(10, time.Hour)
+					p.Close()
+					return
+				}
+			}
+
+			role := "observer/investor"
+			if p.IsVerifiedMiner() {
+				role = "verified conscious miner"
+			}
+
+			p.mu.Lock()
+alreadyDone := p.handshakeDone
+p.handshakeDone = true
+p.mu.Unlock()
+
+if !alreadyDone {
+
+        // Register peer after successful validation
+        n.addPeer(p)
+
+        // Release bootstrap waiters
+        select {
+        case <-p.handshakeCh:
+                // already closed
+        default:
+                close(p.handshakeCh)
         }
 
-        txs, err := n.Ledger.GetTransactionsByAddress(address, offset, limit)
-        if err != nil {
-                return nil, err
-        }
-
-        result := make([]ledger.Transaction, len(txs))
-        for i, t := range txs {
-                result[i] = *t
-        }
-        return result, nil
-}
-
-// =============================================================================
-// METRICS — SILENT & ON-DEMAND
-// =============================================================================
-
-// Equals compares two MetricsData structs for equality
-func (m MetricsData) Equals(o MetricsData) bool {
-        return m.Timestamp == o.Timestamp &&
-                m.MaxSupply == o.MaxSupply &&
-                m.Circulating == o.Circulating &&
-                m.TotalHolders == o.TotalHolders &&
-                m.MinersCount == o.MinersCount &&
-                m.MinersRemaining == o.MinersRemaining
-}
-
-// GetMetrics returns the current cached metrics or fetches them from ledger if not cached
-func (n *Node) GetMetrics() MetricsData {
-        if n == nil || n.Ledger == nil {
-                return MetricsData{}
-        }
-
-        n.metricsMu.RLock()
-        if n.cachedMetricsOnce {
-                cached := n.CachedMetrics
-                n.metricsMu.RUnlock()
-                return cached
-        }
-        n.metricsMu.RUnlock()
-
-        var m MetricsData
-        if err := n.Ledger.GetObject([]byte("network:metrics"), &m); err != nil {
-                return MetricsData{}
-        }
-
-        n.metricsMu.Lock()
-        n.CachedMetrics = m
-        n.cachedMetricsOnce = true
-        n.metricsMu.Unlock()
-
-        return m
-}
-
-// UpdateGlobalMetrics updates the ledger-compatible global metrics (uint64 in Pastabo)
-func (n *Node) UpdateGlobalMetrics(m MetricsData) {
-        if n == nil || n.Ledger == nil {
-                return
-        }
-
-        n.metricsMu.RLock()
-        unchanged := n.cachedMetricsOnce && m.Equals(n.CachedMetrics)
-        n.metricsMu.RUnlock()
-        if unchanged {
-                return
-        }
-
-        // Store metrics in ledger (MetricsData in float64 for display)
-        _ = n.Ledger.PutObject([]byte("network:metrics"), &m)
-
-        n.metricsMu.Lock()
-        n.CachedMetrics = m
-        n.cachedMetricsOnce = true
-
-        // Convert float64 EXPLO to uint64 Pastabo for GlobalMetrics payload
-        n.GlobalMetrics = MetricsPayload{
-                Timestamp:       m.Timestamp,
-                MaxSupply:       uint64(m.MaxSupply * float64(ledger.PastaboPerEXPLO)),   // Pastabo
-                Circulating: m.Circulating,
-                TotalHolders:    m.TotalHolders,
-                MinersCount:     m.MinersCount,
-                MinersRemaining: m.MinersRemaining,
-        }
-
-        n.metricsMu.Unlock()
-}
-
-// FetchMetricsNow retrieves latest network metrics on-demand
-func (n *Node) FetchMetricsNow() MetricsData {
-        if n == nil || n.Ledger == nil {
-                return MetricsData{}
-        }
-
-        // Gather live metrics from scan
-        md, err := scan.GatherMetrics(n.Ledger)
-        if err != nil || md == nil {
-                return n.GetMetrics()
-        }
-
-        // Use float64 EXPLO for human-readable metrics
-        metrics := MetricsData{
-                Timestamp:       md.Timestamp,
-                MaxSupply:       md.MaxSupply,
-                Circulating:     md.Circulating,
-                TotalHolders: int(md.TotalHolders),
-                MinersCount:     int(md.MinersCount),
-                MinersRemaining: int(md.MinersRemaining),
-        }
-
-        // Update global metrics in uint64 (Pastabo) format
-        n.UpdateGlobalMetrics(metrics)
-
-        // Only broadcast if metrics changed
-        if n.GetMetrics().Equals(metrics) {
-                return metrics
-        }
-
-        // Broadcast authenticated metrics if a local miner exists
-        env, err := NewEnvelopeFromPayload(n.ProtocolVersion(), MsgTypeMetrics, n.GlobalMetrics)
-        if err != nil {
-                return n.GetMetrics()
-        }
-
-        if n.config.RequireSignedMessages {
-                miners, err := n.Ledger.ListAllMiners()
-                if err == nil && len(miners) > 0 {
-                        miner := &miners[0]
-                        if ledger.EnsureMinerSignature(miner) == nil {
-                                env.MinerInfo = &MinerInfo{
-                                        MinerID:   miner.ID,
-                                        Timestamp: env.Timestamp,
-                                        PubKey:    miner.PubKey,
-                                }
-                        }
-                }
-        }
-
-        // Random jitter 0-500ms to stagger network broadcasts
-        time.Sleep(time.Duration(rand.Intn(501)) * time.Millisecond)
-        n.BroadcastEnvelope(env)
-
-        return metrics // Return float64 metrics for display
-}
-
-// GetSampleMiners returns a random sample of miners for display
-func (n *Node) GetSampleMiners(count int) []string {
-        if n == nil || n.Ledger == nil {
-                return nil
-        }
-
-        miners, err := n.Ledger.ListAllMiners()
-        if err != nil || len(miners) == 0 {
-                return nil
-        }
-
-        total := len(miners)
-        if count > total {
-                count = total
-        }
-
-        perm := rand.Perm(total)
-        result := make([]string, count)
-        for i := 0; i < count; i++ {
-                result[i] = miners[perm[i]].ID
-        }
-        return result
-}
-
-// ShowLiveMetrics prints current metrics & a sample of miners
-func ShowLiveMetrics(node *Node) {
-        if node == nil {
-                fmt.Println("❌ Node not initialized.")
-                return
-        }
-
-        m := node.GetMetrics()
-        if m.Timestamp == 0 {
-                fmt.Println("⏳ Metrics data not available yet.")
-                return
-        }
-
-        fmt.Printf(
-                "🌍 EXPLO Max:%.2f | Circulating:%.3f | Holders:%d | Miners:%d | NextHalvingIn:%d\n",
-                m.MaxSupply,
-                m.Circulating,
-                m.TotalHolders,
-                m.MinersCount,
-                m.MinersRemaining,
+        log.Printf(
+                "[p2p] ✅ BIDIRECTIONAL HANDSHAKE COMPLETE → %s (%s)",
+                p.id,
+                role,
         )
+}
+		})
+	})
 
-        sample := node.GetSampleMiners(10)
-        if len(sample) > 0 {
-                fmt.Println("🔹 Sample miners:", strings.Join(sample, ", "))
-        }
+	// =========================================================
+	// PING / PONG (UNCHANGED)
+	// =========================================================
+	n.RegisterHandler(MsgTypePing, func(p *Peer, env *Envelope) {
+		var ping PingPayload
+		if err := UnmarshalPayload(env.Payload, &ping); err != nil {
+			return
+		}
+		pong := PongPayload{Nonce: ping.Nonce}
+		reply, _ := NewEnvelopeFromPayload(n.protocolVersion, MsgTypePong, pong)
+		_ = p.SendEnvelope(reply)
+	})
+
+	n.RegisterHandler(MsgTypePong, func(p *Peer, env *Envelope) {})
+
+	// =========================================================
+	// INV (SAFE + CONSENSUS AWARE)
+	// =========================================================
+	n.RegisterHandler(MsgTypeInv, func(p *Peer, env *Envelope) {
+
+		inv, err := DecodeInvPayload(env.Payload)
+		if err != nil {
+			log.Printf("[p2p] Invalid INV payload from %s: %v", p.addr, err)
+			return
+		}
+
+		if inv.Kind != InvKindBlockHeader && inv.Kind != InvKindBlockFull {
+			return
+		}
+
+		var requestHashes [][]byte
+
+		for _, h := range inv.Hashes {
+
+			hashStr := hex.EncodeToString(h)
+
+			_, ok := n.Ledger.GetHeightByBlockHash(hashStr)
+			if ok {
+				continue
+			}
+
+			requestHashes = append(requestHashes, h)
+		}
+
+		if len(requestHashes) > 0 {
+
+			getEnv, err := NewGetDataMessage(InvKindBlockHeader, requestHashes)
+			if err == nil {
+				_ = p.SendEnvelope(getEnv)
+			}
+		}
+	})
+
+	// =========================================================
+	// GETDATA (UNCHANGED + SAFE LIMITS)
+	// =========================================================
+	n.RegisterHandler(MsgTypeGetData, func(p *Peer, env *Envelope) {
+
+		req, err := DecodeGetDataPayload(env.Payload)
+		if err != nil {
+			return
+		}
+
+		if len(req.Hashes) > 50 {
+			req.Hashes = req.Hashes[:50]
+		}
+
+		for _, hashBytes := range req.Hashes {
+
+			hashStr := hex.EncodeToString(hashBytes)
+
+			blk, err := n.Ledger.GetBlockByHash(hashStr)
+			if err != nil || blk == nil {
+				continue
+			}
+
+			// 🔥 SAFETY: require PoW existence
+			if blk.Header.DailyPoW == nil {
+				continue
+			}
+
+			var payload []byte
+			var kind string
+
+			if req.Kind == InvKindBlockHeader || blk.IsLightBlock() {
+				h := *blk
+				h.Transactions = nil
+				payload, _ = cbor.Marshal(h)
+				kind = InvKindBlockHeader
+			} else {
+				payload, _ = cbor.Marshal(blk)
+				kind = InvKindBlockFull
+			}
+
+			blockEnv, _ := NewEnvelopeFromPayload(n.ProtocolVersion(),
+				MsgTypeBlock, BlockPayload{
+					Kind: kind,
+					Data: payload,
+				})
+
+			_ = p.SendEnvelope(blockEnv)
+		}
+	})
+
+	// =========================================================
+	// BLOCK (🔥 FULL CONSENSUS SECURITY FIX)
+	// =========================================================
+	n.RegisterHandler(MsgTypeBlock, func(p *Peer, env *Envelope) {
+
+		var bp BlockPayload
+		if err := UnmarshalPayload(env.Payload, &bp); err != nil {
+			p.Penalize(5, 0)
+			return
+		}
+
+		var blk ledger.Block
+		if err := cbor.Unmarshal(bp.Data, &blk); err != nil {
+			p.Penalize(5, 0)
+			return
+		}
+
+		// ---------------- MINER CHECK ----------------
+		if !p.IsVerifiedMiner() {
+			p.Penalize(20, 24*time.Hour)
+			return
+		}
+
+		// ---------------- POW VALIDATION (CRITICAL FIX) ----------------
+		if blk.Header.DailyPoW == nil {
+    p.Penalize(10, 0)
+    return
 }
 
-// =============================================================================
-// BACKGROUND LOOPS — DISABLED
-// =============================================================================
+if !ledger.VerifyDailyPoW(
+    blk.Header.MinerAddress,
+    *blk.Header.DailyPoW,
+    blk.Header.PrevHash,
+) {
+    p.Penalize(15, time.Hour)
+    return
+}
+		// ---------------- HEIGHT CHECK ----------------
+		currentHeight := n.Ledger.GetLatestBlockHeight()
+		if blk.Header.Height <= currentHeight {
+			return
+		}
 
-// StartMetricsLoop is disabled in mobile nodes
-func (n *Node) StartMetricsLoop(_ time.Duration) {}
+		// ---------------- SIGNATURE CHECK ----------------
+		ok, err := blk.VerifySignature()
+		if err != nil || !ok {
+			p.Penalize(10, 6*time.Hour)
+			return
+		}
 
-// StartMetricsBroadcastLoop is disabled in mobile nodes
-func (n *Node) StartMetricsBroadcastLoop(_ time.Duration) {}
+		// ---------------- LEDGER APPLY ----------------
+		if err := n.Ledger.AddBlock(&blk); err != nil {
+			return
+		}
+
+		log.Printf("[p2p] ✅ Block #%d accepted", blk.Header.Height)
+
+		bh, _ := hex.DecodeString(blk.BlockHash)
+		n.BroadcastBlockInv(bh, InvKindBlockFull)
+	})
+
+	// =========================================================
+	// GET BLOCK RANGE (UNCHANGED)
+	// =========================================================
+	n.RegisterHandler(MsgTypeGetBlocksRange, func(p *Peer, env *Envelope) {
+
+		var req GetBlocksRangePayload
+		if err := UnmarshalPayload(env.Payload, &req); err != nil {
+			return
+		}
+
+		if req.From > req.To {
+			return
+		}
+
+		if req.To-req.From+1 > 50 {
+			req.To = req.From + 49
+		}
+
+		blocks, err := n.Ledger.GetBlocksRange(req.From, req.To)
+		if err != nil || len(blocks) == 0 {
+			return
+		}
+
+		payload := struct {
+			Blocks []*ledger.Block `cbor:"blocks"`
+		}{Blocks: blocks}
+
+		resp, _ := NewEnvelopeFromPayload(n.ProtocolVersion(),
+			MsgTypeBlocksResponse, payload)
+
+		_ = p.SendEnvelope(resp)
+	})
+
+	// =========================================================
+	// BLOCKS RESPONSE (UNCHANGED)
+	// =========================================================
+	n.RegisterHandler(MsgTypeBlocksResponse, func(p *Peer, env *Envelope) {
+
+		var resp struct {
+			Blocks []*ledger.Block `cbor:"blocks"`
+		}
+
+		if err := UnmarshalPayload(env.Payload, &resp); err != nil {
+			return
+		}
+
+		for _, blk := range resp.Blocks {
+			_ = n.Ledger.AddBlock(blk)
+		}
+	})
+
+	// =========================================================
+	// TRANSACTIONS (UNCHANGED)
+	// =========================================================
+	n.RegisterHandler(MsgTypeTx, func(p *Peer, env *Envelope) {
+
+		var tx ledger.Transaction
+		if err := UnmarshalPayload(env.Payload, &tx); err != nil {
+			return
+		}
+
+		if !tx.IsReward && tx.AmountIM > 0 {
+			p.Penalize(1, 0)
+			return
+		}
+
+		_, err := n.Ledger.ApplyAndPersistTransaction(&tx)
+		if err != nil {
+			p.Penalize(1, 0)
+			return
+		}
+
+		n.BroadcastExcept(env, p)
+	})
+
+	// =========================================================
+	// METRICS (RESTORED EXACT LOGIC)
+	// =========================================================
+	n.RegisterHandler(MsgTypeMetrics, func(p *Peer, env *Envelope) {
+
+		if !p.IsVerifiedMiner() {
+			p.Penalize(5, 0)
+			return
+		}
+
+		var m MetricsData
+		if err := UnmarshalPayload(env.Payload, &m); err != nil {
+			return
+		}
+
+		n.metricsMu.Lock()
+		defer n.metricsMu.Unlock()
+
+		n.GlobalMetrics = MetricsPayload{
+			Timestamp:        m.Timestamp,
+			MaxSupplyEXPLO:   m.MaxSupply,
+			CirculatingEXPLO: m.Circulating,
+			TotalHolders:     m.TotalHolders,
+			MinersCount:      m.MinersCount,
+			MinersRemaining:  m.MinersRemaining,
+		}
+
+		n.CachedMetrics = m
+		n.cachedMetricsOnce = true
+
+		log.Printf("[p2p] Metrics updated by %s — %.3f EXPLO",
+			p.verifiedMinerID, m.Circulating)
+	})
+
+	// =========================================================
+	// PEERS (UNCHANGED)
+	// =========================================================
+	n.RegisterHandler(MsgTypePeers, func(p *Peer, env *Envelope) {
+
+		var pl PeersPayload
+		if err := UnmarshalPayload(env.Payload, &pl); err != nil {
+			return
+		}
+
+		for _, addr := range pl.Addrs {
+			if addr != n.listenAddr {
+				go n.Connect(addr)
+			}
+		}
+	})
+
+	n.RegisterHandler(MsgTypeRequestPeers, func(p *Peer, env *Envelope) {
+		n.SendKnownPeers(p)
+	})
+}

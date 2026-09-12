@@ -4,13 +4,16 @@ package ledger
 import (
         "errors"
         "time"
-        "explosive/internal/address"
         "log"
+        "strings"
+        "encoding/binary"
         "crypto/ed25519"
         "encoding/base64"
         "fmt"
 
         "github.com/dgraph-io/badger/v4"
+        "explosive/internal/address"
+        "explosive/internal/compressor"
         "github.com/fxamacker/cbor/v2"
 )
 
@@ -22,20 +25,32 @@ var ErrNotFound = errors.New("not found")
 var errIterStop = errors.New("ledger iteration stopped")
 // ---------------- BlockHeader ----------------
 type BlockHeader struct {
-    Height       uint64     `cbor:"height"`
-    PrevHash     string     `cbor:"prev_hash"`
-    Timestamp    int64      `cbor:"timestamp"`
-    Nonce        uint64     `cbor:"nonce"`
-    MinerAddress string     `cbor:"miner_address"`
-    MerkleRoot   string     `cbor:"merkle_root"`
+        Height       uint64               `cbor:"height"`
+        PrevHash     string               `cbor:"prev_hash"`
+        Timestamp    int64                `cbor:"timestamp"`
+        Nonce        uint64               `cbor:"nonce"`
+        MinerAddress string               `cbor:"miner_address"`
+        MerkleRoot   string               `cbor:"merkle_root"`
 
-    // ⛏️ Daily Proof-of-Work (1 block / day / miner)
-    DailyPoW     *MiningPoW `cbor:"daily_pow,omitempty"`
+        // ⛏️ Daily Proof-of-Work (1 block / day / miner)
+        DailyPoW     *MiningPoW           `cbor:"daily_pow,omitempty"`
 
-    // Version field for backward compatibility and future upgrades
-    // 0 = legacy blocks (no network anchoring in DailyPoW)
-    // 1 = modern blocks (network-anchored PoW with PrevBlockHash)
-    Version      uint8      `cbor:"version"`
+        // SHA3-256 hash of the miner's consciousness fingerprint (4 sacred words)
+        // Included in the block for consensus: allows ApplyBlock to verify uniqueness
+        // without relying on GetMiner() (local state).
+        // Required for blocks with version ≥ 1.
+        // Empty ("") for legacy blocks (version 0).
+        MinerFingerprintHash string       `cbor:"miner_fphash,omitempty"`
+
+        // Version field for backward compatibility and future upgrades
+        // 0 = legacy blocks (no network anchoring in DailyPoW, no fingerprint hash)
+        // 1 = modern blocks (network-anchored PoW + fingerprint hash required)
+        Version      uint8                `cbor:"version"`
+
+        DistributionMeta DistributionMetadata `cbor:"dist_meta,omitempty"`
+
+        // 🔐 PubKey du mineur (base64-encoded, immuable)
+        MinerPubKey  string               `cbor:"miner_pubkey,omitempty"`
 }
 
 // ---------------- Block ----------------
@@ -50,6 +65,10 @@ type Block struct {
         PublicKey string `cbor:"pub_key,omitempty"` // base64-encoded ed25519 public key
 }
 
+// -------------------------- Guardian State --------------------------
+type guardianState struct {
+    Owner      string `cbor:"o"`
+}
 // ==================== SCALABILITY: FULL PRUNING + AGGRESSIVE COMPRESSION ====================
 
 // Configurable: number of recent blocks to keep in FULL detail (with transactions).
@@ -66,6 +85,92 @@ func (b *Block) IsLightBlock() bool {
     return b.Transactions == nil || len(b.Transactions) == 0
 }
 
+// GuardianValidateBlockProducer verifies that the block producer
+// owns the registered identity
+// CONSENSUS CRITICAL — MinerAddress is the true owner.
+
+func (l *Ledger) GuardianValidateBlockProducer(blk *Block) error {
+	if l == nil || l.db == nil {
+		return fmt.Errorf("ledger not initialized")
+	}
+	if blk == nil {
+		return fmt.Errorf("nil block")
+	}
+
+	// -----------------------------
+	// 1. Normalize miner address
+	// -----------------------------
+	minerAddr := strings.ToLower(strings.TrimSpace(blk.Header.MinerAddress))
+	if minerAddr == "" {
+		return fmt.Errorf("missing miner address")
+	}
+
+	// Optional: enforce address prefix format (EXPLOSIVE standard)
+	if !strings.HasPrefix(minerAddr, "explo") {
+		return fmt.Errorf("invalid miner address format")
+	}
+
+	// -----------------------------
+	// 2. Fingerprint rules
+	// -----------------------------
+	fpHash := strings.ToLower(strings.TrimSpace(blk.Header.MinerFingerprintHash))
+
+	if blk.Header.Version >= 1 && fpHash == "" {
+		return fmt.Errorf("missing fingerprint hash (required since version 1)")
+	}
+
+	// Version 0 compatibility (legacy blocks)
+	if fpHash == "" {
+		return nil
+	}
+
+	// Basic sanity check (64 hex chars if SHA-256)
+	if len(fpHash) != 64 {
+		return fmt.Errorf("invalid fingerprint hash length")
+	}
+
+	// -----------------------------
+	// 3. Ownership validation
+	// -----------------------------
+	ownerKey := []byte("guardian:fp_owner:" + fpHash)
+
+	err := l.db.View(func(txn *badger.Txn) error {
+
+		item, err := txn.Get(ownerKey)
+		if err == badger.ErrKeyNotFound {
+			// First time we see this fingerprint → allowed
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("guardian lookup failed: %w", err)
+		}
+
+		ownerBytes, err := item.ValueCopy(nil)
+		if err != nil {
+			return fmt.Errorf("guardian read failed: %w", err)
+		}
+
+		storedOwner := strings.ToLower(strings.TrimSpace(string(ownerBytes)))
+		if storedOwner == "" {
+			return fmt.Errorf("guardian state corrupted (empty owner)")
+		}
+
+		if storedOwner != minerAddr {
+			return fmt.Errorf(
+				"fingerprint already bound to another miner (fp=%s)",
+				fpHash[:12]+"...",
+			)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
 // PruneToLight converts a full block into a light block.
 //
 // This method explicitly releases the transaction slice,
@@ -168,161 +273,243 @@ func (l *Ledger) PruneOldBlocks() error {
     return nil
 }
 
-// ApplyBlock validates, persists, and commits a block to the ledger.
+// ApplyBlock validates and atomically commits a block to the ledger.
 //
-// Responsibilities:
-//   1. Enforce single-chain (no fork at same height)
-//   2. Perform full consensus validation
-//   3. Persist block atomically using compressed batch storage
-//   4. Trigger controlled asynchronous pruning (non-blocking)
+// This function represents the final consensus gate before a block
+// becomes part of the canonical chain. It enforces:
 //
-// This function is part of the critical consensus path.
-// Any expensive maintenance task (e.g. pruning) is deliberately
-// executed asynchronously to preserve low block acceptance latency.
+//   • Single-chain (UniLedger) fork prevention
+//   • Deterministic height assignment (ledger authority)
+//   • Full consensus validation (including Guardian rules)
+//   • Atomic state transitions (Badger transaction)
+//   • Supply cap enforcement
+//   • Miner indexing and identity tracking
+//
+// The entire state transition is executed inside a single Badger
+// transaction to guarantee atomicity and deterministic replay.
+//
+// Non-consensus side effects (pruning, blessings distribution)
+// are executed asynchronously after commit.
 func (l *Ledger) ApplyBlock(blk *Block) error {
-    if l == nil || l.db == nil {
-        return fmt.Errorf("ledger not initialized")
-    }
+	// ------------------------------------------------------------------
+	// Basic sanity check
+	// ------------------------------------------------------------------
+	if l == nil || l.db == nil {
+		return fmt.Errorf("ledger not initialized")
+	}
+	if blk == nil {
+		return fmt.Errorf("nil block")
+	}
 
-    // ------------------------------------------------------------------
-// 1) Load previous block by HASH (ledger authority)
-// ------------------------------------------------------------------
-var prev *Block
+	// ------------------------------------------------------------------
+	// 1️⃣ Resolve previous block
+	// ------------------------------------------------------------------
+	var prev *Block
+	if blk.Header.PrevHash != "" {
+		var err error
+		prev, err = l.GetBlockByHash(blk.Header.PrevHash)
+		if err != nil || prev == nil {
+			return fmt.Errorf("missing previous block %s: %w", blk.Header.PrevHash, err)
+		}
+		blk.Header.Height = prev.Header.Height + 1
+	} else {
+		blk.Header.Height = 0
+	}
 
-if blk.Header.PrevHash != "" {
-    var err error
-    prev, err = l.GetBlockByHash(blk.Header.PrevHash)
-    if err != nil || prev == nil {
-        return fmt.Errorf(
-            "missing previous block with hash %s",
-            blk.Header.PrevHash,
-        )
-    }
+	// ------------------------------------------------------------------
+	// 2️⃣ Fork protection
+	// ------------------------------------------------------------------
+	if existing, err := l.GetBlockByHeight(blk.Header.Height); err == nil && existing != nil {
+		return fmt.Errorf("fork rejected at height %d", blk.Header.Height)
+	}
 
-    // ✅ Ledger assigns height
-    blk.Header.Height = prev.Header.Height + 1
-} else {
-    // Genesis case
-    blk.Header.Height = 0
-}
+	// ------------------------------------------------------------------
+	// 3️⃣ Consensus validation (includes PoW + time rules)
+	// ------------------------------------------------------------------
+	if err := blk.Validate(prev, l); err != nil {
+		log.Printf("❌ Block #%d rejected: %v", blk.Header.Height, err)
+		return fmt.Errorf("block validation failed: %w", err)
+	}
 
-// ------------------------------------------------------------------
-// 2) Enforce UniLedger rule: no fork at same height
-// ------------------------------------------------------------------
-if existing, err := l.GetBlockByHeight(blk.Header.Height); err == nil && existing != nil {
-    return fmt.Errorf(
-        "fork rejected: block already exists at height %d",
-        blk.Header.Height,
-    )
-}
+	// ------------------------------------------------------------------
+	// 4️⃣ Guardian validation
+	// ------------------------------------------------------------------
+	if blk.Header.Version >= 1 {
+		if err := l.GuardianValidateBlockProducer(blk); err != nil {
+			return fmt.Errorf("guardian validation failed: %w", err)
+		}
+	}
 
-// ------------------------------------------------------------------
-// 3) Consensus validation
-// ------------------------------------------------------------------
-if err := blk.Validate(prev, l); err != nil {
-    log.Printf("❌ Block #%d rejected: %v", blk.Header.Height, err)
+	// ------------------------------------------------------------------
+	// 5️⃣ TIME-JACKING HARD FIX
+	// DayStart must fall within the current network UTC day window.
+	// Prevents miners from backdating or forward-dating their PoW.
+	// ------------------------------------------------------------------
+	now := time.Now().UnixMilli()
+	if blk.Header.DailyPoW != nil {
+		day := blk.Header.DailyPoW.DayStart
 
-    _ = l.PutObject(
-        []byte(fmt.Sprintf("quarantine:block:%d", blk.Header.Height)),
-        blk,
-    )
+		// Reject extreme future timestamps.
+		if day > now+10*60*1000 {
+			return fmt.Errorf("PoW timestamp too far in future")
+		}
 
-    return fmt.Errorf("block validation failed: %w", err)
-}
+		// Reject PoW not anchored to the previous block (anti time-jacking).
+		if prev != nil && blk.Header.DailyPoW.PrevBlockHash != prev.BlockHash {
+			return fmt.Errorf("PoW not anchored to previous block (anti time-jacking)")
+		}
+	}
 
-    // ------------------------------------------------------------------
-// 4) Atomic persistence (CONSENSUS CRITICAL)
-// ------------------------------------------------------------------
-if err := l.DB().Update(func(txn *badger.Txn) error {
+	// ------------------------------------------------------------------
+	// 6️⃣ Atomic commit
+	// ------------------------------------------------------------------
+	err := l.db.Update(func(txn *badger.Txn) error {
 
-    // --------------------------------------------------
-    // a) Persist block (canonical CBOR)
-// --------------------------------------------------
-    blockKey := []byte(fmt.Sprintf("block:%d", blk.Header.Height))
+		rawData, err := cbor.Marshal(blk)
+		if err != nil {
+			return fmt.Errorf("CBOR marshal failed: %w", err)
+		}
 
-    data, err := cbor.Marshal(blk)
-    if err != nil {
-        return fmt.Errorf("CBOR marshal failed: %w", err)
-    }
+		compressedData, err := compressor.CompressZSTD(rawData)
+		if err != nil {
+			log.Printf("[WARN] Compression failed block #%d", blk.Header.Height)
+			compressedData = rawData
+		}
 
-    if err := txn.Set(blockKey, data); err != nil {
-        return fmt.Errorf("block persist failed: %w", err)
-    }
+		if err := txn.Set(blockKeyByHeight(blk.Header.Height), compressedData); err != nil {
+			return err
+		}
 
-    // --------------------------------------------------
-    // b) Daily PoW anti-replay index
-    // --------------------------------------------------
-    if blk.Header.DailyPoW != nil {
-        powKey := []byte(fmt.Sprintf(
-            "daily_pow:%s:%d",
-            blk.Header.MinerAddress,
-            blk.Header.DailyPoW.DayStart,
-        ))
+		// ------------------------------------------------------------------
+		// 7️⃣ Process transactions — reward + IMANI minting
+		// ------------------------------------------------------------------
+		var minted uint64
+		rewardCount := 0
 
-        if err := txn.Set(powKey, []byte{1}); err != nil {
-            return fmt.Errorf("daily PoW index write failed: %w", err)
-        }
-    }
+		for _, tx := range blk.Transactions {
+			if err := l.persistTransactionIndexes(txn, &tx); err != nil {
+				return err
+			}
 
-    // --------------------------------------------------
-    // c) Circulating supply (incremental, legacy-safe)
-    // --------------------------------------------------
-    var minted uint64
+			if tx.IsReward {
+				rewardCount++
+				if rewardCount > 1 {
+					return fmt.Errorf("multiple reward transactions not allowed")
+				}
 
-    for _, tx := range blk.Transactions {
-        if tx.IsReward && tx.AmountEXP > 0 {
-            minted += uint64(tx.AmountEXP * 1e8)
-        }
-    }
+				if tx.To != blk.Header.MinerAddress {
+					return fmt.Errorf("invalid reward recipient")
+				}
 
-    if minted > 0 {
-        if err := incU64(txn, "meta:circulating_pastabo", minted); err != nil {
-            return err
-        }
-    }
+				minted += tx.AmountPastabo
 
-    // --------------------------------------------------
-    // d) Miner first-seen tracking (idempotent)
-    // --------------------------------------------------
-    minerKey := []byte("miner_seen:" + blk.Header.MinerAddress)
+				// Load existing balance.
+				balKey := []byte("balance:" + tx.To)
+				var bal Balance
 
-    if _, err := txn.Get(minerKey); err == badger.ErrKeyNotFound {
+				item, err := txn.Get(balKey)
+				if err == nil {
+					val, _ := item.ValueCopy(nil)
+					_ = cbor.Unmarshal(val, &bal)
+				}
 
-        if err := txn.Set(minerKey, []byte{1}); err != nil {
-            return err
-        }
+				// Credit EXPLO reward.
+				bal.EXPLO += tx.AmountPastabo
 
-        if err := incU64(txn, "meta:miners_count", 1); err != nil {
-            return err
-        }
-    }
+				// FIX: Credit IMANI alongside EXPLO in the same atomic operation.
+				// IMANI represents the miner's accumulated consciousness on-chain.
+				// It must be minted here so it is reconstructed correctly when a
+				// miner restores their identity on a new device via block sync.
+				// Without this fix, IMANI would be lost on every device change.
+				if tx.AmountIMPastabo > 0 {
+					bal.IMANI += tx.AmountIMPastabo
+					bal.TotalIMANIReceived += tx.AmountIMPastabo
+				}
 
-    return nil
-}); err != nil {
-    return fmt.Errorf("atomic block commit failed: %w", err)
-}
+				enc, _ := cbor.Marshal(&bal)
+				if err := txn.Set(balKey, enc); err != nil {
+					return err
+				}
+			}
+		}
 
-    // ------------------------------------------------------------------
-    // 5) Async pruning (NON-CONSENSUS)
-    // ------------------------------------------------------------------
-    if blk.Header.Height > 0 && blk.Header.Height%100 == 0 {
-        go func(h uint64) {
-            if err := l.PruneOldBlocks(); err != nil {
-                log.Printf("[scaling] prune error at %d: %v", h, err)
-            }
-        }(blk.Header.Height)
-    }
+		// ------------------------------------------------------------------
+		// 8️⃣ Strict 1 block per day per miner rule
+		// ------------------------------------------------------------------
+		if blk.Header.DailyPoW != nil {
+			key := []byte(fmt.Sprintf(
+				"daily_pow:%s:%d",
+				blk.Header.MinerAddress,
+				blk.Header.DailyPoW.DayStart,
+			))
 
-    // ------------------------------------------------------------------
-    // 6) Confirmation
-    // ------------------------------------------------------------------
-    log.Printf(
-        "✅ Block #%d committed — %s",
-        blk.Header.Height,
-        blk.BlockHash,
-    )
+			_, err := txn.Get(key)
+			if err != badger.ErrKeyNotFound {
+				return fmt.Errorf("double mining attempt detected (1/day rule)")
+			}
 
-    return nil
+			if err := txn.Set(key, []byte{1}); err != nil {
+				return err
+			}
+
+			// Audit trail for governance and dispute resolution.
+			audit := []byte(fmt.Sprintf(
+				"daily_pow_audit:%s:%d:%d",
+				blk.Header.MinerAddress,
+				blk.Header.DailyPoW.DayStart,
+				blk.Header.Height,
+			))
+			_ = txn.Set(audit, []byte{1})
+		}
+
+		// ------------------------------------------------------------------
+		// 9️⃣ Supply cap enforcement — inviolable 50M EXPLO ceiling
+		// ------------------------------------------------------------------
+		if minted > 0 {
+			key := []byte("meta:circulating_pastabo")
+
+			item, err := txn.Get(key)
+			var current uint64
+			if err == nil {
+				val, _ := item.ValueCopy(nil)
+				current = binary.BigEndian.Uint64(val)
+			}
+
+			if current+minted > MaxPastaboSupply {
+				return fmt.Errorf("supply cap exceeded")
+			}
+
+			buf := make([]byte, 8)
+			binary.BigEndian.PutUint64(buf, current+minted)
+
+			if err := txn.Set(key, buf); err != nil {
+				return err
+			}
+		}
+
+		// ------------------------------------------------------------------
+		// 🔟 Update chain tip
+		// ------------------------------------------------------------------
+		tipBuf := make([]byte, 8)
+		binary.BigEndian.PutUint64(tipBuf, blk.Header.Height)
+
+		return txn.Set(MetaChainTip, tipBuf)
+	})
+
+	if err != nil {
+		return fmt.Errorf("atomic block commit failed: %w", err)
+	}
+
+	// ------------------------------------------------------------------
+	// Async post-commit tasks (non-blocking, non-consensus-critical)
+	// ------------------------------------------------------------------
+	if blk.Header.Height%100 == 0 {
+		go l.PruneOldBlocks()
+	}
+	go l.TryDistributeBlessings(blk)
+
+	log.Printf("✅ Block #%d committed", blk.Header.Height)
+	return nil
 }
 
 // ---------------- Block Creation (Mainnet Ready) ----------------
@@ -337,15 +524,22 @@ func NewBlock(
     txs []Transaction,
     nonce uint64,
 ) (*Block, error) {
-    // Basic structural validation
+
+    // ------------------------------------------------------------------
+    // 1) Basic validation
+    // ------------------------------------------------------------------
     if miner == "" {
         return nil, errors.New("miner address cannot be empty")
     }
 
-    // Genesis rule: prevHash must be empty ONLY for height 0
-    if height == 0 {
-        if prevHash != "" {
-            return nil, errors.New("genesis block must have empty prevHash")
+    // ------------------------------------------------------------------
+    // 2) Genesis vs non-genesis rules
+    // ------------------------------------------------------------------
+    isGenesis := prevHash == ""
+
+    if isGenesis {
+        if len(txs) == 0 {
+            return nil, errors.New("genesis block must contain at least one transaction")
         }
     } else {
         if prevHash == "" {
@@ -353,29 +547,38 @@ func NewBlock(
         }
     }
 
-    // Compute Merkle root using consensus-grade function
-    merkleRoot, err := ComputeMerkleRoot(txs)
+    // ------------------------------------------------------------------
+    // 3) Merkle root (VERSIONED CONSENSUS)
+    // ------------------------------------------------------------------
+    merkleRoot, err := ComputeMerkleRoot(txs, 1)
     if err != nil {
         return nil, fmt.Errorf("invalid transactions: %w", err)
     }
 
-    // Modern block header with version
+    // ------------------------------------------------------------------
+    // 4) Block header construction
+    // ------------------------------------------------------------------
     header := BlockHeader{
         Height:       height,
         PrevHash:     prevHash,
-        Timestamp:    NowMillis(), // validated at acceptance time
+        Timestamp:    NowMillis(),
         Nonce:        nonce,
         MinerAddress: miner,
         MerkleRoot:   merkleRoot,
-        Version:      1,           // All newly created blocks are version 1+
+        Version:      1, // force modern consensus
     }
 
+    // ------------------------------------------------------------------
+    // 5) Build block
+    // ------------------------------------------------------------------
     block := &Block{
         Header:       header,
         Transactions: txs,
     }
 
-    // Final block hash (must hash header ONLY, canonically)
+    // ------------------------------------------------------------------
+    // 6) Final hash (canonical header-only hashing)
+    // ------------------------------------------------------------------
     block.BlockHash = block.ComputeFinalHash()
 
     return block, nil
@@ -406,8 +609,16 @@ func (b *Block) SignBlock(privKey ed25519.PrivateKey) error {
 // VerifySignature checks the Ed25519 signature of the block.
 // Returns (true, nil) if the signature is valid or missing (backward compatible).
 func (b *Block) VerifySignature() (bool, error) {
+
+    // 🔒 Enforce signature for modern blocks
+    if b.Header.Version >= 1 {
+        if b.Signature == "" || b.PublicKey == "" {
+            return false, fmt.Errorf("missing signature for version >=1 block")
+        }
+    }
+
+    // Legacy compatibility
     if b.Signature == "" || b.PublicKey == "" {
-        // No signature present — valid for backward compatibility
         return true, nil
     }
 
@@ -429,9 +640,11 @@ func (b *Block) VerifySignature() (bool, error) {
     }
 
     msg := b.ComputeHashData()
+
     if !ed25519.Verify(ed25519.PublicKey(pubBytes), msg, sigBytes) {
         return false, nil
     }
+
     return true, nil
 }
 
@@ -439,9 +652,8 @@ func (b *Block) VerifySignature() (bool, error) {
 // This function is backward-compatible: legacy blocks (without network anchoring) are accepted with minimal checks.
 // Modern blocks (with PrevBlockHash anchor) undergo strict network-bound validation.
 func (b *Block) Validate(prevBlock *Block, ledger *Ledger) error {
-
     // ------------------------------------------------------------------
-    // 1) Hash integrity
+    // 1) Hash integrity (full block canonical hash)
     // ------------------------------------------------------------------
     if b.BlockHash != b.ComputeFinalHash() {
         return errors.New("invalid block hash")
@@ -451,6 +663,7 @@ func (b *Block) Validate(prevBlock *Block, ledger *Ledger) error {
     // 2) Chain continuity
     // ------------------------------------------------------------------
     if b.Header.Height == 0 {
+        // Genesis block
         if prevBlock != nil || b.Header.PrevHash != "" {
             return errors.New("invalid genesis linkage")
         }
@@ -458,21 +671,22 @@ func (b *Block) Validate(prevBlock *Block, ledger *Ledger) error {
         if prevBlock == nil {
             return errors.New("missing previous block")
         }
-        // Height is informational; continuity is hash-based
-if b.Header.Height != prevBlock.Header.Height+1 {
-    log.Printf(
-        "⚠️ height adjusted: expected %d got %d",
-        prevBlock.Header.Height+1,
-        b.Header.Height,
-    )
-}
+
+        if b.Header.Height != prevBlock.Header.Height+1 {
+            return fmt.Errorf(
+                "height mismatch: expected %d got %d",
+                prevBlock.Header.Height+1,
+                b.Header.Height,
+            )
+        }
+
         if b.Header.PrevHash != prevBlock.BlockHash {
             return errors.New("prevHash mismatch")
         }
     }
 
     // ------------------------------------------------------------------
-    // 3) Time strictly chained (not wall-clock trusted)
+    // 3) Time validation (anti time-jacking)
     // ------------------------------------------------------------------
     if b.Header.Timestamp <= 0 {
         return errors.New("invalid timestamp")
@@ -482,27 +696,29 @@ if b.Header.Height != prevBlock.Header.Height+1 {
         return errors.New("timestamp must increase from previous block")
     }
 
-    // soft drift safety
     now := time.Now().UnixMilli()
-    if b.Header.Timestamp > now+2*60*60*1000 {
+
+    // Max future drift: 30 minutes
+    if b.Header.Timestamp > now+30*60*1000 {
         return errors.New("timestamp too far in future")
     }
 
     // ------------------------------------------------------------------
-    // 4) Merkle root (full blocks only)
+    // 4) Merkle root validation (versioned, consensus-safe)
     // ------------------------------------------------------------------
     if !b.IsLightBlock() {
-        root, err := ComputeMerkleRoot(b.Transactions)
+        root, err := ComputeMerkleRoot(b.Transactions, b.Header.Version)
         if err != nil {
             return err
         }
+
         if root != b.Header.MerkleRoot {
             return errors.New("merkle root mismatch")
         }
     }
 
     // ------------------------------------------------------------------
-    // 5) Signature
+    // 5) Signature validation (Ed25519)
     // ------------------------------------------------------------------
     ok, err := b.VerifySignature()
     if err != nil || !ok {
@@ -510,21 +726,35 @@ if b.Header.Height != prevBlock.Header.Height+1 {
     }
 
     // ------------------------------------------------------------------
-    // 6) Legacy-tolerant miner binding
+    // 6) Miner binding (EXPLOSIVE identity model)
     // ------------------------------------------------------------------
-    if b.PublicKey != "" {
-        pub, _ := base64.StdEncoding.DecodeString(b.PublicKey)
-        if len(pub) == ed25519.PublicKeySize {
-            addr := address.FromEd25519PublicKey(ed25519.PublicKey(pub))
-            if addr != b.Header.MinerAddress {
-                log.Printf("legacy miner accepted: %s → %s",
-                    addr, b.Header.MinerAddress)
-            }
+    if b.Header.MinerAddress == "" {
+        return errors.New("missing miner address")
+    }
+
+    // Deterministic address format validation
+    if !address.IsValidEXPLOAddress(b.Header.MinerAddress) {
+        return errors.New("invalid miner address format")
+    }
+
+    // Modern blocks require a valid public key
+    if b.Header.Version >= 1 {
+        if b.PublicKey == "" {
+            return errors.New("missing public key")
+        }
+
+        pubBytes, err := base64.StdEncoding.DecodeString(b.PublicKey)
+        if err != nil {
+            return fmt.Errorf("invalid public key encoding")
+        }
+
+        if len(pubBytes) != ed25519.PublicKeySize {
+            return errors.New("invalid public key size")
         }
     }
 
     // ------------------------------------------------------------------
-    // 7) Daily PoW (legacy + modern)
+    // 7) Daily PoW (strict consensus rules)
     // ------------------------------------------------------------------
     if b.Header.DailyPoW == nil {
         return errors.New("missing DailyPoW")
@@ -532,22 +762,26 @@ if b.Header.Height != prevBlock.Header.Height+1 {
 
     pow := b.Header.DailyPoW
 
-    if pow.PrevBlockHash == "" {
-
-        // 🕯 legacy mode
-        if !VerifyDailyPoWLegacy(b.Header.MinerAddress, *pow) {
-            return errors.New("invalid legacy PoW")
+    if b.Header.Version >= 1 {
+        // Must be anchored to previous block
+        if pow.PrevBlockHash == "" {
+            return errors.New("missing anchored PrevBlockHash in PoW")
         }
 
-    } else {
+        if prevBlock != nil && pow.PrevBlockHash != prevBlock.BlockHash {
+            return errors.New("PoW not anchored to previous block")
+        }
 
-        // 🔐 modern anchored mode
+        if prevBlock == nil {
+            return errors.New("missing previous block for PoW validation")
+        }
+
         if !VerifyDailyPoW(
             b.Header.MinerAddress,
             *pow,
             prevBlock.BlockHash,
         ) {
-            return errors.New("anchored PoW verification failed")
+            return errors.New("invalid PoW")
         }
 
         expectedDiff := getDailyPoWDifficulty(ledger)
@@ -558,10 +792,30 @@ if b.Header.Height != prevBlock.Header.Height+1 {
                 pow.Difficulty,
             )
         }
+
+    } else {
+        // Legacy validation
+        if !VerifyDailyPoWLegacy(b.Header.MinerAddress, *pow) {
+            return errors.New("invalid legacy PoW")
+        }
     }
 
     // ------------------------------------------------------------------
-    // 8) One PoW per day per miner (chain-based)
+    // 8) Anti Time-Jacking on DayStart
+    // ------------------------------------------------------------------
+    expectedDayStart := (b.Header.Timestamp / 86400000) * 86400000
+
+    if pow.DayStart != expectedDayStart {
+        return errors.New("invalid DayStart (not aligned with timestamp)")
+    }
+
+    // Prevent extreme future timestamps
+    if pow.DayStart > now+60*60*1000 {
+        return errors.New("invalid future PoW timestamp")
+    }
+
+    // ------------------------------------------------------------------
+    // 9) One PoW per day per miner (chain-level enforcement)
     // ------------------------------------------------------------------
     if ledger != nil {
         mined, err := ledger.HasDailyPoW(
@@ -571,6 +825,7 @@ if b.Header.Height != prevBlock.Header.Height+1 {
         if err != nil {
             return err
         }
+
         if mined {
             return errors.New("double daily PoW detected")
         }
@@ -578,4 +833,3 @@ if b.Header.Height != prevBlock.Header.Height+1 {
 
     return nil
 }
-

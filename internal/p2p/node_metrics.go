@@ -1,134 +1,175 @@
 package p2p
 
 import (
-    "bytes"
-    "fmt"
-    "time"
+	"crypto/ed25519"
+	"fmt"
+	"sync"
+	"time"
 
-    "explosive/internal/ledger"
-    "github.com/dgraph-io/badger/v4"
+	"github.com/fxamacker/cbor/v2"
+	"golang.org/x/crypto/sha3"
+
+	"explosive/internal/ledger"
+	"explosive/internal/scan"
 )
 
-// MetricsData holds live chain statistics.
-type MetricsData struct {
-	Timestamp       int64   `json:"timestamp"`
-	MaxSupply       float64 `json:"max_supply"`   // in EXPLO for human readability
-	Circulating     float64 `json:"circulating"`
-	TotalHolders    int     `json:"total_holders"`
-	MinersCount     int     `json:"miners_count"`
-	MinersRemaining int     `json:"miners_remaining"`
+// MetricsData is canonical structure from scan package
+type MetricsData = scan.MetricsData
+
+// SignedMetrics wraps canonical metrics with a signature
+type SignedMetrics struct {
+	Metrics   *MetricsData `cbor:"metrics"`
+	Signature []byte       `cbor:"signature"`
+	NodeID    string       `cbor:"node_id"`
 }
 
-// GatherMetrics calculates live metrics directly from the ledger DB.
-// Logic fully mirrors internal/scan/exploscan.go
+// -----------------------------------------------------------------------------
+// Configuration — Mobile Safe
+// -----------------------------------------------------------------------------
+
+const (
+	metricsBroadcastInterval = 30 * time.Second
+)
+
+var (
+	lastBroadcastTime time.Time
+	lastMetricsHash   [32]byte
+	metricsLock       sync.Mutex
+
+	// Canonical CBOR encoder (deterministic across all nodes)
+	canonicalCBOR, _ = cbor.CanonicalEncOptions().EncMode()
+)
+
+// Broadcaster defines minimal broadcast capability.
+type Broadcaster interface {
+	BroadcastMessage(msgType string, payload any) error
+}
+
+// -----------------------------------------------------------------------------
+// GatherMetrics — deterministic
+// -----------------------------------------------------------------------------
+
 func GatherMetrics(l *ledger.Ledger) (*MetricsData, error) {
-    if l == nil || l.DB() == nil {
-        return nil, fmt.Errorf("ledger not initialized")
-    }
-    db := l.DB()
-
-    var maxSupply uint64
-    var circulating float64
-    var minersCount int
-    var balancesCount int
-    minerIDs := make(map[string]struct{})
-    balanceHasMiner := make(map[string]bool)
-
-    // 1️⃣ MaxSupply
-    if maxSupply == 0 {
-	maxSupply = ledger.MaxPastaboSupply
+	if l == nil || l.DB() == nil {
+		return nil, fmt.Errorf("ledger not initialized")
+	}
+	return scan.GatherMetrics(l)
 }
 
-    // try read from DB
-    _ = db.View(func(txn *badger.Txn) error {
-        item, err := txn.Get([]byte("meta:max_supply"))
-        if err == nil {
-            val, err := item.ValueCopy(nil)
-            if err == nil && len(val) >= 8 {
-                var v uint64
-                for i := 0; i < 8; i++ {
-                    v = (v << 8) | uint64(val[i])
-                }
-                maxSupply = v
-            }
-        }
-        return nil
-    })
+// -----------------------------------------------------------------------------
+// hashMetrics — SHA3-256 canonical
+// -----------------------------------------------------------------------------
 
-    // fallback if still zero
-    if maxSupply == 0 {
-        maxSupply = 50_000_000
-    }
+func hashMetrics(m *MetricsData) ([32]byte, error) {
+	var empty [32]byte
 
-    // 2️⃣ Count miners
-    _ = db.View(func(txn *badger.Txn) error {
-        opts := badger.DefaultIteratorOptions
-        opts.PrefetchValues = false
-        it := txn.NewIterator(opts)
-        defer it.Close()
+	if m == nil {
+		return empty, fmt.Errorf("nil metrics")
+	}
 
-        for it.Seek([]byte("miner:")); it.ValidForPrefix([]byte("miner:")); it.Next() {
-            id := string(bytes.TrimPrefix(it.Item().Key(), []byte("miner:")))
-            if id != "" {
-                minerIDs[id] = struct{}{}
-            }
-        }
-        return nil
-    })
-    minersCount = len(minerIDs)
+	data, err := canonicalCBOR.Marshal(m)
+	if err != nil {
+		return empty, err
+	}
 
-    // 3️⃣ Sum balances and count holders
-    _ = db.View(func(txn *badger.Txn) error {
-        it := txn.NewIterator(badger.DefaultIteratorOptions)
-        defer it.Close()
-
-        for it.Seek([]byte("balance:")); it.ValidForPrefix([]byte("balance:")); it.Next() {
-            id := string(bytes.TrimPrefix(it.Item().Key(), []byte("balance:")))
-            if id == "" {
-                continue
-            }
-            bal := &ledger.Balance{}
-            if err := l.GetObject(it.Item().Key(), bal); err != nil {
-                continue
-            }
-            balancesCount++
-            circulating += bal.EXPLO
-            if _, ok := minerIDs[id]; ok {
-                balanceHasMiner[id] = true
-            }
-        }
-        return nil
-    })
-
-    // 4️⃣ Compute total holders
-    nonMinerHolders := balancesCount - len(balanceHasMiner)
-    if nonMinerHolders < 0 {
-        nonMinerHolders = 0
-    }
-    totalHolders := minersCount + nonMinerHolders
-
-    // 5️⃣ Compute miners remaining until next halving
-    minersRemaining := computeMinersToNextHalving(minersCount)
-
-    // return metrics
-    return &MetricsData{
-        Timestamp:       time.Now().Unix(),
-        MaxSupply: float64(maxSupply) / float64(ledger.PastaboPerEXPLO),
-        Circulating:     circulating,
-        TotalHolders:    totalHolders,
-        MinersCount:     minersCount,
-        MinersRemaining: minersRemaining,
-    }, nil
+	return sha3.Sum256(data), nil
 }
 
-// computeMinersToNextHalving returns deterministic number of miners
-// remaining to next halving threshold
-func computeMinersToNextHalving(current int) int {
-    thresholds := []int{100_000, 200_000, 500_000, 600_000, 1_000_000}
-    for _, t := range thresholds {
-        if current < t {
-            return t - current
-        }
-    }
-    return 0
+// -----------------------------------------------------------------------------
+// SignMetrics — deterministic CBOR signature
+// -----------------------------------------------------------------------------
+
+func SignMetrics(metrics *MetricsData, privKey ed25519.PrivateKey, nodeID string) (*SignedMetrics, error) {
+	if metrics == nil {
+		return nil, fmt.Errorf("metrics nil")
+	}
+
+	if len(privKey) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("invalid private key")
+	}
+
+	data, err := canonicalCBOR.Marshal(metrics)
+	if err != nil {
+		return nil, err
+	}
+
+	signature := ed25519.Sign(privKey, data)
+
+	return &SignedMetrics{
+		Metrics:   metrics,
+		Signature: signature,
+		NodeID:    nodeID,
+	}, nil
+}
+
+// -----------------------------------------------------------------------------
+// SafeBroadcastMetrics — Deterministic + Rate Limited + Differential
+// -----------------------------------------------------------------------------
+
+func SafeBroadcastMetrics(
+	l *ledger.Ledger,
+	b Broadcaster,
+	privKey ed25519.PrivateKey,
+	nodeID string,
+) {
+	if l == nil || b == nil {
+		return
+	}
+
+	metricsLock.Lock()
+
+	// Rate limit protection
+	if time.Since(lastBroadcastTime) < metricsBroadcastInterval {
+		metricsLock.Unlock()
+		return
+	}
+
+	lastBroadcastTime = time.Now()
+	metricsLock.Unlock()
+
+	go func() {
+
+		metrics, err := GatherMetrics(l)
+		if err != nil {
+			return
+		}
+
+		hash, err := hashMetrics(metrics)
+		if err != nil {
+			return
+		}
+
+		metricsLock.Lock()
+
+		// Differential broadcast protection
+		if hash == lastMetricsHash {
+			metricsLock.Unlock()
+			return
+		}
+
+		lastMetricsHash = hash
+		metricsLock.Unlock()
+
+		// Sign metrics
+		signedMetrics, err := SignMetrics(metrics, privKey, nodeID)
+		if err != nil {
+			return
+		}
+
+		// Broadcast signed metrics
+		_ = b.BroadcastMessage("SIGNED_METRICS", signedMetrics)
+	}()
+}
+
+// -----------------------------------------------------------------------------
+// HookAfterBlock — Call After Any Chain Change
+// -----------------------------------------------------------------------------
+
+func HookAfterBlock(
+	l *ledger.Ledger,
+	b Broadcaster,
+	privKey ed25519.PrivateKey,
+	nodeID string,
+) {
+	SafeBroadcastMetrics(l, b, privKey, nodeID)
 }

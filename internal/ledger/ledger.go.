@@ -298,7 +298,7 @@ func (l *Ledger) ListAllMiners() ([]Miner, error) {
     }
 
     miners := []Miner{}
-    prefix := []byte("miner:") // Tous les mineurs sont stockés avec cette clé
+    prefix := []byte(PrefixMiner) // Tous les mineurs sont stockés avec cette clé
 
     err := l.db.View(func(txn *badger.Txn) error {
         it := txn.NewIterator(badger.DefaultIteratorOptions)
