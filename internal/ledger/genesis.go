@@ -12,7 +12,7 @@ const GenesisEXPLO uint64 = 10
 const GenesisTimestamp int64 = 1704067200000
 
 // OFFICIAL MAINNET GENESIS HASH (IMMUTABLE)
-const GenesisBlockHash = "41231e100f0b6a14061af87a2ea084db972f687b3eef11fb831a4f9d9cb726e8"
+const GenesisBlockHash = "3aea0eefc0225904726b65729b9d197c62d55ae6514e6576dc273e3f06951398"
 
 // zero hash (32 bytes)
 var zeroHash = make([]byte, 32)
