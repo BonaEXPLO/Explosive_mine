@@ -93,12 +93,38 @@ type Node struct {
 
 	Ledger *ledger.Ledger
 
+	// ------------------------------------------------------------------
+	// WALLET PUBLIC IDENTITY
+	// ------------------------------------------------------------------
+	// The wallet address and public key are public identity data.
+	// Private keys, passwords, mnemonics and sacred words must never
+	// be stored here or transmitted through P2P.
+	walletIdentityMu sync.RWMutex
+	walletAddress    string
+	walletPublicKey  []byte
+
+	// ------------------------------------------------------------------
+	// WALLET SIGNER
+	// ------------------------------------------------------------------
+	// The P2P node never stores a private key or wallet password.
+	// Signing is delegated to the wallet layer through this callback.
+	//
+	// The callback receives data to sign and returns the Ed25519
+	// signature. Private key handling remains entirely outside P2P.
+	walletSignerMu sync.RWMutex
+	walletSigner   func([]byte) ([]byte, error)
+
 	Peers      []*Peer
 	PeersMutex sync.RWMutex
 
-	// TLS identity cache
+	// ------------------------------------------------------------------
+	// TLS IDENTITY CACHE
+	// ------------------------------------------------------------------
 	tlsPeerCache sync.Map
 
+	// ------------------------------------------------------------------
+	// METRICS
+	// ------------------------------------------------------------------
 	metricsMu          sync.Mutex
 	numInvalidMessages int
 
@@ -117,7 +143,7 @@ type Node struct {
 	// NONCE TRACKING (ANTI-REPLAY / ANTI-SPAM)
 	// ------------------------------------------------------------------
 	nonceCount map[string]int // per-nonce tracking
-	nonceTotal int64          // global counter (atomic safe)
+	nonceTotal int64          // global counter
 	nonceMu    sync.Mutex
 
 	// ------------------------------------------------------------------
@@ -253,6 +279,101 @@ func NewNode(listenAddr, networkID, userAgent string, minerID string, sacredWord
 	go n.processIncoming()
 
 	return n, nil
+}
+
+func (n *Node) SetWalletIdentity(walletAddress string, publicKey []byte) error {
+	if n == nil {
+		return errors.New("nil P2P node")
+	}
+
+	walletAddress = strings.TrimSpace(walletAddress)
+	if walletAddress == "" {
+		return errors.New("wallet address is empty")
+	}
+
+	if len(publicKey) != ed25519.PublicKeySize {
+		return fmt.Errorf(
+			"invalid wallet public key size: got %d, want %d",
+			len(publicKey),
+			ed25519.PublicKeySize,
+		)
+	}
+
+	// Copy the public key so callers cannot mutate node identity
+	// through the original byte slice.
+	pubCopy := make([]byte, len(publicKey))
+	copy(pubCopy, publicKey)
+
+	n.walletIdentityMu.Lock()
+	n.walletAddress = walletAddress
+	n.walletPublicKey = pubCopy
+	n.walletIdentityMu.Unlock()
+
+	return nil
+}
+
+// SetWalletSigner configures the local wallet signing callback.
+//
+// SECURITY:
+//   - The P2P node does not receive or store a private key.
+//   - The P2P node does not receive or store a wallet password.
+//   - The wallet layer remains responsible for secure key handling.
+//   - Only the signing callback is retained by the node.
+func (n *Node) SetWalletSigner(signer func([]byte) ([]byte, error)) error {
+	if n == nil {
+		return errors.New("nil P2P node")
+	}
+
+	if signer == nil {
+		return errors.New("wallet signer is nil")
+	}
+
+	n.walletSignerMu.Lock()
+	n.walletSigner = signer
+	n.walletSignerMu.Unlock()
+
+	return nil
+}
+
+// signWalletData delegates signing to the configured wallet signer.
+//
+// The private key never enters the P2P package.
+func (n *Node) signWalletData(data []byte) ([]byte, error) {
+	if n == nil {
+		return nil, errors.New("nil P2P node")
+	}
+
+	if len(data) == 0 {
+		return nil, errors.New("data to sign is empty")
+	}
+
+	n.walletSignerMu.RLock()
+	signer := n.walletSigner
+	n.walletSignerMu.RUnlock()
+
+	if signer == nil {
+		return nil, errors.New("wallet signer is not configured")
+	}
+
+	signature, err := signer(data)
+	if err != nil {
+		return nil, fmt.Errorf("wallet signing failed: %w", err)
+	}
+
+	if len(signature) != ed25519.SignatureSize {
+		return nil, fmt.Errorf(
+			"invalid wallet signature size: got %d, want %d",
+			len(signature),
+			ed25519.SignatureSize,
+		)
+	}
+
+	// Copy the result so the callback cannot mutate the returned
+	// signature after this function returns.
+	sigCopy := make([]byte, len(signature))
+	copy(sigCopy, signature)
+
+	return sigCopy, nil
 }
 
 // normalizeListenAddr converts the provided listen address into a dual-stack compatible format.

@@ -13,16 +13,10 @@ import (
 	"explosive/internal/ledger"
 )
 
-// =============================================================================
-// BOOTSTRAP & SEED NODES
-// =============================================================================
-
-// BootstrapPeers contains hard-coded seed nodes used only for initial discovery.
-// Once the network has peers, it operates fully decentralized — true P2P resilience.
-// These IPs can be changed or removed entirely in production.
-var BootstrapPeers = []string{
-	"51.21.180.138:8443", // Official Explosive seed (change or add more as needed)
-}
+// BootstrapPeers contains optional initial peers used only for network discovery.
+// The network becomes fully decentralized after peers are connected.
+// No external seed is hard-coded into the node.
+var BootstrapPeers = []string{}
 
 // peerShard holds a subset of connected peers for lock sharding and high concurrency.
 type peerShard struct {
@@ -375,6 +369,7 @@ func (n *Node) startLightSyncCycles() {
 		}
 	}
 }
+
 // =============================================================================
 // SHARDING UTILITIES (internal)
 // =============================================================================
@@ -404,5 +399,5 @@ func pidHash(pid PeerID) int32 {
 // ClearBootstrapPeers vide la liste des seeds.
 // Appelé par le seed node lui-même pour éviter l'auto-connexion.
 func ClearBootstrapPeers() {
-    BootstrapPeers = []string{}
+	BootstrapPeers = []string{}
 }

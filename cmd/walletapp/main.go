@@ -40,6 +40,11 @@ var (
 	currentWallet  *wallet.Wallet
 	walletDB       *wallet.WalletDB
 	p2pNode        *p2p.Node
+
+	// Wallet signing session.
+	// The private key exists in memory only while the wallet is unlocked.
+	walletSessionMu   sync.RWMutex
+	walletSessionPriv ed25519.PrivateKey
 )
 
 // ---------- Utilities ----------
@@ -82,6 +87,8 @@ func startInactivityWatcher() {
 				lockMutex.Lock()
 				if !locked && time.Since(lastActivity) > InactiveTimeout {
 					locked = true
+					clearWalletSigningSession()
+
 					printlnL(
 						"🔒 Locked due to inactivity. Re-enter password to continue.",
 						"🔒 Verrouillé pour inactivité. Entrez le mot de passe pour continuer.",
@@ -95,6 +102,104 @@ func startInactivityWatcher() {
 	}()
 }
 
+// clearWalletSigningSession securely removes the private key
+// used for temporary wallet signing operations.
+func clearWalletSigningSession() {
+	walletSessionMu.Lock()
+	defer walletSessionMu.Unlock()
+
+	if walletSessionPriv != nil {
+		for i := range walletSessionPriv {
+			walletSessionPriv[i] = 0
+		}
+		walletSessionPriv = nil
+	}
+}
+
+// setWalletSigningSession decrypts and validates the wallet private key.
+// The private key remains in memory only while the wallet is unlocked.
+func setWalletSigningSession(w *wallet.Wallet, password string) error {
+	if w == nil {
+		return fmt.Errorf("wallet is nil")
+	}
+
+	privBytes, _, err := encryption.DecryptWallet(
+		w.EncryptedPriv,
+		password,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt wallet private key: %w", err)
+	}
+
+	if len(privBytes) != ed25519.PrivateKeySize {
+		for i := range privBytes {
+			privBytes[i] = 0
+		}
+		return fmt.Errorf("invalid wallet private key size")
+	}
+
+	priv := make(ed25519.PrivateKey, ed25519.PrivateKeySize)
+	copy(priv, privBytes)
+
+	for i := range privBytes {
+		privBytes[i] = 0
+	}
+
+	pub := priv.Public().(ed25519.PublicKey)
+
+	storedPub, err := w.PublicKeyBytes("")
+	if err != nil {
+		for i := range priv {
+			priv[i] = 0
+		}
+		return fmt.Errorf("failed to read wallet public key: %w", err)
+	}
+
+	if !ed25519.PublicKey(pub).Equal(ed25519.PublicKey(storedPub)) {
+		for i := range priv {
+			priv[i] = 0
+		}
+		return fmt.Errorf("wallet private/public key mismatch")
+	}
+
+	walletSessionMu.Lock()
+
+	if walletSessionPriv != nil {
+		for i := range walletSessionPriv {
+			walletSessionPriv[i] = 0
+		}
+	}
+
+	walletSessionPriv = priv
+
+	walletSessionMu.Unlock()
+
+	return nil
+}
+
+// signWithWalletSession signs data using the currently unlocked wallet.
+// The private key never leaves the wallet application.
+func signWithWalletSession(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("data to sign is empty")
+	}
+
+	walletSessionMu.RLock()
+	defer walletSessionMu.RUnlock()
+
+	if len(walletSessionPriv) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("wallet is locked or signing session is unavailable")
+	}
+
+	signature := ed25519.Sign(walletSessionPriv, data)
+
+	if len(signature) != ed25519.SignatureSize {
+		return nil, fmt.Errorf("invalid wallet signature size")
+	}
+
+	return signature, nil
+}
+
 func requireUnlock() error {
 	lockMutex.Lock()
 	if !locked {
@@ -106,21 +211,86 @@ func requireUnlock() error {
 	for {
 		printlnL("[1] Enter password 🔑", "[1] Entrer le mot de passe 🔑")
 		choice := prompt("Select (number): ")
-		if choice == "1" {
-			if currentWallet == nil {
-				return fmt.Errorf("no wallet loaded")
-			}
-			pw := prompt("Password: ")
-			_, err := currentWallet.RevealMnemonic(pw)
-			if err == nil {
-				lockMutex.Lock()
-				locked = false
-				lockMutex.Unlock()
-				updateActivity()
-				return nil
-			}
-			printlnL("❌ Incorrect password.", "❌ Mot de passe incorrect.")
+
+		if choice != "1" {
+			continue
 		}
+
+		if currentWallet == nil {
+			return fmt.Errorf("no wallet loaded")
+		}
+
+		pw := prompt("Password: ")
+
+		// Password verification is strictly local.
+		// The mnemonic and private key are decrypted only temporarily
+		// and are never sent to the P2P network.
+		privBytes, _, err := encryption.DecryptWallet(
+			currentWallet.EncryptedPriv,
+			pw,
+		)
+		if err != nil {
+			printlnL(
+				"❌ Incorrect password.",
+				"❌ Mot de passe incorrect.",
+			)
+			continue
+		}
+
+		// Always wipe the decrypted private key before returning.
+		defer func() {
+			for i := range privBytes {
+				privBytes[i] = 0
+			}
+		}()
+
+		// Verify that the decrypted private key still matches
+		// the wallet's stored public identity.
+		if len(privBytes) != ed25519.PrivateKeySize {
+			printlnL(
+				"❌ Invalid wallet private key.",
+				"❌ Clé privée du wallet invalide.",
+			)
+			continue
+		}
+
+		priv := ed25519.PrivateKey(privBytes)
+		pub := priv.Public().(ed25519.PublicKey)
+
+		storedPub, err := currentWallet.PublicKeyBytes("")
+		if err != nil {
+			return fmt.Errorf("failed to read wallet public key: %w", err)
+		}
+
+		if !ed25519.PublicKey(pub).Equal(ed25519.PublicKey(storedPub)) {
+			printlnL(
+				"❌ Wallet identity verification failed.",
+				"❌ La vérification de l'identité du wallet a échoué.",
+			)
+			continue
+		}
+
+		// Establish a temporary signing session for the unlocked wallet.
+		if err := setWalletSigningSession(currentWallet, pw); err != nil {
+			printlnL(
+				"❌ Failed to initialize wallet signing session.",
+				"❌ Impossible d'initialiser la session de signature du wallet.",
+			)
+			continue
+		}
+
+		lockMutex.Lock()
+		locked = false
+		lockMutex.Unlock()
+
+		updateActivity()
+
+		printlnL(
+			"🔓 Wallet unlocked successfully.",
+			"🔓 Wallet déverrouillé avec succès.",
+		)
+
+		return nil
 	}
 }
 
@@ -170,7 +340,34 @@ func startP2PAfterWalletReady(w *wallet.Wallet, ldb *ledger.Ledger) error {
 		return fmt.Errorf("wallet not ready")
 	}
 
-	// 🔐 Port déterministe basé sur l'adresse wallet
+	if ldb == nil {
+		return fmt.Errorf("ledger not ready")
+	}
+
+	if !wallet.IsValidEXPLOAddress(w.Address) {
+		return fmt.Errorf("invalid wallet address")
+	}
+
+	// Read the wallet public key.
+	publicKey, err := w.PublicKeyBytes("")
+	if err != nil {
+		return fmt.Errorf("failed to read wallet public key: %w", err)
+	}
+
+	if len(publicKey) != ed25519.PublicKeySize {
+		return fmt.Errorf("invalid wallet public key size")
+	}
+
+	// Verify that the wallet signing session is available.
+	walletSessionMu.RLock()
+	sessionReady := len(walletSessionPriv) == ed25519.PrivateKeySize
+	walletSessionMu.RUnlock()
+
+	if !sessionReady {
+		return fmt.Errorf("wallet signing session is not available")
+	}
+
+	// Deterministic investor port derived from the wallet address.
 	port, err := p2p.DeriveInvestorPort(w.Address)
 	if err != nil {
 		return fmt.Errorf("failed to derive investor port: %w", err)
@@ -178,7 +375,8 @@ func startP2PAfterWalletReady(w *wallet.Wallet, ldb *ledger.Ledger) error {
 
 	listenAddr := fmt.Sprintf("0.0.0.0:%d", port)
 
-	// 🚫 Wallet ≠ mineur → pas d'identité consciente
+	// A wallet is an observer/investor until the user explicitly
+	// creates a mining identity.
 	minerID := ""
 	var sacredWords []string = nil
 
@@ -195,13 +393,29 @@ func startP2PAfterWalletReady(w *wallet.Wallet, ldb *ledger.Ledger) error {
 
 	node.Ledger = ldb
 
+	// Configure the wallet's public cryptographic identity.
+	if err := node.SetWalletIdentity(w.Address, publicKey); err != nil {
+		return fmt.Errorf("failed to configure wallet identity: %w", err)
+	}
+
+	// Give P2P a signing callback.
+	// P2P never receives the private key or wallet password.
+	if err := node.SetWalletSigner(signWithWalletSession); err != nil {
+		return fmt.Errorf("failed to configure wallet signer: %w", err)
+	}
+
+	// Start only after the wallet identity and signer are configured.
 	if err := node.Start(); err != nil {
 		return fmt.Errorf("failed to start P2P node: %w", err)
 	}
 
 	p2pNode = node
 
-	fmt.Printf("✅ P2P Wallet Node started securely on %s\n", listenAddr)
+	fmt.Printf(
+		"✅ P2P Wallet Node started securely on %s\n",
+		listenAddr,
+	)
+
 	return nil
 }
 
@@ -282,6 +496,12 @@ func flowCreateWallet() error {
 	}
 
 	currentWallet = w
+
+	// Initialize the temporary wallet signing session.
+	if err := setWalletSigningSession(currentWallet, pw); err != nil {
+		return fmt.Errorf("failed to initialize wallet signing session: %w", err)
+	}
+
 	lockMutex.Lock()
 	locked = false
 	lockMutex.Unlock()
@@ -342,6 +562,12 @@ func flowRestoreWallet() error {
 
 	// Set currentWallet in memory
 	currentWallet = w
+
+	// Initialize the temporary wallet signing session.
+	if err := setWalletSigningSession(currentWallet, pw); err != nil {
+		return fmt.Errorf("failed to initialize wallet signing session: %w", err)
+	}
+
 	lockMutex.Lock()
 	locked = false
 	lockMutex.Unlock()

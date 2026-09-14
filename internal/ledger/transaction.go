@@ -1655,7 +1655,6 @@ func (l *Ledger) persistTransactionIndexes(
 	}
 
 	txData, err := cbor.Marshal(tx)
-
 	if err != nil {
 		return err
 	}
@@ -1695,7 +1694,11 @@ func (l *Ledger) persistTransactionIndexes(
 	// Receiver index.
 	if tx.To != "" {
 
-		if !IsValidEXPLOAddress(tx.To) {
+		// System destinations are valid non-wallet receivers.
+		isSystemReceiver := tx.To == "IMANI_POOL"
+
+		if !isSystemReceiver &&
+			!IsValidEXPLOAddress(tx.To) {
 			return errors.New(
 				"invalid receiver index address",
 			)

@@ -2,27 +2,27 @@
 package p2p
 
 import (
-        "bufio"
-        "context"
-        "crypto/ed25519"
-        "encoding/binary"
-        "errors"
-        "runtime"
-        "strings"
-        "strconv"
-        "runtime/debug"
-        "fmt"
-        "bytes"
-        "crypto/tls"
-        "io"
-        "log"
-        "math/rand"
-        "net"
-        "sync"
-        "time"
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/tls"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"math/rand"
+	"net"
+	"runtime"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
-        "github.com/fxamacker/cbor/v2"
-        "explosive/internal/ledger"
+	"explosive/internal/ledger"
+	"github.com/fxamacker/cbor/v2"
 )
 
 // PeerID is a string identifier for a peer (could be hex/base58).
@@ -30,69 +30,69 @@ type PeerID string
 
 // Peer represents a remote peer connection, its outgoing queue, lifecycle, and blockchain state.
 type Peer struct {
-        id   PeerID
-        addr string
+	id   PeerID
+	addr string
 
-        // underlying network connection (may be nil until connected)
-        conn net.Conn
+	// underlying network connection (may be nil until connected)
+	conn net.Conn
 
-        // back reference to owning node (same package)
-        node *Node
+	// back reference to owning node (same package)
+	node *Node
 
-        // outgoing send queue (encoded envelopes)
-        sendQ chan []byte
+	// outgoing send queue (encoded envelopes)
+	sendQ chan []byte
 
-        // cancellation and lifecycle
-        ctx    context.Context
-        cancel context.CancelFunc
-        wg     sync.WaitGroup
+	// cancellation and lifecycle
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 
-        // metadata protected by mu
-        mu        sync.RWMutex
-        connected bool
-        lastSeen  time.Time
+	// metadata protected by mu
+	mu        sync.RWMutex
+	connected bool
+	lastSeen  time.Time
 
-        // anti-abuse / scoring
-        score    int
-        banUntil time.Time
-        errCount int
+	// anti-abuse / scoring
+	score    int
+	banUntil time.Time
+	errCount int
 
-        // blockchain info
-        LatestHeight uint64
+	// blockchain info
+	LatestHeight uint64
 
-        // Verified identity after handshake (V3)
-        verifiedMinerID string // Verified miner address (empty if not verified)
-        verifiedPubKey  []byte // Verified Ed25519 public key
-        verifiedMiner bool // True if peer proved knowledge of sacred words via V3 signature
+	// Verified identity after handshake (V3)
+	verifiedMinerID string // Verified miner address (empty if not verified)
+	verifiedPubKey  []byte // Verified Ed25519 public key
+	verifiedMiner   bool   // True if peer proved knowledge of sacred words via V3 signature
 
-        // ---- HANDSHAKE STATE (FIX CRITICAL BUGS) ----
-        handshakeDone bool          // true once handshake fully validated
-        handshakeOnce sync.Once     // guarantees single handshake execution
-        handshakeCh   chan struct{} // closed when handshake completes
+	// ---- HANDSHAKE STATE (FIX CRITICAL BUGS) ----
+	handshakeDone bool          // true once handshake fully validated
+	handshakeOnce sync.Once     // guarantees single handshake execution
+	handshakeCh   chan struct{} // closed when handshake completes
 }
 
 func init() {
-        // seed math/rand for jitter
-        rand.Seed(time.Now().UnixNano())
+	// seed math/rand for jitter
+	rand.Seed(time.Now().UnixNano())
 }
 
 // NewPeer constructs a Peer object (not connected).
 // It reads queue sizing from node.config.SendQueueSize.
 func NewPeer(id PeerID, addr string, node *Node) *Peer {
-        ctx, cancel := context.WithCancel(context.Background())
-        qsize := 64
-        if node != nil && node.config.SendQueueSize > 0 {
-                qsize = node.config.SendQueueSize
-        }
-        return &Peer{
-                id:          id,
-                addr:        addr,
-                node:        node,
-                sendQ:       make(chan []byte, qsize),
-                ctx:         ctx,
-                cancel:      cancel,
-                handshakeCh: make(chan struct{}),
-        }
+	ctx, cancel := context.WithCancel(context.Background())
+	qsize := 64
+	if node != nil && node.config.SendQueueSize > 0 {
+		qsize = node.config.SendQueueSize
+	}
+	return &Peer{
+		id:          id,
+		addr:        addr,
+		node:        node,
+		sendQ:       make(chan []byte, qsize),
+		ctx:         ctx,
+		cancel:      cancel,
+		handshakeCh: make(chan struct{}),
+	}
 }
 
 // ID returns the peer identifier.
@@ -103,16 +103,16 @@ func (p *Peer) Addr() string { return p.addr }
 
 // IsConnected reports whether connection is active.
 func (p *Peer) IsConnected() bool {
-        p.mu.RLock()
-        defer p.mu.RUnlock()
-        return p.connected && p.conn != nil
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.connected && p.conn != nil
 }
 
 // IsBanned reports whether peer is currently banned.
 func (p *Peer) IsBanned() bool {
-        p.mu.RLock()
-        defer p.mu.RUnlock()
-        return time.Now().Before(p.banUntil)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return time.Now().Before(p.banUntil)
 }
 
 // Penalize adjusts score and optionally bans the peer for banDur.
@@ -155,37 +155,38 @@ func (p *Peer) Penalize(delta int, banDur time.Duration) {
 		debug.Stack(),
 	)
 }
+
 // backoffDial tries to dial with exponential backoff + jitter using the peer context.
 func (p *Peer) backoffDial(ctx context.Context) (net.Conn, error) {
-        base := time.Second
-        max := 30 * time.Second
-        var lastErr error
-        for attempt := 0; attempt < 6; attempt++ {
-                // respect provided DialTimeout from node config if present
-                dialTimeout := time.Second * 10
-                if p.node != nil && p.node.config.DialTimeout > 0 {
-                        dialTimeout = p.node.config.DialTimeout
-                }
-                d := net.Dialer{Timeout: dialTimeout}
-                conn, err := d.DialContext(ctx, "tcp", p.addr)
-                if err == nil {
-                        return conn, nil
-                }
-                lastErr = err
-                // compute backoff + jitter
-                sleep := base * (1 << uint(attempt))
-                if sleep > max {
-                        sleep = max
-                }
-                jitter := time.Duration(rand.Int63n(int64(250 * time.Millisecond)))
-                select {
-                case <-time.After(sleep + jitter):
-                        continue
-                case <-ctx.Done():
-                        return nil, ctx.Err()
-                }
-        }
-        return nil, lastErr
+	base := time.Second
+	max := 30 * time.Second
+	var lastErr error
+	for attempt := 0; attempt < 6; attempt++ {
+		// respect provided DialTimeout from node config if present
+		dialTimeout := time.Second * 10
+		if p.node != nil && p.node.config.DialTimeout > 0 {
+			dialTimeout = p.node.config.DialTimeout
+		}
+		d := net.Dialer{Timeout: dialTimeout}
+		conn, err := d.DialContext(ctx, "tcp", p.addr)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		// compute backoff + jitter
+		sleep := base * (1 << uint(attempt))
+		if sleep > max {
+			sleep = max
+		}
+		jitter := time.Duration(rand.Int63n(int64(250 * time.Millisecond)))
+		select {
+		case <-time.After(sleep + jitter):
+			continue
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return nil, lastErr
 }
 
 // Connect dials the peer (if not already connected) and starts IO loops.
@@ -254,9 +255,35 @@ func (p *Peer) Connect() error {
 		p.node.tlsConfig,
 	)
 	if err != nil {
-        log.Printf("[p2p] bootstrap peer unavailable: %s", p.addr)
-        return fmt.Errorf("TLS dial failed to %s: %w", p.addr, err)
-}
+		log.Printf(
+			"[p2p] ❌ TLS connection FAILED to %s: %v",
+			p.addr,
+			err,
+		)
+
+		// Also test plain TCP separately so we can distinguish
+		// network connectivity from TLS negotiation failure.
+		tcpDialer := &net.Dialer{
+			Timeout: dialTimeout,
+		}
+
+		tcpConn, tcpErr := tcpDialer.Dial("tcp", p.addr)
+		if tcpErr != nil {
+			log.Printf(
+				"[p2p] ❌ TCP connection FAILED to %s: %v",
+				p.addr,
+				tcpErr,
+			)
+		} else {
+			log.Printf(
+				"[p2p] ✅ TCP connection SUCCESSFUL to %s — TLS is the failing layer",
+				p.addr,
+			)
+			_ = tcpConn.Close()
+		}
+
+		return fmt.Errorf("TLS dial failed to %s: %w", p.addr, err)
+	}
 
 	state := conn.ConnectionState()
 
@@ -315,81 +342,180 @@ func (p *Peer) Connect() error {
 
 	return nil
 }
+
 // sendHandshake sends the local node's handshake message to the peer.
 // Enhanced to use the improved Envelope with Nonce and proper canonical signing.
 // Signs the message only if a valid V3 miner identity is available and required.
 
 func (p *Peer) sendHandshake() error {
-        if p.node == nil {
-                return errors.New("missing node reference")
-        }
+	if p == nil {
+		return errors.New("nil peer")
+	}
 
-        // Default identity (observer node without miner)
-        minerID := ""
+	if p.node == nil {
+		return errors.New("missing node reference")
+	}
 
-        if p.node.Ledger != nil {
-                if miners, err := p.node.Ledger.ListAllMiners(); err == nil && len(miners) > 0 {
-                        minerID = miners[0].ID
-                }
-        }
+	// ------------------------------------------------------------------
+	// READ LOCAL WALLET PUBLIC IDENTITY
+	// ------------------------------------------------------------------
+	//
+	// The wallet identity configured in Node is authoritative.
+	//
+	// NEVER use ListAllMiners()[0] here.
+	//
+	// A wallet can be an investor without being a miner.
+	// Therefore the local ledger must never decide which identity
+	// this P2P connection represents.
+	//
+	// Only public wallet information is read here.
+	// Private keys, passwords, BIP39 words and sacred words never
+	// enter the handshake payload.
+	// ------------------------------------------------------------------
 
-        h := HandshakePayload{
-                PeerID:     minerID,
-                ListenAddr: p.node.listenAddr,
-                Version:    p.node.userAgent,
-                Network:    p.node.networkID,
-        }
+	p.node.walletIdentityMu.RLock()
 
-        env, err := NewEnvelopeFromPayload(
-                p.node.ProtocolVersion(),
-                MsgTypeHandshake,
-                h,
-        )
-        if err != nil {
-                return err
-        }
+	walletAddress := p.node.walletAddress
 
-        if p.node.config.RequireSignedMessages && p.node.Ledger != nil {
+	walletPublicKey := make([]byte, len(p.node.walletPublicKey))
+	copy(walletPublicKey, p.node.walletPublicKey)
 
-                miners, err := p.node.Ledger.ListAllMiners()
-                if err == nil && len(miners) > 0 {
+	p.node.walletIdentityMu.RUnlock()
 
-                        miner := &miners[0]
+	walletAddress = strings.TrimSpace(walletAddress)
 
-                        if ledger.EnsureMinerSignature(miner) == nil {
+	if walletAddress == "" {
+		return errors.New("local wallet identity is not configured")
+	}
 
-                                priv, _, err := ledger.DeriveMinerKey(
-                                        miner.ID,
-                                        miner.ConsciousnessFingerprint,
-                                )
+	if len(walletPublicKey) != ed25519.PublicKeySize {
+		return fmt.Errorf(
+			"invalid local wallet public key size: got %d, want %d",
+			len(walletPublicKey),
+			ed25519.PublicKeySize,
+		)
+	}
 
-                                if err == nil {
+	// ------------------------------------------------------------------
+	// DETERMINE NODE ROLE
+	// ------------------------------------------------------------------
+	//
+	// The wallet node is an investor/observer by default.
+	//
+	// Miner identity must be explicitly configured by the miner startup
+	// path. It must never be inferred from an arbitrary local miner.
+	// ------------------------------------------------------------------
 
-                                        if err := p.signEnvelope(env, priv, miner); err == nil {
+	isMiner := false
+	minerID := ""
 
-                                                env.MinerInfo = &MinerInfo{
-                                                        MinerID:   miner.ID,
-                                                        Timestamp: env.Timestamp,
-                                                        PubKey:    miner.PubKey,
-                                                }
+	// ------------------------------------------------------------------
+	// BUILD HANDSHAKE PAYLOAD
+	// ------------------------------------------------------------------
 
-                                                // Keep envelope public key consistent.
-                                                env.PubKey = miner.PubKey
+	h := HandshakePayload{
+		WalletAddress: walletAddress,
+		PeerID:        string(p.node.id),
+		ListenAddr:    p.node.listenAddr,
+		Version:       p.node.userAgent,
+		Network:       p.node.networkID,
+		IsMiner:       isMiner,
+		MinerID:       minerID,
+	}
 
-                                        } else {
+	env, err := NewEnvelopeFromPayload(
+		p.node.ProtocolVersion(),
+		MsgTypeHandshake,
+		h,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create handshake envelope: %w", err)
+	}
 
-                                                log.Printf(
-                                                        "[p2p] handshake signing failed: %v",
-                                                        err,
-                                                )
-                                        }
-                                }
-                        }
-                }
-        }
+	// ------------------------------------------------------------------
+	// ATTACH WALLET PUBLIC KEY
+	// ------------------------------------------------------------------
+	//
+	// The public key is safe to transmit.
+	//
+	// It allows the remote node to associate the claimed wallet address
+	// with its public cryptographic identity.
+	//
+	// The private key is never stored in Node and never transmitted.
+	// ------------------------------------------------------------------
 
-        return p.SendEnvelope(env)
+	env.PubKey = walletPublicKey
+
+	// ------------------------------------------------------------------
+	// CREATE THE EXACT CANONICAL DATA USED BY VerifyEnvelopeSignature
+	// ------------------------------------------------------------------
+	//
+	// IMPORTANT:
+	// The public key and signature themselves are NOT included in the
+	// signed canonical data.
+	//
+	// The signature authenticates:
+	//
+	//   Version
+	//   Type
+	//   Payload
+	//   Timestamp
+	//   Nonce
+	//
+	// WalletAddress is inside Payload, therefore it is authenticated
+	// by the signature.
+	// ------------------------------------------------------------------
+
+	canon := struct {
+		V     uint16      `cbor:"v"`
+		T     MessageType `cbor:"t"`
+		P     []byte      `cbor:"p,omitempty"`
+		Ts    int64       `cbor:"ts"`
+		Nonce uint64      `cbor:"nonce"`
+	}{
+		V:     env.Version,
+		T:     env.Type,
+		P:     env.Payload,
+		Ts:    env.Timestamp,
+		Nonce: env.Nonce,
+	}
+
+	msg, err := cbor.Marshal(canon)
+	if err != nil {
+		return fmt.Errorf(
+			"failed to marshal canonical handshake data: %w",
+			err,
+		)
+	}
+
+	// ------------------------------------------------------------------
+	// SIGN WITH THE LOCAL WALLET
+	// ------------------------------------------------------------------
+	//
+	// The P2P node does NOT receive the private key.
+	//
+	// Node.signWalletData() delegates the operation to the wallet layer.
+	//
+	// Only the resulting Ed25519 signature is placed into the envelope.
+	// ------------------------------------------------------------------
+
+	signature, err := p.node.signWalletData(msg)
+	if err != nil {
+		return fmt.Errorf(
+			"failed to sign wallet handshake: %w",
+			err,
+		)
+	}
+
+	env.Signature = signature
+
+	// ------------------------------------------------------------------
+	// SEND SIGNED HANDSHAKE
+	// ------------------------------------------------------------------
+
+	return p.SendEnvelope(env)
 }
+
 // finalizeHandshake is called when a valid remote handshake message is received.
 // It ensures the bidirectional handshake is marked as complete only once and logs
 // the success with detailed, symbolic information for easy debugging and monitoring.
@@ -404,136 +530,314 @@ func (p *Peer) sendHandshake() error {
 
 func (p *Peer) finalizeHandshake(remoteMinerID string) {
 
-        p.handshakeOnce.Do(func() {
+	p.handshakeOnce.Do(func() {
 
-                p.mu.Lock()
+		p.mu.Lock()
 
-                p.id = PeerID(remoteMinerID)
-                p.handshakeDone = true
+		p.id = PeerID(remoteMinerID)
+		p.handshakeDone = true
 
-                verified := p.verifiedMiner
-                minerID := p.verifiedMinerID
+		verified := p.verifiedMiner
+		minerID := p.verifiedMinerID
 
-                p.mu.Unlock()
+		p.mu.Unlock()
 
-                if p.node != nil {
-                        p.node.addPeer(p)
-                }
+		if p.node != nil {
+			p.node.addPeer(p)
+		}
 
-                log.Printf(
-                        "[p2p] 🤝 BIDIRECTIONAL HANDSHAKE SUCCESSFUL with %s (miner=%s)",
-                        p.addr,
-                        remoteMinerID,
-                )
+		log.Printf(
+			"[p2p] 🤝 BIDIRECTIONAL HANDSHAKE SUCCESSFUL with %s (miner=%s)",
+			p.addr,
+			remoteMinerID,
+		)
 
-                if verified {
-                        log.Printf(
-                                "[p2p] ✅ Verified conscious miner connected: %s",
-                                minerID,
-                        )
-                }
+		if verified {
+			log.Printf(
+				"[p2p] ✅ Verified conscious miner connected: %s",
+				minerID,
+			)
+		}
 
-                select {
-                case <-p.handshakeCh:
-                default:
-                        close(p.handshakeCh)
-                }
-        })
+		select {
+		case <-p.handshakeCh:
+		default:
+			close(p.handshakeCh)
+		}
+	})
 }
-// SendEnvelope serializes and enqueues an envelope for sending.
-// Fixed: safe signing path when no miner or errors occur.
-// Critical messages (Tx, Block, AnnounceMiner) get MinerInfo attached.
 
+// SendEnvelope serializes and enqueues an envelope for sending.
+//
+// Signing policy:
+//  1. HANDSHAKE is already signed explicitly by sendHandshake().
+//  2. If a wallet signer is configured, regular messages are signed with
+//     the authenticated wallet identity.
+//  3. If no wallet signer is configured, the legacy miner signing path is
+//     preserved temporarily for miner-only nodes.
+//  4. Critical messages can never be sent unsigned.
+//
+// The P2P layer never receives or stores wallet private keys.
 func (p *Peer) SendEnvelope(e *Envelope) error {
+
+	if p == nil {
+		return errors.New("nil peer")
+	}
+
 	if p.node == nil {
 		return errors.New("missing node reference")
 	}
 
-	// Automatic signing if enabled and miner available.
+	if e == nil {
+		return errors.New("nil envelope")
+	}
+
+	// ================================================================
+	// SIGNING
+	// ================================================================
+	//
+	// The handshake is signed explicitly by sendHandshake().
+	//
+	// Every other signed message prefers the authenticated wallet
+	// signer. This is important because an investor wallet is a valid
+	// P2P participant even when no miner exists in the local ledger.
+	//
+	// Private keys never enter the P2P package.
+	// ================================================================
+
 	if p.node.config.RequireSignedMessages &&
-		p.node.Ledger != nil &&
 		e.Type != MsgTypeHandshake {
 
-		miners, err := p.node.Ledger.ListAllMiners()
-		if err == nil && len(miners) > 0 {
-			miner := &miners[0]
+		signed := false
 
-			if ledger.EnsureMinerSignature(miner) == nil {
-				priv, _, err := ledger.DeriveMinerKey(
-					miner.ID,
-					miner.ConsciousnessFingerprint,
+		// --------------------------------------------------------
+		// 1. PREFER WALLET SIGNER
+		// --------------------------------------------------------
+
+		p.node.walletIdentityMu.RLock()
+
+		walletPublicKey := make([]byte, len(p.node.walletPublicKey))
+		copy(walletPublicKey, p.node.walletPublicKey)
+
+		walletAddress := p.node.walletAddress
+
+		p.node.walletIdentityMu.RUnlock()
+
+		p.node.walletSignerMu.RLock()
+		walletSignerConfigured := p.node.walletSigner != nil
+		p.node.walletSignerMu.RUnlock()
+
+		if walletSignerConfigured &&
+			walletAddress != "" &&
+			len(walletPublicKey) == ed25519.PublicKeySize {
+
+			canon := struct {
+				V     uint16      `cbor:"v"`
+				T     MessageType `cbor:"t"`
+				P     []byte      `cbor:"p,omitempty"`
+				Ts    int64       `cbor:"ts"`
+				Nonce uint64      `cbor:"nonce"`
+			}{
+				V:     e.Version,
+				T:     e.Type,
+				P:     e.Payload,
+				Ts:    e.Timestamp,
+				Nonce: e.Nonce,
+			}
+
+			msg, err := cbor.Marshal(canon)
+
+			if err != nil {
+				return fmt.Errorf(
+					"failed to marshal canonical wallet signing data: %w",
+					err,
 				)
+			}
 
-				if err == nil {
-					canon := struct {
-						V     uint16      `cbor:"v"`
-						T     MessageType `cbor:"t"`
-						P     []byte      `cbor:"p,omitempty"`
-						Ts    int64       `cbor:"ts"`
-						Nonce uint64      `cbor:"nonce"`
-					}{
-						V:     e.Version,
-						T:     e.Type,
-						P:     e.Payload,
-						Ts:    e.Timestamp,
-						Nonce: e.Nonce,
-					}
+			signature, err := p.node.signWalletData(msg)
 
-					if msg, err := cbor.Marshal(canon); err == nil {
-						e.Signature = ed25519.Sign(priv, msg)
-						e.PubKey = miner.PubKey
+			if err != nil {
+				return fmt.Errorf(
+					"failed to sign message with wallet: %w",
+					err,
+				)
+			}
 
-						if e.Type == MsgTypeTx ||
-							e.Type == MsgTypeBlock ||
-							e.Type == MsgTypeAnnounceMiner ||
-							e.Type == MsgTypeMetrics {
+			if len(signature) != ed25519.SignatureSize {
+				return fmt.Errorf(
+					"invalid wallet signature size: got %d, want %d",
+					len(signature),
+					ed25519.SignatureSize,
+				)
+			}
 
-							if e.MinerInfo == nil {
-								e.MinerInfo = &MinerInfo{
-									MinerID:   miner.ID,
-									Timestamp: e.Timestamp,
-									PubKey:    miner.PubKey,
+			e.Signature = signature
+			e.PubKey = walletPublicKey
+
+			signed = true
+
+			log.Printf(
+				"[p2p] 🔐 message signed with wallet identity: type=%s wallet=%s",
+				e.Type,
+				walletAddress,
+			)
+		}
+
+		// --------------------------------------------------------
+		// 2. LEGACY MINER FALLBACK
+		// --------------------------------------------------------
+		//
+		// This preserves the existing miner path temporarily.
+		//
+		// It is intentionally used ONLY when no wallet signer is
+		// configured. It must never override an authenticated
+		// wallet signer.
+		// --------------------------------------------------------
+
+		if !signed &&
+			p.node.Ledger != nil {
+
+			miners, err := p.node.Ledger.ListAllMiners()
+
+			if err == nil && len(miners) > 0 {
+
+				miner := &miners[0]
+
+				if ledger.EnsureMinerSignature(miner) == nil {
+
+					priv, _, err := ledger.DeriveMinerKey(
+						miner.ID,
+						miner.ConsciousnessFingerprint,
+					)
+
+					if err == nil {
+
+						canon := struct {
+							V     uint16      `cbor:"v"`
+							T     MessageType `cbor:"t"`
+							P     []byte      `cbor:"p,omitempty"`
+							Ts    int64       `cbor:"ts"`
+							Nonce uint64      `cbor:"nonce"`
+						}{
+							V:     e.Version,
+							T:     e.Type,
+							P:     e.Payload,
+							Ts:    e.Timestamp,
+							Nonce: e.Nonce,
+						}
+
+						msg, err := cbor.Marshal(canon)
+
+						if err == nil {
+
+							e.Signature = ed25519.Sign(
+								priv,
+								msg,
+							)
+
+							e.PubKey = miner.PubKey
+
+							if e.Type == MsgTypeTx ||
+								e.Type == MsgTypeBlock ||
+								e.Type == MsgTypeAnnounceMiner ||
+								e.Type == MsgTypeMetrics {
+
+								if e.MinerInfo == nil {
+
+									e.MinerInfo = &MinerInfo{
+										MinerID:   miner.ID,
+										Timestamp: e.Timestamp,
+										PubKey:    miner.PubKey,
+									}
 								}
 							}
+
+							signed = true
+
+							log.Printf(
+								"[p2p] 🔐 message signed with legacy miner identity: type=%s miner=%s",
+								e.Type,
+								miner.ID,
+							)
 						}
 					}
 				}
 			}
 		}
+
+		// --------------------------------------------------------
+		// 3. CRITICAL MESSAGE CANNOT LEAVE UNSIGNED
+		// --------------------------------------------------------
+
+		critical :=
+			e.Type == MsgTypeHandshake ||
+				e.Type == MsgTypeTx ||
+				e.Type == MsgTypeBlock ||
+				e.Type == MsgTypeInv ||
+				e.Type == MsgTypeMetrics
+
+		if critical && !signed {
+
+			return fmt.Errorf(
+				"critical message %s cannot be sent without a valid cryptographic identity",
+				e.Type,
+			)
+		}
 	}
 
+	// ================================================================
+	// ENCODE
+	// ================================================================
+
 	b, err := EncodeEnvelope(e)
+
 	if err != nil {
 		return fmt.Errorf("encode envelope: %w", err)
 	}
 
 	max := p.node.config.MaxMsgSize
+
 	if max <= 0 {
 		max = 4 * 1024 * 1024
 	}
 
 	if len(b) > max {
-		return fmt.Errorf("message too large: %d > %d", len(b), max)
+		return fmt.Errorf(
+			"message too large: %d > %d",
+			len(b),
+			max,
+		)
 	}
 
 	select {
+
 	case <-p.ctx.Done():
 		return errors.New("peer closed")
+
 	default:
 	}
 
-	// Transactions : jamais de blocage.
+	// ================================================================
+	// TRANSACTION QUEUE
+	// ================================================================
+
 	if e.Type == MsgTypeTx {
+
 		select {
+
 		case p.sendQ <- b:
 			return nil
+
 		default:
 			p.Penalize(1, 0)
 			return errors.New("TX queue full")
 		}
 	}
 
-	// Messages critiques.
+	// ================================================================
+	// CRITICAL QUEUE
+	// ================================================================
+
 	critical :=
 		e.Type == MsgTypeHandshake ||
 			e.Type == MsgTypeBlock ||
@@ -547,6 +851,7 @@ func (p *Peer) SendEnvelope(e *Envelope) error {
 		defer timer.Stop()
 
 		select {
+
 		case <-p.ctx.Done():
 			return errors.New("peer closed")
 
@@ -554,19 +859,33 @@ func (p *Peer) SendEnvelope(e *Envelope) error {
 			return nil
 
 		case <-timer.C:
-			log.Printf("[p2p] timeout sending critical %s to %s", e.Type, p.addr)
+
+			log.Printf(
+				"[p2p] timeout sending critical %s to %s",
+				e.Type,
+				p.addr,
+			)
+
 			return errors.New("critical send timeout")
 		}
 	}
 
-	// Tous les autres messages.
+	// ================================================================
+	// NORMAL QUEUE
+	// ================================================================
+
 	select {
+
 	case p.sendQ <- b:
 		return nil
 
 	default:
-		log.Printf("[p2p] peer %s: outbound queue full, dropping %s",
-			p.addr, e.Type)
+
+		log.Printf(
+			"[p2p] peer %s: outbound queue full, dropping %s",
+			p.addr,
+			e.Type,
+		)
 
 		return errors.New("send queue full")
 	}
@@ -576,28 +895,28 @@ func (p *Peer) SendEnvelope(e *Envelope) error {
 // Includes Version, Type, Payload, Timestamp, and Nonce in the signed data.
 // Used for both handshake and regular messages.
 func (p *Peer) signEnvelope(env *Envelope, priv ed25519.PrivateKey, miner *ledger.Miner) error {
-        canon := struct {
-                V     uint16      `cbor:"v"`
-                T     MessageType `cbor:"t"`
-                P     []byte      `cbor:"p,omitempty"`
-                Ts    int64       `cbor:"ts"`
-                Nonce uint64      `cbor:"nonce"`
-        }{
-                V:     env.Version,
-                T:     env.Type,
-                P:     env.Payload,
-                Ts:    env.Timestamp,
-                Nonce: env.Nonce,
-        }
+	canon := struct {
+		V     uint16      `cbor:"v"`
+		T     MessageType `cbor:"t"`
+		P     []byte      `cbor:"p,omitempty"`
+		Ts    int64       `cbor:"ts"`
+		Nonce uint64      `cbor:"nonce"`
+	}{
+		V:     env.Version,
+		T:     env.Type,
+		P:     env.Payload,
+		Ts:    env.Timestamp,
+		Nonce: env.Nonce,
+	}
 
-        msg, err := cbor.Marshal(canon)
-        if err != nil {
-                return fmt.Errorf("failed to marshal canonical data for signing: %w", err)
-        }
+	msg, err := cbor.Marshal(canon)
+	if err != nil {
+		return fmt.Errorf("failed to marshal canonical data for signing: %w", err)
+	}
 
-        env.Signature = ed25519.Sign(priv, msg)
-        env.PubKey = miner.PubKey
-        return nil
+	env.Signature = ed25519.Sign(priv, msg)
+	env.PubKey = miner.PubKey
+	return nil
 }
 
 // Close gracefully shuts down peer: cancels context, closes conn and waits loops.
@@ -640,9 +959,9 @@ func (p *Peer) Close() {
 
 // getConn returns the underlying connection under read lock.
 func (p *Peer) getConn() net.Conn {
-        p.mu.RLock()
-        defer p.mu.RUnlock()
-        return p.conn
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.conn
 }
 
 // writeLoop consumes sendQ and writes framed messages to the connection.
@@ -777,6 +1096,7 @@ func (p *Peer) writeLoop() {
 		}
 	}
 }
+
 // readLoop continuously reads framed messages from the peer and dispatches them to handlers.
 // The handshake is purely bidirectional: it is considered complete as soon as
 // the remote peer's MsgTypeHandshake message is received.
@@ -802,12 +1122,12 @@ func (p *Peer) readLoop() {
 	lastCleanup := time.Now()
 
 	criticalMessages := map[MessageType]bool{
-        MsgTypeHandshake: true,
-        MsgTypeTx:        true,
-        MsgTypeBlock:     true,
-        MsgTypeInv:       true,
-        MsgTypeMetrics:   true,
-}
+		MsgTypeHandshake: true,
+		MsgTypeTx:        true,
+		MsgTypeBlock:     true,
+		MsgTypeInv:       true,
+		MsgTypeMetrics:   true,
+	}
 
 	for {
 		select {
@@ -907,13 +1227,45 @@ func (p *Peer) readLoop() {
 		// ==========================================================
 
 		if criticalMessages[env.Type] {
-        ok, err := VerifyEnvelopeSignature(env)
-        if err != nil || !ok {
-                log.Printf("[p2p] invalid signature from %s (type=%s)", p.addr, env.Type)
-                p.Penalize(40, 4*time.Hour)
-                continue
-        }
-}
+
+			// Critical P2P messages MUST be cryptographically signed.
+			// Missing signatures are never accepted for critical messages.
+			if len(env.PubKey) != ed25519.PublicKeySize ||
+				len(env.Signature) != ed25519.SignatureSize {
+
+				log.Printf(
+					"[p2p] 🚫 missing or invalid cryptographic identity from %s (type=%s, pubkey=%d, signature=%d)",
+					p.addr,
+					env.Type,
+					len(env.PubKey),
+					len(env.Signature),
+				)
+
+				p.Penalize(40, 4*time.Hour)
+				continue
+			}
+
+			ok, err := VerifyEnvelopeSignature(env)
+
+			if err != nil || !ok {
+
+				log.Printf(
+					"[p2p] 🚫 invalid signature from %s (type=%s): %v",
+					p.addr,
+					env.Type,
+					err,
+				)
+
+				p.Penalize(40, 4*time.Hour)
+				continue
+			}
+
+			log.Printf(
+				"[p2p] ✅ cryptographic signature verified from %s (type=%s)",
+				p.addr,
+				env.Type,
+			)
+		}
 
 		// ==========================================================
 		// MINER INFO SPOOF PROTECTION
@@ -1005,41 +1357,41 @@ func (p *Peer) readLoop() {
 // Prevents replacing a reachable public address with 0.0.0.0, localhost, etc.
 func isLocalAddr(addr string) bool {
 
-    host, _, err := net.SplitHostPort(addr)
-    if err != nil {
-        return true
-    }
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return true
+	}
 
-    switch strings.ToLower(host) {
+	switch strings.ToLower(host) {
 
-    case "",
-        "0.0.0.0",
-        "::",
-        "::1",
-        "127.0.0.1",
-        "localhost":
-        return true
-    }
+	case "",
+		"0.0.0.0",
+		"::",
+		"::1",
+		"127.0.0.1",
+		"localhost":
+		return true
+	}
 
-    ip := net.ParseIP(host)
-    if ip == nil {
-        return false
-    }
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
 
-    if ip.IsLoopback() ||
-        ip.IsUnspecified() ||
-        ip.IsLinkLocalUnicast() ||
-        ip.IsLinkLocalMulticast() {
-        return true
-    }
+	if ip.IsLoopback() ||
+		ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() {
+		return true
+	}
 
-    return false
+	return false
 }
 
 // RequestBlocksSince asks the peer for blocks starting from a specific height.
 func (p *Peer) RequestBlocksSince(height uint64) ([]*ledger.Block, error) {
-        // TODO: implement actual P2P request (RPC / gRPC / HTTP)
-        return nil, fmt.Errorf("RequestBlocksSince not implemented")
+	// TODO: implement actual P2P request (RPC / gRPC / HTTP)
+	return nil, fmt.Errorf("RequestBlocksSince not implemented")
 }
 
 // RequestBlocksRange sends a request to the remote peer for a range of blocks
@@ -1056,6 +1408,7 @@ func (p *Peer) RequestBlocksSince(height uint64) ([]*ledger.Block, error) {
 // Returns:
 //   - nil, nil on successful enqueue of the request
 //   - an error if envelope creation or sending fails
+//
 // RequestBlocksRange sends a GetBlocksRange request to the peer.
 // Now returns ([]*ledger.Block, error) to allow synchronous use during sync,
 // but remains non-blocking at network level. Response handled via node handler.
@@ -1063,54 +1416,51 @@ func (p *Peer) RequestBlocksSince(height uint64) ([]*ledger.Block, error) {
 // Currently fire-and-forget (response handled asynchronously).
 // Returns nil blocks to reflect current design.
 func (p *Peer) RequestBlocksRange(from, to uint64) ([]*ledger.Block, error) {
-        if p.node == nil {
-                return nil, errors.New("no node reference")
-        }
+	if p.node == nil {
+		return nil, errors.New("no node reference")
+	}
 
-        payload := GetBlocksRangePayload{From: from, To: to}
-        env, err := NewEnvelopeFromPayload(p.node.ProtocolVersion(), MsgTypeGetBlocksRange, payload)
-        if err != nil {
-                return nil, err
-        }
+	payload := GetBlocksRangePayload{From: from, To: to}
+	env, err := NewEnvelopeFromPayload(p.node.ProtocolVersion(), MsgTypeGetBlocksRange, payload)
+	if err != nil {
+		return nil, err
+	}
 
-        if err := p.SendEnvelope(env); err != nil {
-                return nil, err
-        }
+	if err := p.SendEnvelope(env); err != nil {
+		return nil, err
+	}
 
-        // Response arrives via node handler (MsgTypeBlocksResponse)
-        return nil, nil
+	// Response arrives via node handler (MsgTypeBlocksResponse)
+	return nil, nil
 }
 
 func (p *Peer) IsVerifiedMiner() bool {
-    p.mu.RLock()
-    defer p.mu.RUnlock()
-    return p.verifiedMiner
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.verifiedMiner
 }
 
 func (p *Peer) getTLSIdentity() (string, bool) {
 
-    conn := p.getConn()
+	conn := p.getConn()
 
-    if conn == nil {
-        return "", false
-    }
+	if conn == nil {
+		return "", false
+	}
 
+	tlsConn, ok := conn.(*tls.Conn)
 
-    tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return "", false
+	}
 
-    if !ok {
-        return "", false
-    }
+	state := tlsConn.ConnectionState()
 
+	if len(state.PeerCertificates) == 0 {
+		return "", false
+	}
 
-    state := tlsConn.ConnectionState()
+	cert := state.PeerCertificates[0]
 
-    if len(state.PeerCertificates) == 0 {
-        return "", false
-    }
-
-
-    cert := state.PeerCertificates[0]
-
-    return cert.Subject.CommonName, true
+	return cert.Subject.CommonName, true
 }
