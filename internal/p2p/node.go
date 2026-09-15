@@ -114,6 +114,26 @@ type Node struct {
 	walletSignerMu sync.RWMutex
 	walletSigner   func([]byte) ([]byte, error)
 
+	// ------------------------------------------------------------------
+	// MINER PUBLIC IDENTITY
+	// ------------------------------------------------------------------
+	// Miner identity is separate from wallet identity.
+	// MinerID is normally the same public EXPLO address as the wallet,
+	// but MinerPublicKey is a distinct Ed25519 key derived from the
+	// miner identity credentials.
+	minerIdentityMu sync.RWMutex
+	minerID         string
+	minerPublicKey  []byte
+
+	// ------------------------------------------------------------------
+	// MINER SIGNER
+	// ------------------------------------------------------------------
+	// The P2P node never stores miner private keys or sacred words.
+	// Miner signing is delegated to the ledger/miner layer through
+	// this callback.
+	minerSignerMu sync.RWMutex
+	minerSigner   func([]byte) ([]byte, error)
+
 	Peers      []*Peer
 	PeersMutex sync.RWMutex
 
@@ -370,6 +390,128 @@ func (n *Node) signWalletData(data []byte) ([]byte, error) {
 
 	// Copy the result so the callback cannot mutate the returned
 	// signature after this function returns.
+	sigCopy := make([]byte, len(signature))
+	copy(sigCopy, signature)
+
+	return sigCopy, nil
+}
+
+// SetMinerIdentity configures the public miner identity used by P2P.
+//
+// SECURITY:
+//   - Only the MinerID and public key are stored.
+//   - Sacred words are never stored in the P2P node.
+//   - The miner private key never enters the P2P package.
+func (n *Node) SetMinerIdentity(
+	minerID string,
+	publicKey []byte,
+) error {
+	if n == nil {
+		return errors.New("nil P2P node")
+	}
+
+	minerID = strings.TrimSpace(minerID)
+
+	if minerID == "" {
+		return errors.New("miner ID is empty")
+	}
+
+	if len(publicKey) != ed25519.PublicKeySize {
+		return fmt.Errorf(
+			"invalid miner public key size: got %d, want %d",
+			len(publicKey),
+			ed25519.PublicKeySize,
+		)
+	}
+
+	pubCopy := make([]byte, len(publicKey))
+	copy(pubCopy, publicKey)
+
+	n.minerIdentityMu.Lock()
+	n.minerID = minerID
+	n.minerPublicKey = pubCopy
+	n.minerIdentityMu.Unlock()
+
+	return nil
+}
+
+// SetMinerSigner configures the local miner signing callback.
+//
+// SECURITY:
+//   - The P2P node does not receive or store the miner private key.
+//   - The P2P node does not receive or store sacred words.
+//   - The miner layer remains responsible for secure key derivation.
+func (n *Node) SetMinerSigner(
+	signer func([]byte) ([]byte, error),
+) error {
+	if n == nil {
+		return errors.New("nil P2P node")
+	}
+
+	if signer == nil {
+		return errors.New("miner signer is nil")
+	}
+
+	n.minerSignerMu.Lock()
+	n.minerSigner = signer
+	n.minerSignerMu.Unlock()
+
+	return nil
+}
+
+// getMinerIdentity returns a defensive copy of the public miner identity.
+func (n *Node) getMinerIdentity() (string, []byte) {
+	if n == nil {
+		return "", nil
+	}
+
+	n.minerIdentityMu.RLock()
+	defer n.minerIdentityMu.RUnlock()
+
+	minerID := n.minerID
+
+	var pubCopy []byte
+	if len(n.minerPublicKey) > 0 {
+		pubCopy = make([]byte, len(n.minerPublicKey))
+		copy(pubCopy, n.minerPublicKey)
+	}
+
+	return minerID, pubCopy
+}
+
+// signMinerData delegates signing to the configured miner signer.
+//
+// The miner private key and sacred words never enter the P2P package.
+func (n *Node) signMinerData(data []byte) ([]byte, error) {
+	if n == nil {
+		return nil, errors.New("nil P2P node")
+	}
+
+	if len(data) == 0 {
+		return nil, errors.New("data to sign is empty")
+	}
+
+	n.minerSignerMu.RLock()
+	signer := n.minerSigner
+	n.minerSignerMu.RUnlock()
+
+	if signer == nil {
+		return nil, errors.New("miner signer is not configured")
+	}
+
+	signature, err := signer(data)
+	if err != nil {
+		return nil, fmt.Errorf("miner signing failed: %w", err)
+	}
+
+	if len(signature) != ed25519.SignatureSize {
+		return nil, fmt.Errorf(
+			"invalid miner signature size: got %d, want %d",
+			len(signature),
+			ed25519.SignatureSize,
+		)
+	}
+
 	sigCopy := make([]byte, len(signature))
 	copy(sigCopy, signature)
 

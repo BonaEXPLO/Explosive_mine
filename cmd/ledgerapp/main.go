@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"explosive/internal/address"
 	"explosive/internal/encryption"
-	"explosive/internal/guardian"
 	"explosive/internal/ledger"
 	"explosive/internal/p2p"
 	"explosive/internal/scan"
@@ -19,7 +18,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -141,9 +139,9 @@ func signWithWalletSession(data []byte) ([]byte, error) {
 	return signature, nil
 }
 
-// startP2PNodeForMiner starts the P2P node, attaches the ledger and wallet
-// public identity, configures wallet signing, starts Exploscan and requests
-// an initial ledger synchronization.
+// startP2PNodeForMiner starts the P2P node, attaches the ledger and
+// public wallet/miner identities, configures wallet and miner signing,
+// starts Exploscan and requests an initial ledger synchronization.
 func startP2PNodeForMiner(
 	listenAddr string,
 	db *ledger.Ledger,
@@ -155,7 +153,7 @@ func startP2PNodeForMiner(
 	var err error
 
 	// Create a deterministic node identity when a miner identity is available.
-	// Otherwise create a normal observer node.
+	// Otherwise create a normal wallet-based node identity.
 	if minerID != "" && len(sacredWords) == 4 {
 		node, err = p2p.NewNode(
 			listenAddr,
@@ -175,38 +173,127 @@ func startP2PNodeForMiner(
 	}
 
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create P2P node: %w", err)
+		return nil, nil, fmt.Errorf(
+			"failed to create P2P node: %w",
+			err,
+		)
 	}
 
 	// Attach ledger.
 	node.Ledger = db
 
 	// ------------------------------------------------------------
-	// WALLET PUBLIC IDENTITY
+	// WALLET P2P IDENTITY
 	// ------------------------------------------------------------
 	//
-	// For a miner:
+	// Every authenticated P2P node uses its EXPLO wallet as its
+	// network identity.
+	//
+	// For miners:
 	//
 	//     MinerID == WalletAddress
 	//
-	// The wallet public key is used to prove ownership of the wallet
-	// address during the P2P handshake.
+	// The wallet public key and miner public key are separate
+	// Ed25519 identities.
 	//
-	// The private key NEVER enters the P2P package.
-	if minerID != "" {
-		if currentMiningWallet == nil {
-			node.Stop()
-			return nil, nil, fmt.Errorf(
-				"no wallet selected for miner identity",
-			)
+	// The P2P package never receives wallet or miner private keys.
+
+	if currentMiningWallet == nil {
+		node.Stop()
+		return nil, nil, fmt.Errorf(
+			"no wallet authenticated for P2P identity",
+		)
+	}
+
+	if !address.IsValidEXPLOAddress(
+		currentMiningWallet.Address,
+	) {
+		node.Stop()
+		return nil, nil, fmt.Errorf(
+			"authenticated wallet has invalid EXPLO address",
+		)
+	}
+
+	// ------------------------------------------------------------
+	// 1. WALLET PUBLIC IDENTITY
+	// ------------------------------------------------------------
+
+	walletPublicKey, err := currentMiningWallet.PublicKeyBytes("")
+	if err != nil {
+		node.Stop()
+		return nil, nil, fmt.Errorf(
+			"failed to read wallet public key: %w",
+			err,
+		)
+	}
+
+	if len(walletPublicKey) != ed25519.PublicKeySize {
+		for i := range walletPublicKey {
+			walletPublicKey[i] = 0
 		}
 
-		if !address.IsValidEXPLOAddress(currentMiningWallet.Address) {
-			node.Stop()
-			return nil, nil, fmt.Errorf(
-				"selected wallet has invalid EXPLO address",
-			)
+		node.Stop()
+		return nil, nil, fmt.Errorf(
+			"invalid wallet public key length",
+		)
+	}
+
+	// Give the P2P node only the public wallet identity.
+	if err := node.SetWalletIdentity(
+		currentMiningWallet.Address,
+		walletPublicKey,
+	); err != nil {
+		for i := range walletPublicKey {
+			walletPublicKey[i] = 0
 		}
+
+		node.Stop()
+		return nil, nil, fmt.Errorf(
+			"failed to configure wallet identity: %w",
+			err,
+		)
+	}
+
+	// Wallet signing is delegated through a callback.
+	// The P2P package never receives the wallet private key.
+	if err := node.SetWalletSigner(
+		signWithWalletSession,
+	); err != nil {
+		for i := range walletPublicKey {
+			walletPublicKey[i] = 0
+		}
+
+		node.Stop()
+		return nil, nil, fmt.Errorf(
+			"failed to configure wallet signer: %w",
+			err,
+		)
+	}
+
+	log.Printf(
+		"🔐 Wallet P2P identity attached: %s",
+		currentMiningWallet.Address,
+	)
+
+	// Clear the temporary public-key copy.
+	for i := range walletPublicKey {
+		walletPublicKey[i] = 0
+	}
+
+	// ------------------------------------------------------------
+	// 2. OPTIONAL MINER PUBLIC IDENTITY
+	// ------------------------------------------------------------
+	//
+	// A normal wallet node has no miner identity.
+	//
+	// A miner must satisfy:
+	//
+	//     MinerID == WalletAddress
+	//
+	// Sacred words remain exclusively local and are never transmitted
+	// through the P2P protocol.
+
+	if minerID != "" {
 
 		if !strings.EqualFold(
 			currentMiningWallet.Address,
@@ -214,67 +301,135 @@ func startP2PNodeForMiner(
 		) {
 			node.Stop()
 			return nil, nil, fmt.Errorf(
-				"wallet address does not match miner ID",
+				"wallet address does not match miner ID: wallet=%s miner=%s",
+				currentMiningWallet.Address,
+				minerID,
 			)
 		}
 
-		publicKey, err := currentMiningWallet.PublicKeyBytes("")
+		if !address.IsValidEXPLOAddress(minerID) {
+			node.Stop()
+			return nil, nil, fmt.Errorf(
+				"invalid miner ID",
+			)
+		}
+
+		if len(sacredWords) != 4 {
+			node.Stop()
+			return nil, nil, fmt.Errorf(
+				"miner identity requires exactly 4 sacred words",
+			)
+		}
+
+		// --------------------------------------------------------
+		// MINER PUBLIC IDENTITY
+		// --------------------------------------------------------
+
+		// Derive the miner key only long enough to obtain its
+		// public identity. The P2P node receives the public key only.
+		minerPriv, minerPub, err := ledger.DeriveMinerKey(
+			minerID,
+			sacredWords,
+		)
 		if err != nil {
 			node.Stop()
 			return nil, nil, fmt.Errorf(
-				"failed to read wallet public key: %w",
+				"failed to derive miner identity key: %w",
 				err,
 			)
 		}
 
-		if len(publicKey) != ed25519.PublicKeySize {
-			for i := range publicKey {
-				publicKey[i] = 0
+		if len(minerPub) != ed25519.PublicKeySize {
+			for i := range minerPriv {
+				minerPriv[i] = 0
+			}
+
+			for i := range minerPub {
+				minerPub[i] = 0
 			}
 
 			node.Stop()
 			return nil, nil, fmt.Errorf(
-				"invalid wallet public key length",
+				"invalid derived miner public key size",
 			)
 		}
 
-		// Give the node only public wallet identity.
-		if err := node.SetWalletIdentity(
-			currentMiningWallet.Address,
-			publicKey,
+		if err := node.SetMinerIdentity(
+			minerID,
+			minerPub,
 		); err != nil {
-			for i := range publicKey {
-				publicKey[i] = 0
+			for i := range minerPriv {
+				minerPriv[i] = 0
+			}
+
+			for i := range minerPub {
+				minerPub[i] = 0
 			}
 
 			node.Stop()
 			return nil, nil, fmt.Errorf(
-				"failed to configure wallet identity: %w",
+				"failed to configure miner identity: %w",
 				err,
 			)
 		}
 
-		// The node receives only a signing callback.
-		// The P2P package never receives the wallet private key.
-		if err := node.SetWalletSigner(signWithWalletSession); err != nil {
-			for i := range publicKey {
-				publicKey[i] = 0
+		// The P2P node never stores the miner private key.
+		for i := range minerPriv {
+			minerPriv[i] = 0
+		}
+
+		// Clear the temporary public-key copy.
+		for i := range minerPub {
+			minerPub[i] = 0
+		}
+
+		// --------------------------------------------------------
+		// MINER P2P SIGNER
+		// --------------------------------------------------------
+		//
+		// The P2P package receives only this callback.
+		// Sacred words remain outside the P2P package.
+
+		signingWords := append([]string(nil), sacredWords...)
+
+		if err := node.SetMinerSigner(
+			func(data []byte) ([]byte, error) {
+
+				priv, _, err := ledger.DeriveMinerKey(
+					minerID,
+					signingWords,
+				)
+				if err != nil {
+					return nil, err
+				}
+
+				signature := ed25519.Sign(
+					priv,
+					data,
+				)
+
+				for i := range priv {
+					priv[i] = 0
+				}
+
+				return signature, nil
+			},
+		); err != nil {
+
+			for i := range signingWords {
+				signingWords[i] = ""
 			}
 
 			node.Stop()
 			return nil, nil, fmt.Errorf(
-				"failed to configure wallet signer: %w",
+				"failed to configure miner signer: %w",
 				err,
 			)
-		}
-
-		for i := range publicKey {
-			publicKey[i] = 0
 		}
 
 		log.Printf(
-			"🔐 Wallet identity attached to miner P2P node: %s",
-			currentMiningWallet.Address,
+			"🔐 Miner P2P identity attached: %s",
+			minerID,
 		)
 	}
 
@@ -292,7 +447,9 @@ func startP2PNodeForMiner(
 		}
 
 		switch msg.Type {
+
 		case "BALANCE_UPDATE":
+
 			var bal struct {
 				Addr  string  `cbor:"addr"`
 				Exp   float64 `cbor:"exp"`
@@ -309,6 +466,7 @@ func startP2PNodeForMiner(
 			}
 
 		case "LEDGER_SYNC":
+
 			var syncData struct {
 				Data []wallet.Transaction `cbor:"data"`
 			}
@@ -360,7 +518,9 @@ func startP2PNodeForMiner(
 	go func() {
 		time.Sleep(800 * time.Millisecond)
 
-		fmt.Println("📡 Requesting initial ledger sync from peers...")
+		fmt.Println(
+			"📡 Requesting initial ledger sync from peers...",
+		)
 
 		if _, err := node.FetchBlocks(); err != nil {
 			fmt.Printf(
@@ -717,6 +877,7 @@ func main() {
 	var scanStop chan struct{}
 
 	// ------------------------------------------------------------
+	// ------------------------------------------------------------
 	// HEADLESS / NODE MODE
 	// ------------------------------------------------------------
 
@@ -753,9 +914,39 @@ func main() {
 			listen,
 		)
 
-		// Headless remains an observer node for now.
-		// Miner wallet authentication is configured when an
-		// interactive miner account is selected.
+		// ------------------------------------------------------------
+		// AUTHENTICATE EXISTING WALLET
+		// ------------------------------------------------------------
+		//
+		// Every authenticated P2P node uses an existing EXPLO wallet
+		// as its cryptographic network identity.
+		//
+		// Headless mode never creates or restores a wallet.
+		// It only authenticates an existing local wallet.
+		//
+		// The wallet password is used locally and is never transmitted.
+
+		scanner := bufio.NewScanner(os.Stdin)
+
+		if _, err := prepareWalletForP2P(scanner); err != nil {
+			log.Fatalf(
+				"❌ Failed to authenticate wallet for P2P: %v",
+				err,
+			)
+		}
+
+		// ------------------------------------------------------------
+		// START WALLET-AUTHENTICATED P2P NODE
+		// ------------------------------------------------------------
+		//
+		// No miner identity is supplied here.
+		//
+		// Therefore this headless node is a normal wallet node.
+		//
+		// If the wallet later becomes a miner, MinerID will be equal
+		// to the wallet address and the miner identity will be attached
+		// through the mining flow.
+
 		n, stop, err := startP2PNodeForMiner(
 			listen,
 			db,
@@ -1222,843 +1413,87 @@ mainLoop:
 	}
 }
 
-// handleCreateMiner creates a miner from an existing wallet.
-//
-// Important architecture:
-// WalletAddress -> MinerID
-//
-// The user no longer manually enters a MinerID.
-func handleCreateMiner(
-	db *ledger.Ledger,
-	scanner *bufio.Scanner,
-	node *p2p.Node,
-) *ledger.Miner {
-
-	fmt.Println("\n🆕 Create Miner Account")
-
-	// ------------------------------------------------------------
-	// 1. Select and unlock existing wallet
-	// ------------------------------------------------------------
-
-	selectedWallet, err := prepareWalletForMining(scanner)
-	if err != nil {
-		fmt.Println(
-			"❌ Wallet preparation failed:",
-			err,
-		)
-		return nil
-	}
-
-	id := strings.ToLower(
-		strings.TrimSpace(
-			selectedWallet.Address,
-		),
-	)
-
-	if !ledger.IsValidMinerID(id) {
-		fmt.Println(
-			"❌ Wallet address cannot be used as MinerID.",
-		)
-
-		clearWalletSigningSession()
-		currentMiningWallet = nil
-
-		return nil
-	}
-
-	// ------------------------------------------------------------
-	// 2. Check duplicate miner
-	// ------------------------------------------------------------
-
-	var existing ledger.Miner
-
-	if err := db.GetObject(
-		[]byte("miner:"+id),
-		&existing,
-	); err == nil {
-		fmt.Println(
-			"❌ A miner already exists for this wallet address.",
-		)
-
-		clearWalletSigningSession()
-		currentMiningWallet = nil
-
-		return nil
-	}
-
-	// ------------------------------------------------------------
-	// 3. Miner password
-	// ------------------------------------------------------------
-	//
-	// This password is DIFFERENT from the wallet password.
-
-	fmt.Println()
-	fmt.Println("🔐 Now create the miner password.")
-	fmt.Println("This password protects the miner identity on this device.")
-
-	password := readPassword(
-		scanner,
-		"Create miner password: ",
-	)
-
-	confirm := readPassword(
-		scanner,
-		"Confirm miner password: ",
-	)
-
-	if password != confirm {
-		fmt.Println(
-			"❌ Miner passwords do not match.",
-		)
-
-		clearWalletSigningSession()
-		currentMiningWallet = nil
-
-		return nil
-	}
-
-	// ------------------------------------------------------------
-	// 4. Sacred words
-	// ------------------------------------------------------------
-
-	fmt.Println()
-	fmt.Println(
-		"💡 Enter your 4 sacred words (Guardian ONLY):",
-	)
-
-	words := make([]string, 4)
-
-	used := make(
-		map[string]struct{},
-	)
-
-	for i := 0; i < 4; i++ {
-		for {
-			input := strings.TrimSpace(
-				readInput(
-					scanner,
-					fmt.Sprintf("Word #%d: ", i+1),
-				),
-			)
-
-			if !guardian.IsValidWordFormat(input) {
-				fmt.Println(
-					"⚠️ Invalid format (6–16 letters, hyphen or apostrophe allowed).",
-				)
-				continue
-			}
-
-			normalized := strings.ToLower(
-				strings.TrimSpace(input),
-			)
-
-			if _, exists := used[normalized]; exists {
-				fmt.Println(
-					"⚠️ Duplicate word not allowed.",
-				)
-				continue
-			}
-
-			words[i] = normalized
-			used[normalized] = struct{}{}
-
-			fmt.Println(
-				"✅ Confirmed:",
-				normalized,
-			)
-
-			break
-		}
-	}
-
-	// ------------------------------------------------------------
-	// 5. Final Guardian validation
-	// ------------------------------------------------------------
-
-	if err := guardian.ValidateWordsFormat(words); err != nil {
-		fmt.Println(
-			"❌",
-			err,
-		)
-
-		clearWalletSigningSession()
-		currentMiningWallet = nil
-
-		return nil
-	}
-
-	words = guardian.NormalizeWords(words)
-
-	dup, err := guardian.IsDuplicateFingerprint(words)
-	if err != nil {
-		fmt.Println(
-			"❌ Failed to check fingerprint:",
-			err,
-		)
-
-		clearWalletSigningSession()
-		currentMiningWallet = nil
-
-		return nil
-	}
-
-	if dup {
-		fmt.Println(
-			"❌ Sacred words already used.",
-		)
-
-		clearWalletSigningSession()
-		currentMiningWallet = nil
-
-		return nil
-	}
-
-	// ------------------------------------------------------------
-	// 6. Create miner
-	// ------------------------------------------------------------
-
-	miner, msg, err := ledger.CreateMiner(
-		id,
-		password,
-		words,
-		"",
-		db,
-	)
-
-	if err != nil {
-		fmt.Println(
-			"❌ Error creating miner:",
-			err,
-		)
-
-		clearWalletSigningSession()
-		currentMiningWallet = nil
-
-		return nil
-	}
-
-	// ------------------------------------------------------------
-	// 7. Persist miner
-	// ------------------------------------------------------------
-
-	if err := db.PutObject(
-		[]byte("miner:"+id),
-		miner,
-	); err != nil {
-		fmt.Println(
-			"❌ Failed to save miner:",
-			err,
-		)
-
-		clearWalletSigningSession()
-		currentMiningWallet = nil
-
-		return nil
-	}
-
-	fmt.Println(
-		"✅ Miner account created successfully!",
-	)
-
-	fmt.Println(
-		"🆔 Miner ID:",
-		miner.ID,
-	)
-
-	fmt.Println(
-		"💳 Wallet address:",
-		selectedWallet.Address,
-	)
-
-	fmt.Println(
-		"💬 Guardian says:",
-		msg,
-	)
-
-	return miner
-}
-
-// handleRestoreMiner restores a miner using:
-//
-// Existing Wallet Address + 4 Sacred Words + new Miner Password
-func handleRestoreMiner(
-	db *ledger.Ledger,
-	scanner *bufio.Scanner,
-) *ledger.Miner {
-
-	fmt.Println(
-		"\n♻️ Restore Miner Account (Universal Restoration)",
-	)
-
-	// ------------------------------------------------------------
-	// 1. Select and unlock wallet
-	// ------------------------------------------------------------
-
-	selectedWallet, err := prepareWalletForMining(scanner)
-	if err != nil {
-		fmt.Println(
-			"❌ Wallet preparation failed:",
-			err,
-		)
-		return nil
-	}
-
-	id := strings.ToLower(
-		strings.TrimSpace(
-			selectedWallet.Address,
-		),
-	)
-
-	if !address.IsValidEXPLOAddress(id) {
-		fmt.Println(
-			"❌ Invalid wallet address.",
-		)
-
-		clearWalletSigningSession()
-		currentMiningWallet = nil
-
-		return nil
+// prepareWalletForP2P authenticates an existing wallet for P2P identity.
+// The wallet private key remains encrypted at rest and is unlocked only
+// for the in-memory signing session.
+func prepareWalletForP2P(scanner *bufio.Scanner) (*wallet.Wallet, error) {
+	if walletDB == nil {
+		return nil, fmt.Errorf("wallet database is not available")
 	}
 
 	fmt.Println()
-	fmt.Println(
-		"🆔 Miner ID:",
-		id,
+	fmt.Println("🔐 Connect your existing EXPLO wallet.")
+	fmt.Println("This wallet will be used as your P2P network identity.")
+	fmt.Println()
+
+	walletAddress := strings.TrimSpace(
+		readInput(scanner, "Enter wallet address: "),
 	)
 
-	// ------------------------------------------------------------
-	// 2. Sacred words
-	// ------------------------------------------------------------
-
-	fmt.Println(
-		"Enter your 4 sacred words in order:",
-	)
-
-	words := make([]string, 4)
-
-	used := make(
-		map[string]struct{},
-	)
-
-	for i := 0; i < 4; i++ {
-		for {
-			input := strings.TrimSpace(
-				readInput(
-					scanner,
-					fmt.Sprintf("Word #%d: ", i+1),
-				),
-			)
-
-			if !guardian.IsValidWordFormat(input) {
-				fmt.Println(
-					"⚠️ Invalid format (6–16 letters, hyphen or apostrophe allowed).",
-				)
-				continue
-			}
-
-			normalized := strings.ToLower(
-				strings.TrimSpace(input),
-			)
-
-			if _, exists := used[normalized]; exists {
-				fmt.Println(
-					"⚠️ Duplicate word not allowed.",
-				)
-				continue
-			}
-
-			words[i] = normalized
-			used[normalized] = struct{}{}
-
-			fmt.Println(
-				"✅ Confirmed:",
-				normalized,
-			)
-
-			break
-		}
+	if walletAddress == "" {
+		return nil, fmt.Errorf("wallet address cannot be empty")
 	}
 
-	// ------------------------------------------------------------
-	// 3. Validate sacred words
-	// ------------------------------------------------------------
+	walletAddress = strings.ToLower(walletAddress)
 
-	if err := guardian.ValidateWordsFormat(words); err != nil {
-		fmt.Println(
-			"❌",
+	if !address.IsValidEXPLOAddress(walletAddress) {
+		return nil, fmt.Errorf("invalid EXPLO wallet address")
+	}
+
+	selected, err := walletDB.LoadWallet(walletAddress)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"wallet not found on this device or could not be loaded: %w",
 			err,
 		)
-
-		clearWalletSigningSession()
-		currentMiningWallet = nil
-
-		return nil
 	}
 
-	words = guardian.NormalizeWords(words)
+	if selected == nil {
+		return nil, fmt.Errorf("wallet record is empty")
+	}
 
-	// ------------------------------------------------------------
-	// 4. New local miner password
-	// ------------------------------------------------------------
+	if !strings.EqualFold(selected.Address, walletAddress) {
+		return nil, fmt.Errorf("wallet identity mismatch")
+	}
+
+	if !address.IsValidEXPLOAddress(selected.Address) {
+		return nil, fmt.Errorf(
+			"wallet contains an invalid EXPLO address",
+		)
+	}
+
+	if strings.TrimSpace(selected.PublicKeyHex) == "" {
+		return nil, fmt.Errorf("wallet has no public key")
+	}
 
 	fmt.Println()
-	fmt.Println(
-		"🔐 Create a NEW miner password for this device.",
-	)
+	fmt.Println("🔑 Unlock wallet for P2P authentication.")
+	fmt.Println("The wallet password is required only locally.")
+	fmt.Println("The password is NEVER transmitted over P2P.")
 
-	newPass := readPassword(
+	walletPassword := readPassword(
 		scanner,
-		"Enter new miner password: ",
+		"Enter wallet password: ",
 	)
 
-	confirm := readPassword(
-		scanner,
-		"Confirm new miner password: ",
-	)
-
-	if newPass != confirm {
-		fmt.Println(
-			"❌ Miner passwords do not match.",
-		)
-
-		clearWalletSigningSession()
-		currentMiningWallet = nil
-
-		return nil
-	}
-
-	// ------------------------------------------------------------
-	// 5. Universal restoration
-	// ------------------------------------------------------------
-
-	miner, guardianMsg, err := ledger.RestoreMinerUniversal(
-		id,
-		words,
-		newPass,
-		db,
-	)
-
-	if err != nil {
-		fmt.Println(
-			"❌ Failed to restore miner:",
-			err,
-		)
-
-		clearWalletSigningSession()
-		currentMiningWallet = nil
-
-		return nil
-	}
-
-	if miner == nil {
-		fmt.Println(
-			"❌ Miner restoration returned an empty identity.",
-		)
-
-		clearWalletSigningSession()
-		currentMiningWallet = nil
-
-		return nil
-	}
-
-	if !strings.EqualFold(
-		miner.ID,
-		selectedWallet.Address,
-	) {
-		fmt.Println(
-			"❌ Restored miner ID does not match wallet address.",
-		)
-
-		clearWalletSigningSession()
-		currentMiningWallet = nil
-
-		return nil
-	}
-
-	fmt.Println(
-		"✅ Miner restored successfully:",
-		miner.ID,
-	)
-
-	fmt.Println(
-		"🔐 Identity regenerated deterministically and secured for this device.",
-	)
-
-	fmt.Println(
-		"💳 Wallet:",
-		selectedWallet.Address,
-	)
-
-	fmt.Println(
-		"💬 Guardian says:",
-		guardianMsg,
-	)
-
-	return miner
-}
-
-func handleMine(
-	db *ledger.Ledger,
-	scanner *bufio.Scanner,
-	miner *ledger.Miner,
-	node *p2p.Node,
-) {
-	fmt.Println("\n⛏️ Mine EXPLO / IMANI")
-
-	stateKey := []byte(
-		"state:" + miner.ID,
-	)
-
-	state := &ledger.MinerState{}
-
-	if err := db.GetObject(
-		stateKey,
-		state,
-	); err != nil || state == nil {
-		state = &ledger.MinerState{}
-	}
-
-	balanceKey := []byte(
-		"balance:" + miner.ID,
-	)
-
-	balance := &ledger.Balance{}
-
-	if err := db.GetObject(
-		balanceKey,
-		balance,
-	); err != nil || balance == nil {
-		balance = &ledger.Balance{}
-	}
-
-	// ------------------------------------------------------------
-	// Donation
-	// ------------------------------------------------------------
-
-	var donation float64
-
-	for {
-		input := readInput(
-			scanner,
-			"Donation percent (0.0 - 0.1)? Enter 0 for none: ",
-		)
-
-		d, err := strconv.ParseFloat(
-			strings.TrimSpace(input),
-			64,
-		)
-
-		if err != nil {
-			fmt.Println(
-				"⚠️ Invalid number format.",
-			)
-			continue
-		}
-
-		if d < 0.0 || d > 0.1 {
-			fmt.Println(
-				"⚠️ Must be between 0.0 and 0.1",
-			)
-			continue
-		}
-
-		donation = d
-		break
-	}
-
-	// ------------------------------------------------------------
-	// Execute mining
-	// ------------------------------------------------------------
-
-	if err := ledger.Mine(
-		db,
-		miner,
-		state,
-		donation,
-		node,
+	if err := setWalletSigningSession(
+		selected,
+		walletPassword,
 	); err != nil {
-		fmt.Println(
-			"❌ Mining failed:",
-			err,
-		)
-		return
-	}
-
-	// ------------------------------------------------------------
-	// Reload authoritative balance
-	// ------------------------------------------------------------
-
-	if err := db.GetObject(
-		balanceKey,
-		balance,
-	); err != nil {
-		balance = &ledger.Balance{}
-	}
-
-	if err := db.PutObject(
-		stateKey,
-		state,
-	); err != nil {
-		fmt.Println(
-			"⚠️ Failed to save miner state:",
+		return nil, fmt.Errorf(
+			"wallet authentication failed: %w",
 			err,
 		)
 	}
 
-	fmt.Println(
-		"✅ Mining session complete!",
-	)
+	currentMiningWallet = selected
 
+	fmt.Println()
+	fmt.Println("✅ Wallet authenticated successfully.")
 	fmt.Printf(
-		"💰 Wallet balance: %.8f EXPLO, %.4f IMANI\n",
-		float64(balance.EXPLO)/float64(ledger.PastaboPerEXPLO),
-		float64(balance.IMANI)/float64(ledger.PastaboPerEXPLO),
+		"🌐 P2P identity: %s\n",
+		selected.Address,
 	)
 
-	fmt.Printf(
-		"🌟 LUMEN: %.2f / %.2f\n",
-		state.LUMEN,
-		ledger.MaxLumen,
-	)
-
-	// ------------------------------------------------------------
-	// Broadcast last block
-	// ------------------------------------------------------------
-
-	lastBlock, err := db.GetLatestBlock()
-
-	if err != nil {
-		fmt.Println(
-			"⚠️ Failed to fetch last block:",
-			err,
-		)
-
-	} else if lastBlock != nil && node != nil {
-
-		env, err := p2p.NewEnvelopeFromPayload(
-			node.ProtocolVersion(),
-			p2p.MsgTypeBlock,
-			lastBlock,
-		)
-
-		if err == nil {
-			node.Broadcast(env)
-
-			fmt.Println(
-				"📡 New block broadcasted to network peers!",
-			)
-		} else {
-			fmt.Println(
-				"⚠️ Failed to create block envelope:",
-				err,
-			)
-		}
-	}
-
-	// ------------------------------------------------------------
-	// Metrics
-	// ------------------------------------------------------------
-
-	if node != nil {
-		md, err := scan.GatherMetrics(db)
-
-		if err != nil {
-			fmt.Println(
-				"⚠️ Failed to gather metrics after mining:",
-				err,
-			)
-
-		} else if md != nil {
-			fmt.Println(
-				"📊 Global metrics updated after mining.",
-			)
-
-			p2p.HookAfterBlock(
-				db,
-				nil,
-				nil,
-				"",
-			)
-		}
-	}
-}
-
-func handleChangePassword(
-	db *ledger.Ledger,
-	scanner *bufio.Scanner,
-	miner *ledger.Miner,
-) {
-	fmt.Println("\n🔑 Change Password")
-
-	newPass := readPassword(
-		scanner,
-		"Enter new password: ",
-	)
-
-	confirm := readPassword(
-		scanner,
-		"Confirm new password: ",
-	)
-
-	if newPass != confirm {
-		fmt.Println(
-			"❌ Passwords do not match.",
-		)
-		return
-	}
-
-	err := miner.ChangePasswordAfterRestore(
-		newPass,
-	)
-
-	if err != nil {
-		fmt.Println(
-			"❌ Failed to change password:",
-			err,
-		)
-		return
-	}
-
-	err = db.PutObject(
-		[]byte("miner:"+miner.ID),
-		miner,
-	)
-
-	if err != nil {
-		fmt.Println(
-			"❌ Failed to save updated miner:",
-			err,
-		)
-		return
-	}
-
-	fmt.Println(
-		"✅ Password changed successfully.",
-	)
-}
-
-func handleDeleteMiner(
-	db *ledger.Ledger,
-	scanner *bufio.Scanner,
-	miner *ledger.Miner,
-) bool {
-
-	fmt.Println("\n🗑️ Delete Miner Account")
-
-	fmt.Println(
-		"Enter your 4 sacred words in order:",
-	)
-
-	words := make([]string, 4)
-
-	for i := 0; i < 4; i++ {
-		for {
-			word := strings.TrimSpace(
-				readInput(
-					scanner,
-					fmt.Sprintf("Word #%d: ", i+1),
-				),
-			)
-
-			_, err := guardian.FingerprintHash(
-				[]string{word},
-			)
-
-			if err != nil {
-				fmt.Println(
-					"⚠️ Invalid format. Must start with uppercase, ≥4 chars, letters and '-' allowed.",
-				)
-				continue
-			}
-
-			words[i] = word
-			break
-		}
-	}
-
-	err := ledger.DeleteMiner(
-		words,
-		miner,
-	)
-
-	if err != nil {
-		fmt.Println(
-			"❌ Failed to authorize deletion:",
-			err,
-		)
-		return false
-	}
-
-	err = db.PutBytes(
-		[]byte("miner:"+miner.ID),
-		nil,
-	)
-
-	if err != nil {
-		fmt.Println(
-			"❌ Failed to delete from DB:",
-			err,
-		)
-		return false
-	}
-
-	fmt.Println(
-		"✅ Miner account deleted successfully.",
-	)
-
-	return true
-}
-
-func SyncWithNetwork(
-	node *p2p.Node,
-	db *ledger.Ledger,
-) {
-	if node == nil {
-		fmt.Println(
-			"⚠️ Cannot synchronize: P2P node is nil.",
-		)
-		return
-	}
-
-	if _, err := node.FetchBlocks(); err != nil {
-		fmt.Println(
-			"⚠️ Failed to request block sync from network:",
-			err,
-		)
-		return
-	}
-
-	fmt.Println(
-		"📡 Sync requested — blocks will arrive asynchronously.",
-	)
-}
-
-// -----------------------------
-// Helpers
-// -----------------------------
-
-func readInput(
-	scanner *bufio.Scanner,
-	prompt string,
-) string {
-	fmt.Print(prompt)
-
-	if !scanner.Scan() {
-		return ""
-	}
-
-	return strings.TrimSpace(
-		scanner.Text(),
-	)
-}
-
-func readPassword(
-	scanner *bufio.Scanner,
-	prompt string,
-) string {
-	// Currently no terminal masking is implemented.
-	return readInput(
-		scanner,
-		prompt,
-	)
+	return selected, nil
 }
