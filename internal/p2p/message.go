@@ -1,4 +1,3 @@
-// internal/p2p/message.go
 package p2p
 
 import (
@@ -14,18 +13,18 @@ import (
 
 // Protocol constants
 const (
-	CurrentProtocolVersion uint16 = 1               // Current protocol version
-	MaxPayloadSize         int    = 5 * 1024 * 1024 // 5 MB maximum payload (mobile-safe, sufficient for blocks)
-	MaxTxPayloadSize       int    = 100 * 1024      // 100 KB maximum for transaction payloads
-	MaxBlockPayloadSize    int    = 2 * 1024 * 1024 // 2 MB maximum for block payloads
-	MaxClockSkew           int64  = 30 * 60 * 1000  // ±30 minutes clock skew tolerance
+	CurrentProtocolVersion uint16 = 1
+	MaxPayloadSize         int    = 5 * 1024 * 1024
+	MaxTxPayloadSize       int    = 100 * 1024
+	MaxBlockPayloadSize    int    = 2 * 1024 * 1024
+	MaxClockSkew           int64  = 30 * 60 * 1000
 )
 
-// Inventory object kinds (explicit & extensible)
+// Inventory object kinds.
 const (
-	InvKindBlockHeader = "BLOCK_HEADER" // header-only (always available, even after pruning)
-	InvKindBlockFull   = "BLOCK_FULL"   // full block with transactions (may be pruned)
-	InvKindTx          = "TX"           // future: transaction inventory
+	InvKindBlockHeader = "BLOCK_HEADER"
+	InvKindBlockFull   = "BLOCK_FULL"
+	InvKindTx          = "TX"
 )
 
 // MessageType defines top-level message types used on the network.
@@ -50,41 +49,196 @@ const (
 	MsgTypeBlocksResponse MessageType = "BLOCKSRESPONSE"
 )
 
-// MinerInfo carries public miner identity information.
-// Used in handshake and MsgTypeAnnounceMiner to prove possession of the consciousness fingerprint
-// via the included PubKey and future Signature field (if needed at envelope level).
-type MinerInfo struct {
-	MinerID   string `cbor:"miner_id"` // Wallet address (explo...)
-	Timestamp int64  `cbor:"timestamp"`
-	PubKey    []byte `cbor:"pubkey"`              // Mandatory: Ed25519 public key derived deterministically
-	Signature []byte `cbor:"miner_sig,omitempty"` // Optional: signature of "MINER|ID|word1|..." (proof of sacred words)
+// -----------------------------------------------------------------------------
+// MINER P2P PROOF
+// -----------------------------------------------------------------------------
+
+// minerP2PProofDomain provides domain separation for miner authentication.
+//
+// This signature is completely separate from the legacy on-chain miner
+// signature. Sacred words are NEVER included in this proof.
+const minerP2PProofDomain = "EXPLOSIVE-MINER-P2P-V1"
+
+// MinerP2PProofPayload is the canonical public data signed by a miner
+// when authenticating itself during a P2P handshake.
+//
+// SECURITY:
+//   - Contains public identity information only.
+//   - Does not contain sacred words.
+//   - Does not contain passwords.
+//   - Does not contain private keys.
+type MinerP2PProofPayload struct {
+	Domain        string `cbor:"domain"`
+	Network       string `cbor:"network"`
+	WalletAddress string `cbor:"wallet_address"`
+	MinerID       string `cbor:"miner_id"`
+	PeerID        string `cbor:"peer_id"`
+	MinerPubKey   []byte `cbor:"miner_pubkey"`
+	Timestamp     int64  `cbor:"timestamp"`
+	Nonce         uint64 `cbor:"nonce"`
 }
 
-// Envelope is the wire-level envelope. Use CBOR for compactness and speed.
-// Updated for full V3 integration:
-// - Signature and PubKey are now mandatory for critical messages when RequireSignedMessages is enabled.
-// - MinerInfo is used to broadcast the miner's public identity (ID + PubKey) without revealing sacred words.
-// - Signature covers the canonical message (Version, Type, Payload, Timestamp) using the miner's deterministic Ed25519 key.
-// Enhanced with:
-// - Mandatory cryptographically secure Nonce for replay protection
-// - Stricter validation and size limits
+// BuildMinerP2PProof builds the canonical public message that must be signed
+// by the miner private key.
+//
+// The proof binds the miner identity to:
+//   - the EXPLOSIVE network,
+//   - the wallet address,
+//   - the MinerID,
+//   - the P2P node identity,
+//   - the miner public key,
+//   - the handshake timestamp,
+//   - the handshake nonce.
+//
+// This prevents reuse of a valid miner signature in another handshake context.
+func BuildMinerP2PProof(
+	network string,
+	walletAddress string,
+	minerID string,
+	peerID string,
+	minerPubKey []byte,
+	timestamp int64,
+	nonce uint64,
+) ([]byte, error) {
+	if network == "" {
+		return nil, errors.New("miner proof network is empty")
+	}
+
+	if walletAddress == "" {
+		return nil, errors.New("miner proof wallet address is empty")
+	}
+
+	if minerID == "" {
+		return nil, errors.New("miner proof miner ID is empty")
+	}
+
+	if peerID == "" {
+		return nil, errors.New("miner proof peer ID is empty")
+	}
+
+	if timestamp == 0 {
+		return nil, errors.New("miner proof timestamp is missing")
+	}
+
+	if nonce == 0 {
+		return nil, errors.New("miner proof nonce is missing")
+	}
+
+	if len(minerPubKey) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf(
+			"invalid miner public key size: got %d, want %d",
+			len(minerPubKey),
+			ed25519.PublicKeySize,
+		)
+	}
+
+	payload := MinerP2PProofPayload{
+		Domain:        minerP2PProofDomain,
+		Network:       network,
+		WalletAddress: walletAddress,
+		MinerID:       minerID,
+		PeerID:        peerID,
+		MinerPubKey:   append([]byte(nil), minerPubKey...),
+		Timestamp:     timestamp,
+		Nonce:         nonce,
+	}
+
+	return cbor.Marshal(payload)
+}
+
+// VerifyMinerP2PProof verifies a miner's P2P authentication signature.
+//
+// The signature is verified exclusively with the public miner key supplied
+// inside MinerInfo. No sacred words are required on the receiving node.
+func VerifyMinerP2PProof(
+	network string,
+	walletAddress string,
+	minerID string,
+	peerID string,
+	minerPubKey []byte,
+	timestamp int64,
+	nonce uint64,
+	signature []byte,
+) bool {
+	if len(minerPubKey) != ed25519.PublicKeySize {
+		return false
+	}
+
+	if len(signature) != ed25519.SignatureSize {
+		return false
+	}
+
+	payload, err := BuildMinerP2PProof(
+		network,
+		walletAddress,
+		minerID,
+		peerID,
+		minerPubKey,
+		timestamp,
+		nonce,
+	)
+	if err != nil {
+		return false
+	}
+
+	return ed25519.Verify(
+		ed25519.PublicKey(minerPubKey),
+		payload,
+		signature,
+	)
+}
+
+// -----------------------------------------------------------------------------
+// PAYLOADS
+// -----------------------------------------------------------------------------
+
+// MinerInfo carries the public cryptographic identity of a miner.
+//
+// PubKey is the MINER public key.
+// Signature is the P2P miner proof.
+//
+// IMPORTANT:
+// MinerInfo does NOT contain sacred words or any private information.
+type MinerInfo struct {
+	MinerID   string `cbor:"miner_id"`
+	Timestamp int64  `cbor:"timestamp"`
+	PubKey    []byte `cbor:"pubkey"`
+	Signature []byte `cbor:"miner_sig,omitempty"`
+}
+
+// Envelope is the wire-level P2P envelope.
+//
+// Identity separation:
+//
+//	Envelope.PubKey
+//	    = Wallet public key
+//
+//	Envelope.Signature
+//	    = Wallet signature
+//
+//	Envelope.MinerInfo.PubKey
+//	    = Miner public key
+//
+//	Envelope.MinerInfo.Signature
+//	    = Miner P2P signature
+//
+// Wallet and miner keys are intentionally separate identities.
 type Envelope struct {
 	Version   uint16      `cbor:"v"`
 	Type      MessageType `cbor:"t"`
-	Payload   []byte      `cbor:"p,omitempty"` // Optional for control messages (PING, etc.)
+	Payload   []byte      `cbor:"p,omitempty"`
 	Timestamp int64       `cbor:"ts"`
-	Nonce     uint64      `cbor:"nonce"`                // Cryptographically secure nonce (anti-replay protection)
-	Signature []byte      `cbor:"sig,omitempty"`        // Ed25519 signature of canonical data
-	PubKey    []byte      `cbor:"pk,omitempty"`         // Ed25519 public key (derived from miner ID + 4 words)
-	MinerInfo *MinerInfo  `cbor:"miner_info,omitempty"` // Optional: announces miner identity (used in handshake & announce)
+	Nonce     uint64      `cbor:"nonce"`
+	Signature []byte      `cbor:"sig,omitempty"`
+	PubKey    []byte      `cbor:"pk,omitempty"`
+	MinerInfo *MinerInfo  `cbor:"miner_info,omitempty"`
 }
 
-// -------------------- PAYLOAD STRUCTS --------------------
+// -----------------------------------------------------------------------------
+// PAYLOAD STRUCTS
+// -----------------------------------------------------------------------------
 
-// HandshakePayload is exchanged when a P2P connection is established.
-//
-// The handshake identifies the public wallet identity of the node and
-// describes its network role.
+// HandshakePayload identifies the public wallet identity and network role.
 //
 // SECURITY:
 //   - WalletAddress is public.
@@ -92,8 +246,8 @@ type Envelope struct {
 //   - ListenAddr is public.
 //   - Version and Network are public protocol information.
 //   - MinerID is public when the node is a miner.
-//   - No password, private key, BIP39 mnemonic or sacred mining words
-//     are ever included in this payload.
+//   - No wallet password, private key, BIP39 mnemonic or sacred words
+//     are ever transmitted.
 type HandshakePayload struct {
 	WalletAddress string `cbor:"wallet_address"`
 	PeerID        string `cbor:"peer_id"`
@@ -113,15 +267,14 @@ type PongPayload struct {
 }
 
 // InvPayload announces the availability of objects by hash.
-// Peers MUST respond with GETDATA if interested.
 type InvPayload struct {
-	Kind   string   `cbor:"kind"`   // BLOCK_HEADER | BLOCK_FULL | TX
-	Hashes [][]byte `cbor:"hashes"` // canonical SHA3-256 hashes
+	Kind   string   `cbor:"kind"`
+	Hashes [][]byte `cbor:"hashes"`
 }
 
 // GetDataPayload requests objects previously announced via INV.
 type GetDataPayload struct {
-	Kind   string   `cbor:"kind"` // BLOCK_HEADER | BLOCK_FULL | TX
+	Kind   string   `cbor:"kind"`
 	Hashes [][]byte `cbor:"hashes"`
 }
 
@@ -130,10 +283,9 @@ type TxPayload struct {
 }
 
 // BlockPayload transports either a full block or a header-only block.
-// The receiver determines validity based on the Kind it requested.
 type BlockPayload struct {
-	Kind string `cbor:"kind"` // BLOCK_HEADER | BLOCK_FULL
-	Data []byte `cbor:"data"` // CBOR-encoded Block (full or header-only)
+	Kind string `cbor:"kind"`
+	Data []byte `cbor:"data"`
 }
 
 type GetBlocksRangePayload struct {
@@ -141,34 +293,45 @@ type GetBlocksRangePayload struct {
 	To   uint64 `cbor:"to"`
 }
 
-// MetricsPayload used for broadcasting Exploscan metrics to all peers.
-// Fully aligned with canonical scan.MetricsData.
+// MetricsPayload is used for broadcasting Exploscan metrics.
 type MetricsPayload struct {
 	Timestamp int64 `cbor:"timestamp"`
 
 	MaxSupplyEXPLO   float64 `cbor:"max_supply_explo"`
 	CirculatingEXPLO float64 `cbor:"circulating_explo"`
 
-	TotalIMANI     float64 `cbor:"total_imani"`      // EXPLO donnés * 1000
-	TotalLUMEN     float64 `cbor:"total_lumen"`      // √IMANI
-	ImaniFundEXPLO float64 `cbor:"imani_fund_explo"` // EXPLO collectés pour le pool
+	TotalIMANI     float64 `cbor:"total_imani"`
+	TotalLUMEN     float64 `cbor:"total_lumen"`
+	ImaniFundEXPLO float64 `cbor:"imani_fund_explo"`
 
 	TotalHolders    uint64 `cbor:"total_holders"`
 	MinersCount     uint64 `cbor:"miners_count"`
 	MinersRemaining uint64 `cbor:"miners_remaining"`
 }
 
-// -------------------- ENCODING/DECODING --------------------
+// -----------------------------------------------------------------------------
+// ENCODING / DECODING
+// -----------------------------------------------------------------------------
 
 func EncodeEnvelope(e *Envelope) ([]byte, error) {
+	if e == nil {
+		return nil, errors.New("nil envelope")
+	}
+
 	return cbor.Marshal(e)
 }
 
 func DecodeEnvelope(b []byte) (*Envelope, error) {
+	if len(b) == 0 {
+		return nil, errors.New("empty envelope")
+	}
+
 	var e Envelope
+
 	if err := cbor.Unmarshal(b, &e); err != nil {
 		return nil, err
 	}
+
 	return &e, nil
 }
 
@@ -177,106 +340,185 @@ func MarshalPayload(v interface{}) ([]byte, error) {
 }
 
 func UnmarshalPayload(b []byte, out interface{}) error {
+	if len(b) == 0 {
+		return errors.New("empty payload")
+	}
+
 	return cbor.Unmarshal(b, out)
 }
 
-// -------------------- VALIDATION --------------------
+// -----------------------------------------------------------------------------
+// VALIDATION
+// -----------------------------------------------------------------------------
 
 // ValidateEnvelope performs structural and timing validation.
-// Enhanced to enforce presence of PubKey and valid MinerInfo when present.
-// Additional checks: protocol version, nonce presence, payload size limit, reduced clock skew.
+//
+// MinerInfo is structurally validated here.
+// Cryptographic miner authentication is performed separately through
+// VerifyMinerP2PProof().
 func ValidateEnvelope(e *Envelope) error {
 	if e == nil {
 		return errors.New("nil envelope")
 	}
+
 	if e.Version != CurrentProtocolVersion {
-		return fmt.Errorf("unsupported protocol version: %d (expected %d)", e.Version, CurrentProtocolVersion)
+		return fmt.Errorf(
+			"unsupported protocol version: %d (expected %d)",
+			e.Version,
+			CurrentProtocolVersion,
+		)
 	}
+
 	if e.Timestamp == 0 {
 		return errors.New("missing timestamp")
 	}
+
 	if e.Nonce == 0 {
 		return errors.New("missing nonce")
 	}
 
-	// Allow reasonable clock skew (±30 minutes)
 	now := time.Now().UnixMilli()
-	if diff := now - e.Timestamp; diff > MaxClockSkew || diff < -MaxClockSkew {
+
+	if diff := now - e.Timestamp; diff > MaxClockSkew ||
+		diff < -MaxClockSkew {
 		return errors.New("timestamp skew too large")
 	}
 
-	// Type-specific payload size limits
+	// Type-specific payload size limits.
 	switch e.Type {
 	case MsgTypeTx:
 		if len(e.Payload) == 0 || len(e.Payload) > MaxTxPayloadSize {
-			return fmt.Errorf("invalid transaction payload size: %d bytes", len(e.Payload))
+			return fmt.Errorf(
+				"invalid transaction payload size: %d bytes",
+				len(e.Payload),
+			)
 		}
+
 	case MsgTypeBlock:
 		if len(e.Payload) == 0 || len(e.Payload) > MaxBlockPayloadSize {
-			return fmt.Errorf("invalid block payload size: %d bytes", len(e.Payload))
+			return fmt.Errorf(
+				"invalid block payload size: %d bytes",
+				len(e.Payload),
+			)
 		}
+
 	default:
 		if len(e.Payload) > MaxPayloadSize {
-			return fmt.Errorf("payload exceeds maximum size: %d > %d bytes", len(e.Payload), MaxPayloadSize)
+			return fmt.Errorf(
+				"payload exceeds maximum size: %d > %d bytes",
+				len(e.Payload),
+				MaxPayloadSize,
+			)
 		}
 	}
 
-	// Payload requirements per message type
+	// Payload requirements per message type.
 	switch e.Type {
-
 	case MsgTypeHandshake:
 		if len(e.Payload) == 0 {
 			return errors.New("handshake payload required")
 		}
 
-	case MsgTypeTx, MsgTypeBlock, MsgTypeInv,
-		MsgTypeGetData, MsgTypeMetrics:
+	case MsgTypeTx,
+		MsgTypeBlock,
+		MsgTypeInv,
+		MsgTypeGetData,
+		MsgTypeMetrics:
+
 		if len(e.Payload) == 0 {
-			return errors.New("payload required for this message type")
+			return errors.New(
+				"payload required for this message type",
+			)
 		}
 
 	case MsgTypeAnnounceMiner:
-		// May rely only on MinerInfo (payload optional)
+		// MinerInfo may carry the public miner identity.
 
-	case MsgTypePing, MsgTypePong:
+	case MsgTypePing,
+		MsgTypePong:
+
 		if len(e.Payload) > 1024 {
 			return errors.New("ping/pong payload too large")
 		}
 
-	case MsgTypeRequestPeers, MsgTypePeers:
-		// Payload optional
+	case MsgTypeRequestPeers,
+		MsgTypePeers:
+		// Payload optional.
 
 	default:
 		return errors.New("unknown message type")
 	}
 
-	// If MinerInfo is present, PubKey must be included and valid length
+	// ------------------------------------------------------------------
+	// MINER INFO STRUCTURAL VALIDATION
+	// ------------------------------------------------------------------
+
 	if e.MinerInfo != nil {
+		if e.MinerInfo.MinerID == "" {
+			return errors.New("miner ID is missing in MinerInfo")
+		}
+
+		if e.MinerInfo.Timestamp == 0 {
+			return errors.New("miner timestamp is missing")
+		}
+
+		if e.MinerInfo.Timestamp != e.Timestamp {
+			return errors.New(
+				"miner timestamp does not match envelope timestamp",
+			)
+		}
+
 		if len(e.MinerInfo.PubKey) != ed25519.PublicKeySize {
-			return errors.New("invalid or missing miner public key in MinerInfo")
+			return errors.New(
+				"invalid or missing miner public key in MinerInfo",
+			)
+		}
+
+		if len(e.MinerInfo.Signature) != ed25519.SignatureSize {
+			return errors.New(
+				"invalid or missing miner signature in MinerInfo",
+			)
 		}
 	}
 
 	return nil
 }
 
-// -------------------- SIGNATURE --------------------
-// VerifyEnvelopeSignature verifies the Ed25519 signature over the canonical message data.
-// Returns (true, nil) if no signature is present (backward compatible).
-// Returns error only on malformed data; invalid signature returns (false, nil).
-// Canonical data now includes Nonce for full replay protection.
+// -----------------------------------------------------------------------------
+// WALLET / ENVELOPE SIGNATURE
+// -----------------------------------------------------------------------------
+
+// VerifyEnvelopeSignature verifies the wallet-level Ed25519 signature.
+//
+// Envelope.PubKey is the WALLET public key.
+//
+// MinerInfo.PubKey is intentionally NOT used here because wallet and miner
+// identities are separate.
+//
+// If both Signature and PubKey are absent, this function returns true for
+// compatibility with non-critical unsigned control messages.
 func VerifyEnvelopeSignature(e *Envelope) (bool, error) {
 	if e == nil {
 		return false, fmt.Errorf("nil envelope")
 	}
 
-	// No signature present → accepted for backward compatibility and non-critical messages
 	if len(e.Signature) == 0 || len(e.PubKey) == 0 {
 		return true, nil
 	}
 
-	// Canonical signed data: Version + Type + Payload + Timestamp + Nonce
-	// This excludes Signature, PubKey, and MinerInfo to prevent self-referencing issues
+	if len(e.PubKey) != ed25519.PublicKeySize {
+		return false, errors.New("invalid wallet public key length")
+	}
+
+	if len(e.Signature) != ed25519.SignatureSize {
+		return false, errors.New("invalid wallet signature length")
+	}
+
+	// Canonical wallet-signed data.
+	//
+	// MinerInfo is intentionally excluded because the wallet signature
+	// authenticates the wallet identity, while the miner signature
+	// authenticates the miner identity.
 	canon := struct {
 		V     uint16      `cbor:"v"`
 		T     MessageType `cbor:"t"`
@@ -293,61 +535,101 @@ func VerifyEnvelopeSignature(e *Envelope) (bool, error) {
 
 	msg, err := cbor.Marshal(canon)
 	if err != nil {
-		return false, fmt.Errorf("failed to marshal canonical data for signature verification: %w", err)
+		return false, fmt.Errorf(
+			"failed to marshal canonical data for signature verification: %w",
+			err,
+		)
 	}
 
-	if len(e.PubKey) != ed25519.PublicKeySize {
-		return false, errors.New("invalid public key length")
-	}
-	if len(e.Signature) != ed25519.SignatureSize {
-		return false, errors.New("invalid signature length")
-	}
-
-	if !ed25519.Verify(ed25519.PublicKey(e.PubKey), msg, e.Signature) {
-		return false, nil // Invalid signature, but no internal error
+	if !ed25519.Verify(
+		ed25519.PublicKey(e.PubKey),
+		msg,
+		e.Signature,
+	) {
+		return false, nil
 	}
 
 	return true, nil
 }
 
-// -------------------- HELPERS --------------------
+// -----------------------------------------------------------------------------
+// NONCE
+// -----------------------------------------------------------------------------
 
 // generateSecureNonce produces a cryptographically secure random nonce.
 func generateSecureNonce() (uint64, error) {
 	var b [8]byte
+
 	if _, err := rand.Read(b[:]); err != nil {
 		return 0, err
 	}
-	return binary.LittleEndian.Uint64(b[:]), nil
+
+	nonce := binary.LittleEndian.Uint64(b[:])
+
+	// Zero is treated as invalid by ValidateEnvelope().
+	// Extremely unlikely, but regenerate instead of returning zero.
+	if nonce == 0 {
+		return generateSecureNonce()
+	}
+
+	return nonce, nil
 }
 
-// NewEnvelopeFromPayload quickly wraps a struct payload into an Envelope.
-// Enhanced with secure nonce generation and payload size check.
-func NewEnvelopeFromPayload(version uint16, mtype MessageType, payload interface{}) (*Envelope, error) {
+// -----------------------------------------------------------------------------
+// ENVELOPE CONSTRUCTION
+// -----------------------------------------------------------------------------
+
+// NewEnvelopeFromPayload wraps a payload into an Envelope.
+//
+// The existing API is intentionally preserved:
+//
+//	NewEnvelopeFromPayload(version, messageType, payload)
+func NewEnvelopeFromPayload(
+	version uint16,
+	mtype MessageType,
+	payload interface{},
+) (*Envelope, error) {
+
 	pb, err := MarshalPayload(payload)
 	if err != nil {
 		return nil, err
 	}
 
-	// Type-specific size enforcement
 	switch mtype {
 	case MsgTypeTx:
 		if len(pb) > MaxTxPayloadSize {
-			return nil, fmt.Errorf("transaction payload exceeds maximum size: %d > %d bytes", len(pb), MaxTxPayloadSize)
+			return nil, fmt.Errorf(
+				"transaction payload exceeds maximum size: %d > %d bytes",
+				len(pb),
+				MaxTxPayloadSize,
+			)
 		}
+
 	case MsgTypeBlock:
 		if len(pb) > MaxBlockPayloadSize {
-			return nil, fmt.Errorf("block payload exceeds maximum size: %d > %d bytes", len(pb), MaxBlockPayloadSize)
+			return nil, fmt.Errorf(
+				"block payload exceeds maximum size: %d > %d bytes",
+				len(pb),
+				MaxBlockPayloadSize,
+			)
 		}
+
 	default:
 		if len(pb) > MaxPayloadSize {
-			return nil, fmt.Errorf("payload exceeds maximum size: %d > %d bytes", len(pb), MaxPayloadSize)
+			return nil, fmt.Errorf(
+				"payload exceeds maximum size: %d > %d bytes",
+				len(pb),
+				MaxPayloadSize,
+			)
 		}
 	}
 
 	nonce, err := generateSecureNonce()
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate secure nonce: %w", err)
+		return nil, fmt.Errorf(
+			"failed to generate secure nonce: %w",
+			err,
+		)
 	}
 
 	return &Envelope{
@@ -359,11 +641,22 @@ func NewEnvelopeFromPayload(version uint16, mtype MessageType, payload interface
 	}, nil
 }
 
-// ✅ New: helper to construct a ready-to-broadcast message (used by exploscan.go)
-// Enhanced with secure nonce generation.
-func NewMessage(mtype MessageType, payload interface{}) *Envelope {
-	pb, _ := MarshalPayload(payload)
-	nonce, _ := generateSecureNonce()
+// NewMessage constructs a ready-to-broadcast message.
+func NewMessage(
+	mtype MessageType,
+	payload interface{},
+) *Envelope {
+
+	pb, err := MarshalPayload(payload)
+	if err != nil {
+		return nil
+	}
+
+	nonce, err := generateSecureNonce()
+	if err != nil {
+		return nil
+	}
+
 	return &Envelope{
 		Version:   CurrentProtocolVersion,
 		Type:      mtype,
@@ -373,17 +666,42 @@ func NewMessage(mtype MessageType, payload interface{}) *Envelope {
 	}
 }
 
-// DecodeHandshakePayload decodes a CBOR handshake payload
-func DecodeHandshakePayload(b []byte) (*HandshakePayload, error) {
+// -----------------------------------------------------------------------------
+// HANDSHAKE
+// -----------------------------------------------------------------------------
+
+// DecodeHandshakePayload decodes a CBOR handshake payload.
+func DecodeHandshakePayload(
+	b []byte,
+) (*HandshakePayload, error) {
+
+	if len(b) == 0 {
+		return nil, errors.New("empty handshake payload")
+	}
+
 	var hp HandshakePayload
+
 	if err := cbor.Unmarshal(b, &hp); err != nil {
 		return nil, err
 	}
+
 	return &hp, nil
 }
 
+// -----------------------------------------------------------------------------
+// INVENTORY
+// -----------------------------------------------------------------------------
+
 // NewInvMessage constructs an INV message for hashes of a given kind.
-func NewInvMessage(kind string, hashes [][]byte) (*Envelope, error) {
+func NewInvMessage(
+	kind string,
+	hashes [][]byte,
+) (*Envelope, error) {
+
+	if kind == "" {
+		return nil, errors.New("inv kind is empty")
+	}
+
 	if len(hashes) == 0 {
 		return nil, errors.New("inv requires at least one hash")
 	}
@@ -401,7 +719,15 @@ func NewInvMessage(kind string, hashes [][]byte) (*Envelope, error) {
 }
 
 // NewGetDataMessage constructs a GETDATA request.
-func NewGetDataMessage(kind string, hashes [][]byte) (*Envelope, error) {
+func NewGetDataMessage(
+	kind string,
+	hashes [][]byte,
+) (*Envelope, error) {
+
+	if kind == "" {
+		return nil, errors.New("getdata kind is empty")
+	}
+
 	if len(hashes) == 0 {
 		return nil, errors.New("getdata requires at least one hash")
 	}
@@ -418,26 +744,46 @@ func NewGetDataMessage(kind string, hashes [][]byte) (*Envelope, error) {
 	)
 }
 
-// DecodeInvPayload safely decodes and validates an Inv payload.
-func DecodeInvPayload(b []byte) (*InvPayload, error) {
+// DecodeInvPayload safely decodes and validates an INV payload.
+func DecodeInvPayload(
+	b []byte,
+) (*InvPayload, error) {
+
+	if len(b) == 0 {
+		return nil, errors.New("empty inv payload")
+	}
+
 	var p InvPayload
+
 	if err := cbor.Unmarshal(b, &p); err != nil {
 		return nil, err
 	}
+
 	if p.Kind == "" || len(p.Hashes) == 0 {
 		return nil, errors.New("invalid inv payload")
 	}
+
 	return &p, nil
 }
 
-// DecodeGetDataPayload safely decodes and validates a GetData payload.
-func DecodeGetDataPayload(b []byte) (*GetDataPayload, error) {
+// DecodeGetDataPayload safely decodes and validates a GETDATA payload.
+func DecodeGetDataPayload(
+	b []byte,
+) (*GetDataPayload, error) {
+
+	if len(b) == 0 {
+		return nil, errors.New("empty getdata payload")
+	}
+
 	var p GetDataPayload
+
 	if err := cbor.Unmarshal(b, &p); err != nil {
 		return nil, err
 	}
+
 	if p.Kind == "" || len(p.Hashes) == 0 {
 		return nil, errors.New("invalid getdata payload")
 	}
+
 	return &p, nil
 }

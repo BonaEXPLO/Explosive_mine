@@ -8,6 +8,7 @@ import (
 	"explosive/internal/ledger"
 	"github.com/fxamacker/cbor/v2"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -23,6 +24,7 @@ func (n *Node) registerDefaultHandlers() {
 			// =========================================================
 			// 1. DECODE HANDSHAKE
 			// =========================================================
+
 			var hs HandshakePayload
 
 			if err := UnmarshalPayload(env.Payload, &hs); err != nil {
@@ -36,17 +38,19 @@ func (n *Node) registerDefaultHandlers() {
 			}
 
 			log.Printf(
-				"[p2p] Handshake received from %s (id=%s, version=%s, listen=%s, wallet=%s)",
+				"[p2p] Handshake received from %s (id=%s, version=%s, listen=%s, wallet=%s, miner=%v)",
 				p.addr,
 				hs.PeerID,
 				hs.Version,
 				hs.ListenAddr,
 				hs.WalletAddress,
+				hs.IsMiner,
 			)
 
 			// =========================================================
 			// 2. NETWORK CHECK
 			// =========================================================
+
 			if hs.Network != n.networkID {
 				log.Printf(
 					"[p2p] Handshake rejected from %s: wrong network '%s'",
@@ -60,6 +64,7 @@ func (n *Node) registerDefaultHandlers() {
 			// =========================================================
 			// 3. VERSION CHECK
 			// =========================================================
+
 			if hs.Version != n.userAgent {
 				log.Printf(
 					"[p2p] Version mismatch %s remote=%s local=%s",
@@ -70,8 +75,9 @@ func (n *Node) registerDefaultHandlers() {
 			}
 
 			// =========================================================
-			// 4. BASIC WALLET IDENTITY CHECK
+			// 4. WALLET IDENTITY CHECK
 			// =========================================================
+
 			if hs.WalletAddress == "" {
 				log.Printf(
 					"[p2p] Handshake rejected from %s: wallet address missing",
@@ -92,8 +98,9 @@ func (n *Node) registerDefaultHandlers() {
 			}
 
 			// =========================================================
-			// 5. PUBLIC KEY IS REQUIRED
+			// 5. WALLET PUBLIC KEY
 			// =========================================================
+
 			if len(env.PubKey) != ed25519.PublicKeySize {
 				log.Printf(
 					"[p2p] Handshake rejected from %s: invalid wallet public key size: got %d, want %d",
@@ -108,6 +115,7 @@ func (n *Node) registerDefaultHandlers() {
 			// =========================================================
 			// 6. WALLET ADDRESS <-> PUBLIC KEY BINDING
 			// =========================================================
+
 			expectedAddress := address.FromEd25519PublicKey(
 				ed25519.PublicKey(env.PubKey),
 			)
@@ -119,6 +127,7 @@ func (n *Node) registerDefaultHandlers() {
 					hs.WalletAddress,
 					expectedAddress,
 				)
+
 				p.Penalize(20, time.Hour)
 				p.Close()
 				return
@@ -130,13 +139,15 @@ func (n *Node) registerDefaultHandlers() {
 			)
 
 			// =========================================================
-			// 7. HANDSHAKE SIGNATURE IS MANDATORY
+			// 7. WALLET HANDSHAKE SIGNATURE
 			// =========================================================
+
 			if len(env.Signature) != ed25519.SignatureSize {
 				log.Printf(
-					"[p2p] Handshake rejected from %s: missing or invalid signature",
+					"[p2p] Handshake rejected from %s: missing or invalid wallet signature",
 					p.addr,
 				)
+
 				p.Penalize(20, time.Hour)
 				p.Close()
 				return
@@ -145,10 +156,11 @@ func (n *Node) registerDefaultHandlers() {
 			ok, err := VerifyEnvelopeSignature(env)
 			if err != nil {
 				log.Printf(
-					"[p2p] Handshake signature verification error from %s: %v",
+					"[p2p] Handshake wallet signature verification error from %s: %v",
 					p.addr,
 					err,
 				)
+
 				p.Penalize(20, time.Hour)
 				p.Close()
 				return
@@ -159,6 +171,7 @@ func (n *Node) registerDefaultHandlers() {
 					"[p2p] 🚫 Invalid wallet handshake signature from %s",
 					p.addr,
 				)
+
 				p.Penalize(20, time.Hour)
 				p.Close()
 				return
@@ -172,42 +185,61 @@ func (n *Node) registerDefaultHandlers() {
 			// =========================================================
 			// 8. PEER ID CHECK
 			// =========================================================
+
 			if hs.PeerID == "" {
 				log.Printf(
 					"[p2p] Handshake rejected from %s: peer ID missing",
 					p.addr,
 				)
+
 				p.Close()
 				return
 			}
 
+			p.mu.Lock()
 			p.id = PeerID(hs.PeerID)
+			p.mu.Unlock()
 
 			// =========================================================
 			// 9. MINER / INVESTOR ROLE CONSISTENCY
 			// =========================================================
+
 			if hs.IsMiner {
+
+				// -----------------------------------------------------
+				// 9.1 MinerID is mandatory
+				// -----------------------------------------------------
 
 				if hs.MinerID == "" {
 					log.Printf(
 						"[p2p] Handshake rejected from %s: miner flag set but MinerID is empty",
 						p.addr,
 					)
+
 					p.Close()
 					return
 				}
 
-				if hs.MinerID != hs.WalletAddress {
+				// -----------------------------------------------------
+				// 9.2 MinerID must equal WalletAddress
+				// -----------------------------------------------------
+
+				if !strings.EqualFold(hs.MinerID, hs.WalletAddress) {
 					log.Printf(
 						"[p2p] Handshake rejected from %s: MinerID %s does not match wallet %s",
 						p.addr,
 						hs.MinerID,
 						hs.WalletAddress,
 					)
+
 					p.Penalize(20, time.Hour)
 					p.Close()
 					return
 				}
+
+				// -----------------------------------------------------
+				// 9.3 MinerID must be a valid EXPLO address
+				// -----------------------------------------------------
 
 				if !address.IsValidEXPLOAddress(hs.MinerID) {
 					log.Printf(
@@ -215,18 +247,137 @@ func (n *Node) registerDefaultHandlers() {
 						p.addr,
 						hs.MinerID,
 					)
+
 					p.Close()
 					return
 				}
 
-				// -------------------------------------------------
-				// On-chain miner identity verification
-				// -------------------------------------------------
+				// -----------------------------------------------------
+				// 9.4 MinerInfo is mandatory for miners
+				// -----------------------------------------------------
+
+				if env.MinerInfo == nil {
+					log.Printf(
+						"[p2p] Handshake rejected from %s: miner handshake missing MinerInfo",
+						p.addr,
+					)
+
+					p.Penalize(30, time.Hour)
+					p.Close()
+					return
+				}
+
+				// -----------------------------------------------------
+				// 9.5 MinerInfo.MinerID must match MinerID
+				// -----------------------------------------------------
+
+				if !strings.EqualFold(
+					env.MinerInfo.MinerID,
+					hs.MinerID,
+				) {
+					log.Printf(
+						"[p2p] Handshake rejected from %s: MinerInfo MinerID mismatch: info=%s handshake=%s",
+						p.addr,
+						env.MinerInfo.MinerID,
+						hs.MinerID,
+					)
+
+					p.Penalize(30, time.Hour)
+					p.Close()
+					return
+				}
+
+				// -----------------------------------------------------
+				// 9.6 MinerInfo timestamp must match envelope
+				// -----------------------------------------------------
+
+				if env.MinerInfo.Timestamp != env.Timestamp {
+					log.Printf(
+						"[p2p] Handshake rejected from %s: MinerInfo timestamp mismatch",
+						p.addr,
+					)
+
+					p.Penalize(20, time.Hour)
+					p.Close()
+					return
+				}
+
+				// -----------------------------------------------------
+				// 9.7 Miner public key must be valid
+				// -----------------------------------------------------
+
+				if len(env.MinerInfo.PubKey) != ed25519.PublicKeySize {
+					log.Printf(
+						"[p2p] Handshake rejected from %s: invalid miner public key size: got %d, want %d",
+						p.addr,
+						len(env.MinerInfo.PubKey),
+						ed25519.PublicKeySize,
+					)
+
+					p.Penalize(30, time.Hour)
+					p.Close()
+					return
+				}
+
+				// -----------------------------------------------------
+				// 9.8 Miner P2P signature must be valid
+				// -----------------------------------------------------
+
+				if len(env.MinerInfo.Signature) != ed25519.SignatureSize {
+					log.Printf(
+						"[p2p] Handshake rejected from %s: invalid miner P2P signature size: got %d, want %d",
+						p.addr,
+						len(env.MinerInfo.Signature),
+						ed25519.SignatureSize,
+					)
+
+					p.Penalize(30, time.Hour)
+					p.Close()
+					return
+				}
+
+				// -----------------------------------------------------
+				// 9.9 Verify Miner P2P proof
+				// -----------------------------------------------------
+
+				minerProofOK := VerifyMinerP2PProof(
+					n.networkID,
+					hs.WalletAddress,
+					hs.MinerID,
+					hs.PeerID,
+					env.MinerInfo.PubKey,
+					env.Timestamp,
+					env.Nonce,
+					env.MinerInfo.Signature,
+				)
+
+				if !minerProofOK {
+					log.Printf(
+						"[p2p] 🚫 Invalid Miner P2P proof from %s: miner=%s",
+						p.addr,
+						hs.MinerID,
+					)
+
+					p.Penalize(40, 4*time.Hour)
+					p.Close()
+					return
+				}
+
+				log.Printf(
+					"[p2p] ✅ Miner P2P proof verified: miner=%s",
+					hs.MinerID,
+				)
+
+				// -----------------------------------------------------
+				// 9.10 On-chain miner identity verification
+				// -----------------------------------------------------
+
 				if !n.verifyPeerOnChain(PeerID(hs.MinerID)) {
 					log.Printf(
 						"[p2p] 🚫 miner identity not found in ledger: %s",
 						hs.MinerID,
 					)
+
 					p.Close()
 					return
 				}
@@ -236,40 +387,26 @@ func (n *Node) registerDefaultHandlers() {
 					hs.MinerID,
 				)
 
-				// -------------------------------------------------
-				// MinerInfo consistency check
-				// -------------------------------------------------
-				if env.MinerInfo != nil {
+				// -----------------------------------------------------
+				// 9.11 Store VERIFIED MINER identity
+				// -----------------------------------------------------
+				//
+				// IMPORTANT:
+				//
+				// verifiedPubKey is the MINER public key here.
+				// It is intentionally different from env.PubKey,
+				// which is the WALLET public key.
+				// -----------------------------------------------------
 
-					if env.MinerInfo.MinerID != hs.MinerID {
-						log.Printf(
-							"[p2p] Handshake rejected from %s: MinerInfo mismatch",
-							p.addr,
-						)
-						p.Penalize(20, time.Hour)
-						p.Close()
-						return
-					}
-
-					if len(env.MinerInfo.PubKey) > 0 &&
-						len(env.MinerInfo.PubKey) != ed25519.PublicKeySize {
-
-						log.Printf(
-							"[p2p] Handshake rejected from %s: invalid MinerInfo public key",
-							p.addr,
-						)
-						p.Close()
-						return
-					}
-				}
-
-				// -------------------------------------------------
-				// Mark verified miner
-				// -------------------------------------------------
 				p.mu.Lock()
+
 				p.verifiedMinerID = hs.MinerID
-				p.verifiedPubKey = append([]byte(nil), env.PubKey...)
+				p.verifiedPubKey = append(
+					[]byte(nil),
+					env.MinerInfo.PubKey...,
+				)
 				p.verifiedMiner = true
+
 				p.mu.Unlock()
 
 				log.Printf(
@@ -279,15 +416,29 @@ func (n *Node) registerDefaultHandlers() {
 
 			} else {
 
-				// -------------------------------------------------
-				// Observer / investor
-				// -------------------------------------------------
+				// =====================================================
+				// OBSERVER / INVESTOR
+				// =====================================================
+
 				if hs.MinerID != "" {
 					log.Printf(
 						"[p2p] Handshake rejected from %s: observer cannot advertise MinerID %s",
 						p.addr,
 						hs.MinerID,
 					)
+
+					p.Close()
+					return
+				}
+
+				// An observer must not send MinerInfo at all.
+				if env.MinerInfo != nil {
+					log.Printf(
+						"[p2p] Handshake rejected from %s: observer cannot contain MinerInfo",
+						p.addr,
+					)
+
+					p.Penalize(30, time.Hour)
 					p.Close()
 					return
 				}
@@ -301,6 +452,7 @@ func (n *Node) registerDefaultHandlers() {
 			// =========================================================
 			// 10. COMPLETE HANDSHAKE
 			// =========================================================
+
 			role := "observer/investor"
 
 			if p.IsVerifiedMiner() {
@@ -308,13 +460,18 @@ func (n *Node) registerDefaultHandlers() {
 			}
 
 			p.mu.Lock()
+
 			alreadyDone := p.handshakeDone
 			p.handshakeDone = true
+
+			peerID := p.id
+
 			p.mu.Unlock()
 
 			if !alreadyDone {
 
-				// Register peer only after complete cryptographic validation.
+				// Register peer only after complete cryptographic
+				// validation.
 				n.addPeer(p)
 
 				// Release bootstrap waiters.
@@ -327,7 +484,7 @@ func (n *Node) registerDefaultHandlers() {
 
 				log.Printf(
 					"[p2p] ✅ BIDIRECTIONAL HANDSHAKE COMPLETE → %s (%s, wallet=%s)",
-					p.id,
+					peerID,
 					role,
 					hs.WalletAddress,
 				)
