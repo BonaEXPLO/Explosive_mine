@@ -384,7 +384,10 @@ func ValidateEnvelope(e *Envelope) error {
 		return errors.New("timestamp skew too large")
 	}
 
-	// Type-specific payload size limits.
+	// ------------------------------------------------------------------
+	// TYPE-SPECIFIC PAYLOAD SIZE LIMITS
+	// ------------------------------------------------------------------
+
 	switch e.Type {
 	case MsgTypeTx:
 		if len(e.Payload) == 0 || len(e.Payload) > MaxTxPayloadSize {
@@ -412,7 +415,10 @@ func ValidateEnvelope(e *Envelope) error {
 		}
 	}
 
-	// Payload requirements per message type.
+	// ------------------------------------------------------------------
+	// PAYLOAD REQUIREMENTS PER MESSAGE TYPE
+	// ------------------------------------------------------------------
+
 	switch e.Type {
 	case MsgTypeHandshake:
 		if len(e.Payload) == 0 {
@@ -444,6 +450,20 @@ func ValidateEnvelope(e *Envelope) error {
 	case MsgTypeRequestPeers,
 		MsgTypePeers:
 		// Payload optional.
+
+	case MsgTypeGetBlocksRange:
+		// GETBLOCKSRANGE is a valid blockchain synchronization request.
+		// The payload is validated by the registered message handler.
+		if len(e.Payload) == 0 {
+			return errors.New("GETBLOCKSRANGE payload is empty")
+		}
+
+	case MsgTypeBlocksResponse:
+		// BLOCKSRESPONSE is a valid blockchain synchronization response.
+		// The payload is validated by the registered message handler.
+		if len(e.Payload) == 0 {
+			return errors.New("BLOCKSRESPONSE payload is empty")
+		}
 
 	default:
 		return errors.New("unknown message type")
