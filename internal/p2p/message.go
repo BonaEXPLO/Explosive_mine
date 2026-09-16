@@ -256,6 +256,13 @@ type HandshakePayload struct {
 	Network       string `cbor:"net"`
 	IsMiner       bool   `cbor:"is_miner"`
 	MinerID       string `cbor:"miner_id,omitempty"`
+
+	// ChainHeight is the highest block height currently known
+	// by the sender. It is public synchronization metadata.
+	//
+	// No wallet password, private key, BIP39 mnemonic or sacred words
+	// are ever transmitted.
+	ChainHeight uint64 `cbor:"chain_height"`
 }
 
 type PingPayload struct {

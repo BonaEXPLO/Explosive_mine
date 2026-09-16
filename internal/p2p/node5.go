@@ -301,30 +301,43 @@ func (n *Node) ListPeers() map[PeerID]string {
 	return out
 }
 
-/* -------------------------------------------------------------------------
-   PEER DISCONNECT
---------------------------------------------------------------------------- */
+// -------------------------------------------------------------------------
+// PEER DISCONNECT
+// -------------------------------------------------------------------------
 
 func (n *Node) handlePeerDisconnect(p *Peer) {
 	if p == nil {
 		return
 	}
 
-	// Close synchronously. Close is expected to be idempotent.
+	// Capture the session identity and address before modifying
+	// the peer state or removing the session from the node.
+	p.mu.RLock()
+	peerID := p.id
+	peerAddr := p.addr
+	p.mu.RUnlock()
+
+	// Stop the current session.
+	//
+	// Close() is intentionally non-blocking: this function may be
+	// called from readLoop() or writeLoop(), so waiting for the
+	// WaitGroup here could deadlock the current worker.
 	p.Close()
 
-	// Remove from shard.
-	sh := n.shard(p.id)
+	// Remove this exact session from its shard.
+	if peerID != "" {
+		sh := n.shard(peerID)
 
-	sh.mu.Lock()
+		sh.mu.Lock()
 
-	if existing, ok := sh.peers[p.id]; ok && existing == p {
-		delete(sh.peers, p.id)
+		if existing, ok := sh.peers[peerID]; ok && existing == p {
+			delete(sh.peers, peerID)
+		}
+
+		sh.mu.Unlock()
 	}
 
-	sh.mu.Unlock()
-
-	// Remove from global peers slice.
+	// Remove this exact session from the global active-peer list.
 	n.PeersMutex.Lock()
 
 	for i := 0; i < len(n.Peers); {
@@ -333,17 +346,18 @@ func (n *Node) handlePeerDisconnect(p *Peer) {
 				n.Peers[:i],
 				n.Peers[i+1:]...,
 			)
-		} else {
-			i++
+			continue
 		}
+
+		i++
 	}
 
 	n.PeersMutex.Unlock()
 
 	log.Printf(
-		"[p2p] peer disconnected: id=%s addr=%s",
-		p.id,
-		p.addr,
+		"[p2p] peer session disconnected: id=%s addr=%s",
+		peerID,
+		peerAddr,
 	)
 }
 

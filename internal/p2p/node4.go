@@ -3,11 +3,8 @@ package p2p
 
 import (
 	"context"
-	"explosive/internal/ledger"
-	"fmt"
 	"log"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -128,205 +125,189 @@ func (n *Node) SendKnownPeers(p *Peer) {
 	_ = p.SendEnvelope(env)
 }
 
-// SyncLedgerFromBestPeer synchronizes the local ledger with the peer
-// having the highest known block height. Supports parallel fetching,
-// retry with exponential backoff, ordered insertion, and graceful cancellation.
-
+// SyncLedgerFromBestPeer starts one asynchronous ledger synchronization
+// session using the connected peer that advertises the highest chain height.
+//
+// The synchronization protocol is:
+//
+//	GETBLOCKSRANGE -> BLOCKSRESPONSE -> AddBlock
+//	                     |
+//	                     +-> next GETBLOCKSRANGE
+//
+// Only one synchronization session may run at a time.
+// BLOCKSRESPONSE is responsible for continuing the session asynchronously.
 func (n *Node) SyncLedgerFromBestPeer(ctx context.Context) {
-	// 0️⃣ Snapshot peers safely.
-	n.PeersMutex.RLock()
-	peersCopy := append([]*Peer(nil), n.Peers...)
-	n.PeersMutex.RUnlock()
-
-	if len(peersCopy) == 0 {
-		log.Println("[p2p] ⚠️ No peers available for sync")
+	if n == nil || n.Ledger == nil {
+		log.Println("[p2p] ⚠️ Cannot synchronize: ledger not initialized")
 		return
 	}
 
-	// 1️⃣ Identify peer with highest block height.
+	if ctx == nil {
+		ctx = n.ctx
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// ------------------------------------------------------------
+	// 1. Acquire the global synchronization session.
+	// ------------------------------------------------------------
+
+	n.syncMu.Lock()
+
+	if n.syncRunning {
+		activePeer := n.syncPeer
+		var activeAddr string
+
+		if activePeer != nil {
+			activeAddr = activePeer.Addr()
+		}
+
+		n.syncMu.Unlock()
+
+		log.Printf(
+			"[p2p] ⏳ Ledger synchronization already running with %s",
+			activeAddr,
+		)
+
+		return
+	}
+
+	n.syncRunning = true
+	n.syncPeer = nil
+	n.syncTarget = 0
+
+	n.syncMu.Unlock()
+
+	// ------------------------------------------------------------
+	// 2. Cancel safely before selecting a peer.
+	// ------------------------------------------------------------
+
+	select {
+	case <-ctx.Done():
+		n.syncMu.Lock()
+		n.syncRunning = false
+		n.syncPeer = nil
+		n.syncTarget = 0
+		n.syncMu.Unlock()
+
+		log.Println("[p2p] ⛔ Ledger synchronization cancelled")
+		return
+
+	default:
+	}
+
+	// ------------------------------------------------------------
+	// 3. Snapshot the currently known peers.
+	// ------------------------------------------------------------
+
+	peers := n.AllPeers()
+
 	var bestPeer *Peer
-	maxHeight := uint64(0)
-	for _, p := range peersCopy {
-		if !p.IsConnected() {
+	var bestHeight uint64
+
+	localHeight := n.Ledger.GetLatestBlockHeight()
+
+	for _, p := range peers {
+		if p == nil {
 			continue
 		}
+
+		if !p.IsConnected() || p.IsBanned() {
+			continue
+		}
+
 		p.mu.RLock()
-		height := p.LatestHeight
+		peerHeight := p.LatestHeight
+		peerID := p.id
 		p.mu.RUnlock()
-		if height > maxHeight {
-			maxHeight = height
+
+		if peerID == "" {
+			continue
+		}
+
+		if peerHeight <= localHeight {
+			continue
+		}
+
+		if bestPeer == nil || peerHeight > bestHeight {
 			bestPeer = p
+			bestHeight = peerHeight
 		}
 	}
+
+	// ------------------------------------------------------------
+	// 4. No peer has a longer chain.
+	// ------------------------------------------------------------
 
 	if bestPeer == nil {
-		log.Println("[p2p] ⚠️ No suitable peer found for sync")
+		n.syncMu.Lock()
+		n.syncRunning = false
+		n.syncPeer = nil
+		n.syncTarget = 0
+		n.syncMu.Unlock()
+
+		log.Println(
+			"[p2p] ⚠️ No suitable peer found for ledger synchronization",
+		)
+
 		return
 	}
 
-	// 2️⃣ Current ledger height.
-	nextHeight := n.Ledger.GetLatestBlockHeight() + 1
-	if nextHeight > maxHeight {
-		log.Println("[p2p] ✅ Ledger is already up-to-date")
+	// ------------------------------------------------------------
+	// 5. Register the selected synchronization peer.
+	// ------------------------------------------------------------
+
+	n.syncMu.Lock()
+	n.syncPeer = bestPeer
+	n.syncTarget = bestHeight
+	n.syncMu.Unlock()
+
+	// ------------------------------------------------------------
+	// 6. Calculate the first synchronization segment.
+	// ------------------------------------------------------------
+
+	from := localHeight + 1
+	to := from + 49
+
+	if to > bestHeight {
+		to = bestHeight
+	}
+
+	log.Printf(
+		"[p2p] ⏳ Starting ledger synchronization: local=%d target=%d peer=%s",
+		localHeight,
+		bestHeight,
+		bestPeer.Addr(),
+	)
+
+	// ------------------------------------------------------------
+	// 7. Send the first asynchronous block-range request.
+	// ------------------------------------------------------------
+
+	if err := bestPeer.requestBlocksRange(from, to); err != nil {
+		n.syncMu.Lock()
+		n.syncRunning = false
+		n.syncPeer = nil
+		n.syncTarget = 0
+		n.syncMu.Unlock()
+
+		log.Printf(
+			"[p2p] ⚠️ Failed to start ledger synchronization with %s: %v",
+			bestPeer.Addr(),
+			err,
+		)
+
 		return
 	}
 
-	log.Printf("[p2p] ⏳ Syncing blocks from height %d to %d", nextHeight, maxHeight)
-
-	// 3️⃣ Prepare segments.
-	const segmentSize = 50
-	const maxRetries = 3
-	var segments [][2]uint64
-	for s := nextHeight; s <= maxHeight; s += segmentSize {
-		segEnd := s + segmentSize - 1
-		if segEnd > maxHeight {
-			segEnd = maxHeight
-		}
-		segments = append(segments, [2]uint64{s, segEnd})
-	}
-
-	// 4️⃣ Channels & concurrency.
-	blockCh := make(chan *ledger.Block, segmentSize*len(segments))
-	errCh := make(chan error, len(segments))
-	concurrencyLimit := 5
-	sem := make(chan struct{}, concurrencyLimit)
-
-	// FIX Bug #7: use a dedicated WaitGroup for segment-level goroutines only.
-	// Per-peer goroutines inside fetchSegment use a separate local WaitGroup,
-	// preventing wg.Wait() from racing against wg.Add() calls made inside
-	// already-running goroutines.
-	var segWg sync.WaitGroup
-
-	// 5️⃣ Fetch segment in parallel from multiple peers.
-	fetchSegment := func(from, to uint64) {
-		defer segWg.Done()
-
-		attempt := 0
-		for attempt < maxRetries {
-			attempt++
-
-			select {
-			case <-ctx.Done():
-				errCh <- fmt.Errorf("sync cancelled for segment %d-%d", from, to)
-				return
-			default:
-			}
-
-			type result struct {
-				blocks []*ledger.Block
-				err    error
-			}
-
-			connectedPeers := make([]*Peer, 0, len(peersCopy))
-			for _, peer := range peersCopy {
-				if peer.IsConnected() {
-					connectedPeers = append(connectedPeers, peer)
-				}
-			}
-
-			if len(connectedPeers) == 0 {
-				errCh <- fmt.Errorf("no connected peers for segment %d-%d", from, to)
-				return
-			}
-
-			resCh := make(chan result, len(connectedPeers))
-
-			// FIX Bug #7: use a local WaitGroup for per-peer goroutines.
-			// This is completely independent from segWg, so segWg.Wait()
-			// cannot race against these Add() calls.
-			var peerWg sync.WaitGroup
-
-			for _, peer := range connectedPeers {
-				peerWg.Add(1) // Safe: called before go, in the same goroutine.
-				go func(p *Peer) {
-					defer peerWg.Done()
-					sem <- struct{}{}
-					blks, err := p.RequestBlocksRange(from, to)
-					<-sem
-					resCh <- result{blocks: blks, err: err}
-				}(peer)
-			}
-
-			// Close resCh once all peer fetches complete.
-			go func() {
-				peerWg.Wait()
-				close(resCh)
-			}()
-
-			// Collect first successful result.
-			var success bool
-			for res := range resCh {
-				if !success && res.err == nil && len(res.blocks) > 0 {
-					for _, blk := range res.blocks {
-						if blk != nil && blk.Header.Height > 0 {
-							blockCh <- blk
-						}
-					}
-					success = true
-				}
-			}
-
-			if success {
-				return
-			}
-
-			// Exponential backoff before retry.
-			backoff := time.Duration(1<<attempt) * time.Second
-			log.Printf("[p2p] ⚠️ Segment %d-%d failed on attempt %d, retrying in %s", from, to, attempt, backoff)
-
-			select {
-			case <-ctx.Done():
-				errCh <- fmt.Errorf("sync cancelled for segment %d-%d during backoff", from, to)
-				return
-			case <-time.After(backoff):
-			}
-		}
-
-		errCh <- fmt.Errorf("failed to sync segment %d-%d after %d attempts", from, to, maxRetries)
-	}
-
-	// 6️⃣ Launch all segment fetches.
-	// FIX Bug #7: all segWg.Add(1) calls happen here, before any goroutine
-	// starts, guaranteeing segWg.Wait() cannot run before all Add() calls.
-	for _, seg := range segments {
-		segWg.Add(1)
-		go fetchSegment(seg[0], seg[1])
-	}
-
-	// 7️⃣ Close channels after all segment goroutines finish.
-	go func() {
-		segWg.Wait()
-		close(blockCh)
-		close(errCh)
-	}()
-
-	// 8️⃣ Ordered block insertion.
-	buffer := make(map[uint64]*ledger.Block)
-	for blk := range blockCh {
-		h := blk.Header.Height
-		buffer[h] = blk
-
-		for {
-			b, ok := buffer[nextHeight]
-			if !ok {
-				break
-			}
-			if err := n.Ledger.AddBlock(b); err != nil {
-				log.Printf("[p2p] ⚠️ Failed to add block %d: %v", nextHeight, err)
-			} else {
-				log.Printf("[p2p] ✅ Block %d synced", nextHeight)
-			}
-			delete(buffer, nextHeight)
-			nextHeight++
-		}
-	}
-
-	// 9️⃣ Log remaining errors.
-	for err := range errCh {
-		log.Printf("[p2p] ⚠️ Sync error: %v", err)
-	}
-
-	log.Println("[p2p] ✅ Ledger synchronization completed successfully")
+	log.Printf(
+		"[p2p] 📥 Initial sync request sent: blocks %d-%d from %s",
+		from,
+		to,
+		bestPeer.Addr(),
+	)
 }
 
 func (n *Node) StartSeedMode() {

@@ -94,6 +94,17 @@ type Node struct {
 	Ledger *ledger.Ledger
 
 	// ------------------------------------------------------------------
+	// BLOCKCHAIN SYNCHRONIZATION STATE
+	// ------------------------------------------------------------------
+	// Only one ledger synchronization session may run at a time.
+	// Block exchange remains asynchronous through GETBLOCKSRANGE
+	// and BLOCKSRESPONSE messages.
+	syncMu      sync.Mutex
+	syncRunning bool
+	syncPeer    *Peer
+	syncTarget  uint64
+
+	// ------------------------------------------------------------------
 	// WALLET PUBLIC IDENTITY
 	// ------------------------------------------------------------------
 	// The wallet address and public key are public identity data.

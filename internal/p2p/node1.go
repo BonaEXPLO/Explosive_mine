@@ -2,16 +2,14 @@
 package p2p
 
 import (
+	"context"
 	"crypto/sha3"
 	"encoding/binary"
 	"errors"
+	"explosive/internal/ledger"
 	"fmt"
-	"log"
-        "math/rand"
-        "time"
 	"strings"
 	"sync"
-	"explosive/internal/ledger"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -19,9 +17,9 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
-	MinerPortMin    = 4000  // Miners use high ports for censorship-resistant direct connectivity
+	MinerPortMin    = 4000 // Miners use high ports for censorship-resistant direct connectivity
 	MinerPortMax    = 65535
-	InvestorPortMin = 5000  // Investor/light nodes use a narrower range
+	InvestorPortMin = 5000 // Investor/light nodes use a narrower range
 	InvestorPortMax = 59999
 )
 
@@ -42,17 +40,17 @@ func DerivePort(seed string, minPort, maxPort int) (int, error) {
 // "MINER|" + walletID + "|" + words joined by "|"
 // This ensures perfect alignment with DeriveMinerKey() in miner.go.
 func DeriveMinerPort(walletID string, words []string) (int, error) {
-    if len(words) != 4 {
-        return 0, errors.New("miner port derivation requires exactly 4 consciousness words")
-    }
+	if len(words) != 4 {
+		return 0, errors.New("miner port derivation requires exactly 4 consciousness words")
+	}
 
-    // Canonical V3 identity string – MUST match the message signed in SignMinerIdentity()
-    // Format: "MINER|walletID|word1|word2|word3|word4"
-    // This guarantees deterministic alignment with Ed25519 key derivation
-    seedParts := append([]string{"MINER", walletID}, words...)
-    seed := strings.Join(seedParts, "|")
+	// Canonical V3 identity string – MUST match the message signed in SignMinerIdentity()
+	// Format: "MINER|walletID|word1|word2|word3|word4"
+	// This guarantees deterministic alignment with Ed25519 key derivation
+	seedParts := append([]string{"MINER", walletID}, words...)
+	seed := strings.Join(seedParts, "|")
 
-    return DerivePort(seed, MinerPortMin, MinerPortMax)
+	return DerivePort(seed, MinerPortMin, MinerPortMax)
 }
 
 // DeriveInvestorPort derives a port for non-miner (investor/light) wallets.
@@ -82,11 +80,12 @@ func DeriveListenAddr(walletID string, words []string, walletAddress string) (st
 // ListenAddr returns the effective P2P listen address of the node.
 // Safe to call after Start().
 func (n *Node) ListenAddr() string {
-        if n == nil {
-                return ""
-        }
-        return n.listenAddr
+	if n == nil {
+		return ""
+	}
+	return n.listenAddr
 }
+
 // ApplyDerivedListenAddrToNode sets the node's listen address if not already configured.
 // Safe to call multiple times (idempotent).
 func ApplyDerivedListenAddrToNode(n *Node, walletID string, words []string, walletAddress string) (string, error) {
@@ -105,65 +104,45 @@ func ApplyDerivedListenAddrToNode(n *Node, walletID string, words []string, wall
 	return addr, nil
 }
 
-// FetchBlocks triggers synchronization of missing blocks from connected peers.
-// It sends non-blocking GetBlocksRange requests to multiple peers with jitter
-// to avoid network flooding. Actual block reception and application occur
-// asynchronously via the MsgTypeBlocksResponse handler.
-// This design is mobile-friendly: low CPU, no blocking, controlled concurrency.
-// Enhanced with randomized jitter delay per peer to prevent simultaneous requests on startup.
+// FetchBlocks starts the single ledger synchronization engine.
+//
+// Block synchronization is asynchronous:
+//
+//	FetchBlocks()
+//	     |
+//	     v
+//	SyncLedgerFromBestPeer()
+//	     |
+//	     v
+//	GETBLOCKSRANGE
+//	     |
+//	     v
+//	BLOCKSRESPONSE
+//	     |
+//	     v
+//	   AddBlock()
+//
+// FetchBlocks does not send block requests directly and does not wait
+// for blocks to arrive. The BLOCKSRESPONSE handler continues the
+// synchronization session asynchronously.
 func (n *Node) FetchBlocks() ([]*ledger.Block, error) {
+	if n == nil {
+		return nil, errors.New("node is nil")
+	}
+
 	if n.Ledger == nil {
 		return nil, errors.New("ledger not initialized")
 	}
 
-	latest := n.Ledger.GetLatestBlockHeight()
-
-	peers := n.AllPeers()
-	if len(peers) == 0 {
-		return nil, nil // No peers → nothing to do
+	ctx := n.ctx
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
-	// Limit concurrent requests to preserve battery/CPU on mobile
-	maxConcurrent := 8
-	if len(peers) < maxConcurrent {
-		maxConcurrent = len(peers)
-	}
-	sem := make(chan struct{}, maxConcurrent)
-	var wg sync.WaitGroup
+	n.SyncLedgerFromBestPeer(ctx)
 
-	for _, peer := range peers {
-		if !peer.IsConnected() || peer.IsBanned() {
-			continue
-		}
-
-		wg.Add(1)
-		go func(p *Peer) {
-			defer wg.Done()
-			sem <- struct{}{}        // acquire semaphore
-			defer func() { <-sem }() // release semaphore
-
-			// Randomized jitter delay (100–800 ms) to stagger requests and avoid network flood
-			delay := time.Duration(100 + rand.Intn(701)) * time.Millisecond
-			time.Sleep(delay)
-
-			// Request next 50 blocks after current height
-			// Fire-and-forget: we ignore returned blocks (they arrive via handler)
-			// Only check for sending error
-			_, err := p.RequestBlocksRange(latest+1, latest+50)
-			if err != nil {
-				log.Printf("[p2p] RequestBlocksRange to %s failed: %v", p.Addr(), err)
-			} else {
-				log.Printf("[p2p] Requested blocks %d–%d from %s", latest+1, latest+50, p.Addr())
-			}
-		}(peer)
-	}
-
-	wg.Wait()
-
-	// No blocks returned synchronously – sync is triggered, blocks arrive later via handler
 	return nil, nil
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BROADCASTING – CBOR-based, sharded, high-performance
@@ -172,59 +151,60 @@ func (n *Node) FetchBlocks() ([]*ledger.Block, error) {
 // BroadcastEnvelope sends an envelope to all connected peers (sharded, lock-free read).
 // Enhanced to be fully non-blocking (fire-and-forget) and skip banned peers for efficiency.
 func (n *Node) BroadcastEnvelope(env *Envelope) {
-        if env == nil {
-                return
-        }
-        for i := range n.peerShards {
-                sh := &n.peerShards[i]
-                sh.mu.RLock()
-                for _, p := range sh.peers {
-                        if p.IsConnected() && !p.IsBanned() {
-                                go p.SendEnvelope(env) // Fire-and-forget to prevent any blocking
-                        }
-                }
-                sh.mu.RUnlock()
-        }
+	if env == nil {
+		return
+	}
+	for i := range n.peerShards {
+		sh := &n.peerShards[i]
+		sh.mu.RLock()
+		for _, p := range sh.peers {
+			if p.IsConnected() && !p.IsBanned() {
+				go p.SendEnvelope(env) // Fire-and-forget to prevent any blocking
+			}
+		}
+		sh.mu.RUnlock()
+	}
 }
 
 // BroadcastExcept sends to all peers except the specified one (used for relaying).
 // Enhanced to be non-blocking and skip banned peers.
 func (n *Node) BroadcastExcept(env *Envelope, except *Peer) {
-        if env == nil || except == nil {
-                return
-        }
-        for i := range n.peerShards {
-                sh := &n.peerShards[i]
-                sh.mu.RLock()
-                for _, p := range sh.peers {
-                        if p != except && p.IsConnected() && !p.IsBanned() {
-                                go p.SendEnvelope(env) // Fire-and-forget
-                        }
-                }
-                sh.mu.RUnlock()
-        }
+	if env == nil || except == nil {
+		return
+	}
+	for i := range n.peerShards {
+		sh := &n.peerShards[i]
+		sh.mu.RLock()
+		for _, p := range sh.peers {
+			if p != except && p.IsConnected() && !p.IsBanned() {
+				go p.SendEnvelope(env) // Fire-and-forget
+			}
+		}
+		sh.mu.RUnlock()
+	}
 }
 
 // BroadcastTransaction serializes and broadcasts a ledger transaction using the canonical MsgTypeTx.
 // Enhanced to use secure envelope creation with nonce and payload size check.
 func (n *Node) BroadcastTransaction(tx *ledger.Transaction) error {
-        env, err := NewEnvelopeFromPayload(n.ProtocolVersion(), MsgTypeTx, tx)
-        if err != nil {
-                return fmt.Errorf("failed to encode transaction: %w", err)
-        }
-        n.BroadcastEnvelope(env)
-        return nil
+	env, err := NewEnvelopeFromPayload(n.ProtocolVersion(), MsgTypeTx, tx)
+	if err != nil {
+		return fmt.Errorf("failed to encode transaction: %w", err)
+	}
+	n.BroadcastEnvelope(env)
+	return nil
 }
 
 // Implement scan.Broadcaster interface required by Exploscan
 func (n *Node) BroadcastMessage(msgType string, payload interface{}) error {
-    env, err := NewEnvelopeFromPayload(n.ProtocolVersion(), MessageType(msgType), payload)
-    if err != nil {
-        return fmt.Errorf("failed to create envelope: %w", err)
-    }
-    n.BroadcastEnvelope(env)
-    return nil
+	env, err := NewEnvelopeFromPayload(n.ProtocolVersion(), MessageType(msgType), payload)
+	if err != nil {
+		return fmt.Errorf("failed to create envelope: %w", err)
+	}
+	n.BroadcastEnvelope(env)
+	return nil
 }
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CUSTOM MESSAGE HANDLING – Multi-handler support (no overwrite)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -276,26 +256,26 @@ func initCustomHandlers(n *Node) {
 // IsOnlineCount returns the number of connected peers across all shards.
 
 func (n *Node) IsOnlineCount(maxPerShard int) int {
-    total := 0
+	total := 0
 
-    for i := range n.peerShards {
-        sh := &n.peerShards[i]
+	for i := range n.peerShards {
+		sh := &n.peerShards[i]
 
-        sh.mu.RLock()
-        checked := 0
-        for _, p := range sh.peers {
-            if p.IsConnected() {
-                total++
-            }
-            checked++
-            if maxPerShard > 0 && checked >= maxPerShard {
-                break
-            }
-        }
-        sh.mu.RUnlock()
-    }
+		sh.mu.RLock()
+		checked := 0
+		for _, p := range sh.peers {
+			if p.IsConnected() {
+				total++
+			}
+			checked++
+			if maxPerShard > 0 && checked >= maxPerShard {
+				break
+			}
+		}
+		sh.mu.RUnlock()
+	}
 
-    return total
+	return total
 }
 
 // HasPeers returns true if the node knows at least one peer (connected or not).
@@ -304,4 +284,3 @@ func (n *Node) HasPeers() bool {
 	defer n.PeersMutex.RUnlock()
 	return len(n.Peers) > 0
 }
-

@@ -2,7 +2,6 @@
 package p2p
 
 import (
-	"context"
 	"crypto/sha256"
 	"fmt"
 	"log"
@@ -332,39 +331,125 @@ func (n *Node) AutoRegisterLocalMiners() {
 	}
 }
 
-// startLightSyncCycles runs up to 5 ledger sync attempts with increasing delays.
-// FIX Bug #9: all sleeps now respect n.ctx.Done() to avoid goroutine leak on node shutdown.
+// startLightSyncCycles performs a limited number of asynchronous
+// ledger synchronization attempts.
+//
+// Synchronization itself is asynchronous:
+//
+//	SyncLedgerFromBestPeer()
+//	        |
+//	        v
+//	  GETBLOCKSRANGE
+//	        |
+//	        v
+//	  BLOCKSRESPONSE
+//	        |
+//	        v
+//	     AddBlock()
+//
+// This function only starts and monitors synchronization sessions.
+// It never cancels an active synchronization context prematurely.
 func (n *Node) startLightSyncCycles() {
 	const maxCycles = 5
+	const syncMonitorInterval = 1 * time.Second
+	const syncAttemptTimeout = 35 * time.Second
 
 	for cycle := 1; cycle <= maxCycles; cycle++ {
-		// Check for shutdown before each cycle.
+
+		// ------------------------------------------------------------
+		// 1. Check node shutdown.
+		// ------------------------------------------------------------
+
 		select {
 		case <-n.ctx.Done():
 			return
 		default:
 		}
 
+		// ------------------------------------------------------------
+		// 2. Wait for at least one connected peer.
+		// ------------------------------------------------------------
+
 		if n.PeerCount() == 0 {
 			select {
 			case <-n.ctx.Done():
 				return
+
 			case <-time.After(6 * time.Second):
 			}
+
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(n.ctx, 35*time.Second)
-		n.SyncLedgerFromBestPeer(ctx)
-		cancel()
+		// ------------------------------------------------------------
+		// 3. Start one asynchronous synchronization session.
+		// ------------------------------------------------------------
+
+		n.SyncLedgerFromBestPeer(n.ctx)
+
+		// ------------------------------------------------------------
+		// 4. Monitor the active synchronization session.
+		//
+		// We do NOT cancel n.ctx.
+		// The node context belongs to the whole P2P node lifetime.
+		//
+		// The timeout here only limits how long this monitoring cycle
+		// waits before allowing the next cycle to evaluate the state.
+		// ------------------------------------------------------------
+
+		deadline := time.NewTimer(syncAttemptTimeout)
+
+	monitorLoop:
+		for {
+			select {
+
+			case <-n.ctx.Done():
+				if !deadline.Stop() {
+					select {
+					case <-deadline.C:
+					default:
+					}
+				}
+				return
+
+			case <-deadline.C:
+				break monitorLoop
+
+			case <-time.After(syncMonitorInterval):
+				n.syncMu.Lock()
+				running := n.syncRunning
+				n.syncMu.Unlock()
+
+				if !running {
+					break monitorLoop
+				}
+
+				if n.IsLedgerComplete() {
+					break monitorLoop
+				}
+			}
+		}
+
+		// ------------------------------------------------------------
+		// 5. Stop immediately if synchronization completed.
+		// ------------------------------------------------------------
 
 		if n.IsLedgerComplete() {
+			log.Printf(
+				"[p2p] 🎉 Initial ledger synchronization completed",
+			)
 			return
 		}
+
+		// ------------------------------------------------------------
+		// 6. Give the network a short recovery interval before
+		// attempting another synchronization cycle.
+		// ------------------------------------------------------------
 
 		select {
 		case <-n.ctx.Done():
 			return
+
 		case <-time.After(5 * time.Second):
 		}
 	}

@@ -200,6 +200,18 @@ func (n *Node) registerDefaultHandlers() {
 			p.id = PeerID(hs.PeerID)
 			p.mu.Unlock()
 
+			// Store the remote blockchain height announced by the authenticated
+			// handshake. This value is used only for synchronization decisions.
+			p.mu.Lock()
+			p.LatestHeight = hs.ChainHeight
+			p.mu.Unlock()
+
+			log.Printf(
+				"[p2p] 📏 Remote chain height from %s: %d",
+				hs.PeerID,
+				hs.ChainHeight,
+			)
+
 			// =========================================================
 			// 9. MINER / INVESTOR ROLE CONSISTENCY
 			// =========================================================
@@ -658,54 +670,479 @@ func (n *Node) registerDefaultHandlers() {
 	})
 
 	// =========================================================
-	// GET BLOCK RANGE (UNCHANGED)
+	// BLOCK RANGE REQUEST
 	// =========================================================
+	//
+	// GETBLOCKSRANGE requests a bounded range of blockchain blocks.
+	//
+	// The response is always asynchronous. The requesting peer receives
+	// a BLOCKSRESPONSE through the normal P2P message pipeline.
+	//
+	// A maximum of 50 blocks is allowed per request in order to keep
+	// memory, bandwidth and mobile CPU usage bounded.
 	n.RegisterHandler(MsgTypeGetBlocksRange, func(p *Peer, env *Envelope) {
 
-		var req GetBlocksRangePayload
-		if err := UnmarshalPayload(env.Payload, &req); err != nil {
+		if n == nil || n.Ledger == nil {
+			log.Printf(
+				"[p2p] ⚠️ Cannot serve GETBLOCKSRANGE: ledger not initialized",
+			)
 			return
 		}
+
+		if p == nil {
+			log.Printf(
+				"[p2p] ⚠️ GETBLOCKSRANGE received from nil peer",
+			)
+			return
+		}
+
+		// ---------------------------------------------------------
+		// 1. Decode request
+		// ---------------------------------------------------------
+
+		var req GetBlocksRangePayload
+
+		if err := UnmarshalPayload(env.Payload, &req); err != nil {
+			log.Printf(
+				"[p2p] ❌ Invalid GETBLOCKSRANGE from %s: %v",
+				p.addr,
+				err,
+			)
+			p.Penalize(5, 0)
+			return
+		}
+
+		// ---------------------------------------------------------
+		// 2. Validate requested range
+		// ---------------------------------------------------------
 
 		if req.From > req.To {
+			log.Printf(
+				"[p2p] 🚫 Invalid GETBLOCKSRANGE from %s: from=%d to=%d",
+				p.addr,
+				req.From,
+				req.To,
+			)
+			p.Penalize(3, 0)
 			return
 		}
 
+		// Never serve more than 50 blocks in one response.
 		if req.To-req.From+1 > 50 {
 			req.To = req.From + 49
 		}
 
-		blocks, err := n.Ledger.GetBlocksRange(req.From, req.To)
-		if err != nil || len(blocks) == 0 {
+		// ---------------------------------------------------------
+		// 3. Read requested blocks from the authoritative ledger
+		// ---------------------------------------------------------
+
+		blocks, err := n.Ledger.GetBlocksRange(
+			req.From,
+			req.To,
+		)
+
+		if err != nil {
+			log.Printf(
+				"[p2p] ⚠️ Failed to read blocks %d-%d for %s: %v",
+				req.From,
+				req.To,
+				p.addr,
+				err,
+			)
 			return
 		}
 
+		// ---------------------------------------------------------
+		// 4. Return an explicit empty response when the requested
+		// range is not available.
+		//
+		// The requester can then terminate the current sync session
+		// instead of waiting forever.
+		// ---------------------------------------------------------
+
+		if len(blocks) == 0 {
+
+			log.Printf(
+				"[p2p] 📭 No blocks available for requested range %d-%d from %s",
+				req.From,
+				req.To,
+				p.addr,
+			)
+
+			payload := struct {
+				Blocks []*ledger.Block `cbor:"blocks"`
+			}{
+				Blocks: []*ledger.Block{},
+			}
+
+			resp, err := NewEnvelopeFromPayload(
+				n.ProtocolVersion(),
+				MsgTypeBlocksResponse,
+				payload,
+			)
+
+			if err != nil {
+				log.Printf(
+					"[p2p] ⚠️ Failed to create empty BLOCKSRESPONSE for %s: %v",
+					p.addr,
+					err,
+				)
+				return
+			}
+
+			if err := p.SendEnvelope(resp); err != nil {
+				log.Printf(
+					"[p2p] ⚠️ Failed to send empty BLOCKSRESPONSE to %s: %v",
+					p.addr,
+					err,
+				)
+			}
+
+			return
+		}
+
+		// ---------------------------------------------------------
+		// 5. Build BLOCKSRESPONSE
+		// ---------------------------------------------------------
+
 		payload := struct {
 			Blocks []*ledger.Block `cbor:"blocks"`
-		}{Blocks: blocks}
+		}{
+			Blocks: blocks,
+		}
 
-		resp, _ := NewEnvelopeFromPayload(n.ProtocolVersion(),
-			MsgTypeBlocksResponse, payload)
+		resp, err := NewEnvelopeFromPayload(
+			n.ProtocolVersion(),
+			MsgTypeBlocksResponse,
+			payload,
+		)
 
-		_ = p.SendEnvelope(resp)
+		if err != nil {
+			log.Printf(
+				"[p2p] ⚠️ Failed to create BLOCKSRESPONSE for %s: %v",
+				p.addr,
+				err,
+			)
+			return
+		}
+
+		// ---------------------------------------------------------
+		// 6. Send response asynchronously through the peer session
+		// ---------------------------------------------------------
+
+		if err := p.SendEnvelope(resp); err != nil {
+			log.Printf(
+				"[p2p] ⚠️ Failed to send BLOCKSRESPONSE to %s: %v",
+				p.addr,
+				err,
+			)
+			return
+		}
+
+		log.Printf(
+			"[p2p] 📤 BLOCKSRESPONSE sent to %s: blocks=%d range=%d-%d",
+			p.addr,
+			len(blocks),
+			req.From,
+			req.To,
+		)
 	})
 
 	// =========================================================
-	// BLOCKS RESPONSE (UNCHANGED)
+	// BLOCK SYNCHRONIZATION RESPONSE
 	// =========================================================
+	//
+	// BLOCKSRESPONSE is the asynchronous continuation of a
+	// GETBLOCKSRANGE synchronization session.
+	//
+	// Only the peer selected by SyncLedgerFromBestPeer may advance
+	// the active synchronization session. Blocks are always applied
+	// strictly in sequential height order and are cryptographically
+	// verified before entering the local ledger.
 	n.RegisterHandler(MsgTypeBlocksResponse, func(p *Peer, env *Envelope) {
+
+		if n == nil || n.Ledger == nil {
+			log.Printf(
+				"[p2p] ⚠️ Cannot process BLOCKSRESPONSE: ledger not initialized",
+			)
+			return
+		}
+
+		if p == nil {
+			log.Printf(
+				"[p2p] ⚠️ BLOCKSRESPONSE received from nil peer",
+			)
+			return
+		}
+
+		// ---------------------------------------------------------
+		// 1. Decode response
+		// ---------------------------------------------------------
 
 		var resp struct {
 			Blocks []*ledger.Block `cbor:"blocks"`
 		}
 
 		if err := UnmarshalPayload(env.Payload, &resp); err != nil {
+			log.Printf(
+				"[p2p] ❌ Invalid BLOCKSRESPONSE from %s: %v",
+				p.addr,
+				err,
+			)
+			p.Penalize(5, 0)
 			return
 		}
 
-		for _, blk := range resp.Blocks {
-			_ = n.Ledger.AddBlock(blk)
+		// ---------------------------------------------------------
+		// 2. Verify active synchronization session
+		// ---------------------------------------------------------
+
+		n.syncMu.Lock()
+
+		syncRunning := n.syncRunning
+		syncPeer := n.syncPeer
+		syncTarget := n.syncTarget
+
+		n.syncMu.Unlock()
+
+		if !syncRunning {
+			log.Printf(
+				"[p2p] ⚠️ Ignoring unsolicited BLOCKSRESPONSE from %s",
+				p.addr,
+			)
+			return
 		}
+
+		if syncPeer == nil {
+			log.Printf(
+				"[p2p] ⚠️ Ignoring BLOCKSRESPONSE from %s: no active sync peer",
+				p.addr,
+			)
+			return
+		}
+
+		if syncPeer != p {
+			log.Printf(
+				"[p2p] ⚠️ Ignoring BLOCKSRESPONSE from %s: response is not from active sync peer %s",
+				p.addr,
+				syncPeer.Addr(),
+			)
+			return
+		}
+
+		// ---------------------------------------------------------
+		// 3. Empty response
+		// ---------------------------------------------------------
+
+		if len(resp.Blocks) == 0 {
+
+			log.Printf(
+				"[p2p] 📭 Empty BLOCKSRESPONSE from active sync peer %s",
+				p.addr,
+			)
+
+			n.syncMu.Lock()
+
+			if n.syncPeer == p {
+				n.syncRunning = false
+				n.syncPeer = nil
+				n.syncTarget = 0
+			}
+
+			n.syncMu.Unlock()
+
+			log.Printf(
+				"[p2p] ⚠️ Synchronization session ended: peer %s returned no blocks",
+				p.addr,
+			)
+
+			return
+		}
+
+		// ---------------------------------------------------------
+		// 4. Apply blocks strictly in sequential order
+		// ---------------------------------------------------------
+
+		for _, blk := range resp.Blocks {
+
+			if blk == nil {
+				log.Printf(
+					"[p2p] 🚫 Nil block received from %s",
+					p.addr,
+				)
+
+				p.Penalize(5, 0)
+				return
+			}
+
+			localHeight := n.Ledger.GetLatestBlockHeight()
+
+			// Already synchronized.
+			if blk.Header.Height <= localHeight {
+				continue
+			}
+
+			// A synchronization response must contain exactly the
+			// next expected block. Never accept height gaps.
+			if blk.Header.Height != localHeight+1 {
+
+				log.Printf(
+					"[p2p] 🚫 Block height gap from %s: got=%d expected=%d",
+					p.addr,
+					blk.Header.Height,
+					localHeight+1,
+				)
+
+				p.Penalize(15, time.Hour)
+
+				n.syncMu.Lock()
+
+				if n.syncPeer == p {
+					n.syncRunning = false
+					n.syncPeer = nil
+					n.syncTarget = 0
+				}
+
+				n.syncMu.Unlock()
+
+				return
+			}
+
+			// -----------------------------------------------------
+			// Verify block cryptographic signature
+			// -----------------------------------------------------
+
+			ok, err := blk.VerifySignature()
+
+			if err != nil || !ok {
+
+				log.Printf(
+					"[p2p] 🚫 Invalid block signature from %s at height %d: %v",
+					p.addr,
+					blk.Header.Height,
+					err,
+				)
+
+				p.Penalize(15, time.Hour)
+
+				n.syncMu.Lock()
+
+				if n.syncPeer == p {
+					n.syncRunning = false
+					n.syncPeer = nil
+					n.syncTarget = 0
+				}
+
+				n.syncMu.Unlock()
+
+				return
+			}
+
+			// -----------------------------------------------------
+			// Apply through the authoritative ledger validation layer
+			// -----------------------------------------------------
+
+			if err := n.Ledger.AddBlock(blk); err != nil {
+
+				log.Printf(
+					"[p2p] 🚫 Failed to apply synced block %d from %s: %v",
+					blk.Header.Height,
+					p.addr,
+					err,
+				)
+
+				n.syncMu.Lock()
+
+				if n.syncPeer == p {
+					n.syncRunning = false
+					n.syncPeer = nil
+					n.syncTarget = 0
+				}
+
+				n.syncMu.Unlock()
+
+				return
+			}
+
+			log.Printf(
+				"[p2p] ✅ Synced block #%d from %s",
+				blk.Header.Height,
+				p.addr,
+			)
+		}
+
+		// ---------------------------------------------------------
+		// 5. Check synchronization progress
+		// ---------------------------------------------------------
+
+		currentHeight := n.Ledger.GetLatestBlockHeight()
+
+		if currentHeight >= syncTarget {
+
+			n.syncMu.Lock()
+
+			if n.syncPeer == p {
+				n.syncRunning = false
+				n.syncPeer = nil
+				n.syncTarget = 0
+			}
+
+			n.syncMu.Unlock()
+
+			log.Printf(
+				"[p2p] 🎉 Ledger synchronized with %s at height %d",
+				p.addr,
+				currentHeight,
+			)
+
+			return
+		}
+
+		// ---------------------------------------------------------
+		// 6. Request next synchronization segment
+		// ---------------------------------------------------------
+
+		from := currentHeight + 1
+		to := from + 49
+
+		if to > syncTarget {
+			to = syncTarget
+		}
+
+		log.Printf(
+			"[p2p] 📥 Requesting next sync segment %d-%d from %s",
+			from,
+			to,
+			p.addr,
+		)
+
+		if err := p.requestBlocksRange(from, to); err != nil {
+
+			log.Printf(
+				"[p2p] ⚠️ Failed to request next sync segment from %s: %v",
+				p.addr,
+				err,
+			)
+
+			n.syncMu.Lock()
+
+			if n.syncPeer == p {
+				n.syncRunning = false
+				n.syncPeer = nil
+				n.syncTarget = 0
+			}
+
+			n.syncMu.Unlock()
+
+			return
+		}
+
+		log.Printf(
+			"[p2p] 📤 Next sync request sent: blocks %d-%d from %s",
+			from,
+			to,
+			p.addr,
+		)
 	})
 
 	// =========================================================

@@ -557,6 +557,10 @@ func (p *Peer) sendHandshake() error {
 		Network:       p.node.networkID,
 		IsMiner:       isMiner,
 		MinerID:       minerID,
+
+		// Advertise the highest block height currently known by this node.
+		// This is public synchronization metadata only.
+		ChainHeight: p.node.Ledger.GetLatestBlockHeight(),
 	}
 
 	if strings.TrimSpace(h.PeerID) == "" {
@@ -1797,44 +1801,64 @@ func (p *Peer) RequestBlocksSince(height uint64) ([]*ledger.Block, error) {
 	return nil, fmt.Errorf("RequestBlocksSince not implemented")
 }
 
-// RequestBlocksRange sends a request to the remote peer for a range of blocks
-// from height 'from' to 'to' (inclusive).
+// requestBlocksRange sends a block-range request without waiting
+// for the blockchain data.
 //
-// This is a fire-and-forget operation: the function only sends the request
-// envelope and returns immediately. The actual blocks are delivered asynchronously
-// via the node's MsgTypeBlocksResponse handler, which processes the response
-// and adds the received blocks to the local ledger.
+// The corresponding BLOCKSRESPONSE is delivered asynchronously
+// through the node message handler.
 //
-// This design keeps the P2P layer non-blocking and mobile-friendly while
-// allowing concurrent requests to multiple peers during ledger synchronization.
-//
-// Returns:
-//   - nil, nil on successful enqueue of the request
-//   - an error if envelope creation or sending fails
-//
-// RequestBlocksRange sends a GetBlocksRange request to the peer.
-// Now returns ([]*ledger.Block, error) to allow synchronous use during sync,
-// but remains non-blocking at network level. Response handled via node handler.
-// RequestBlocksRange sends a GetBlocksRange request to the peer.
-// Currently fire-and-forget (response handled asynchronously).
-// Returns nil blocks to reflect current design.
-func (p *Peer) RequestBlocksRange(from, to uint64) ([]*ledger.Block, error) {
-	if p.node == nil {
-		return nil, errors.New("no node reference")
+// The synchronization engine uses this function to advance from
+// one block segment to the next.
+func (p *Peer) requestBlocksRange(from, to uint64) error {
+	if p == nil {
+		return errors.New("nil peer")
 	}
 
-	payload := GetBlocksRangePayload{From: from, To: to}
-	env, err := NewEnvelopeFromPayload(p.node.ProtocolVersion(), MsgTypeGetBlocksRange, payload)
+	if p.node == nil {
+		return errors.New("no node reference")
+	}
+
+	if from > to {
+		return errors.New("invalid block range")
+	}
+
+	// Never request more than 50 blocks in one message.
+	if to-from+1 > 50 {
+		to = from + 49
+	}
+
+	payload := GetBlocksRangePayload{
+		From: from,
+		To:   to,
+	}
+
+	env, err := NewEnvelopeFromPayload(
+		p.node.ProtocolVersion(),
+		MsgTypeGetBlocksRange,
+		payload,
+	)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf(
+			"failed to create block range request: %w",
+			err,
+		)
 	}
 
 	if err := p.SendEnvelope(env); err != nil {
-		return nil, err
+		return fmt.Errorf(
+			"failed to send block range request: %w",
+			err,
+		)
 	}
 
-	// Response arrives via node handler (MsgTypeBlocksResponse)
-	return nil, nil
+	log.Printf(
+		"[p2p] 📤 GETBLOCKSRANGE %d-%d sent to %s",
+		from,
+		to,
+		p.addr,
+	)
+
+	return nil
 }
 
 func (p *Peer) IsVerifiedMiner() bool {
