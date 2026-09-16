@@ -813,42 +813,87 @@ func (n *Node) handleNewConnection(conn net.Conn) {
 	}()
 }
 
+// addPeer registers the authenticated peer session.
+//
+// A Peer represents one connection session. If the same peer identity
+// reconnects, the new authenticated session replaces the old session.
+// The old session is closed only after all node locks are released.
+//
+// Disconnect handlers must remove only the exact session pointer they
+// belong to. This prevents an old connection from accidentally removing
+// a newer connection for the same peer identity.
 func (n *Node) addPeer(p *Peer) {
-	if p == nil || p.id == "" {
+	if n == nil || p == nil {
 		return
 	}
 
-	sh := n.shard(p.id)
+	p.mu.RLock()
+	peerID := p.id
+	peerAddr := p.addr
+	p.mu.RUnlock()
 
-	// Check peer limit without holding the target shard lock.
-	// PeerCount() acquires read locks on all shards.
+	if peerID == "" {
+		log.Printf("[p2p] ❌ cannot add peer with empty identity")
+		p.Close()
+		return
+	}
+
+	sh := n.shard(peerID)
+
+	// ------------------------------------------------------------
+	// 1. Check the peer limit.
+	// ------------------------------------------------------------
+
 	currentCount := n.PeerCount()
+
+	// ------------------------------------------------------------
+	// 2. Replace the session inside the shard.
+	// ------------------------------------------------------------
 
 	sh.mu.Lock()
 
-	// Re-check whether this peer already exists.
-	_, alreadyExists := sh.peers[p.id]
+	oldPeer, exists := sh.peers[peerID]
 
-	if !alreadyExists && currentCount >= n.config.MaxPeers {
+	if !exists && currentCount >= n.config.MaxPeers {
 		sh.mu.Unlock()
 
-		log.Printf("[p2p] ⚠️ Peer limit exceeded (%d/%d) — rejecting peer %s (%s)",
-			currentCount, n.config.MaxPeers, p.id, p.addr)
+		log.Printf(
+			"[p2p] ⚠️ Peer limit exceeded (%d/%d) — rejecting peer %s (%s)",
+			currentCount,
+			n.config.MaxPeers,
+			peerID,
+			peerAddr,
+		)
 
 		p.Close()
 		return
 	}
 
-	oldPeer, exists := sh.peers[p.id]
-	sh.peers[p.id] = p
+	// The newly authenticated session becomes authoritative.
+	sh.peers[peerID] = p
 
 	sh.mu.Unlock()
+
+	// ------------------------------------------------------------
+	// 3. Update the global active-session list.
+	// ------------------------------------------------------------
 
 	n.PeersMutex.Lock()
 
 	replaced := false
-	for i, peer := range n.Peers {
-		if peer.id == p.id {
+
+	for i := 0; i < len(n.Peers); i++ {
+		existing := n.Peers[i]
+
+		if existing == nil {
+			continue
+		}
+
+		existing.mu.RLock()
+		existingID := existing.id
+		existing.mu.RUnlock()
+
+		if existingID == peerID {
 			n.Peers[i] = p
 			replaced = true
 			break
@@ -861,17 +906,63 @@ func (n *Node) addPeer(p *Peer) {
 
 	n.PeersMutex.Unlock()
 
+	// ------------------------------------------------------------
+	// 4. Close the previous session AFTER releasing all locks.
+	// ------------------------------------------------------------
+
+	if exists && oldPeer != nil && oldPeer != p {
+		log.Printf(
+			"[p2p] ♻️ Replacing old peer session: id=%s old=%s new=%s",
+			peerID,
+			oldPeer.addr,
+			peerAddr,
+		)
+
+		// Close() is intentionally non-blocking.
+		//
+		// The old session's disconnect handler will only remove the
+		// exact old Peer pointer. It cannot remove the new session.
+		oldPeer.Close()
+	}
+
+	// ------------------------------------------------------------
+	// 5. Update activity/reputation bookkeeping.
+	// ------------------------------------------------------------
+
+	now := time.Now()
+
+	n.peerLastSeen.Store(peerID, now)
+
+	if _, exists := n.peerReputation.Load(peerID); !exists {
+		n.peerReputation.Store(peerID, 0)
+	}
+
+	// ------------------------------------------------------------
+	// 6. Log the resulting active session.
+	// ------------------------------------------------------------
+
 	newTotal := n.PeerCount()
 
-	if exists && oldPeer != p {
+	if exists && oldPeer != nil && oldPeer != p {
 		log.Printf(
-			"[p2p] ♻️ Peer updated: id=%s addr=%s (total connected peers: %d)",
-			p.id, p.addr, newTotal,
+			"[p2p] ♻️ Peer session replaced: id=%s addr=%s (total connected peers: %d)",
+			peerID,
+			peerAddr,
+			newTotal,
 		)
 	} else if !exists {
 		log.Printf(
 			"[p2p] 🌱 New peer successfully added: id=%s addr=%s (total connected peers: %d)",
-			p.id, p.addr, newTotal,
+			peerID,
+			peerAddr,
+			newTotal,
+		)
+	} else {
+		log.Printf(
+			"[p2p] 🔄 Peer session refreshed: id=%s addr=%s (total connected peers: %d)",
+			peerID,
+			peerAddr,
+			newTotal,
 		)
 	}
 }

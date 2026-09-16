@@ -1,24 +1,28 @@
 // internal/p2p/node4.go
 package p2p
+
 import (
-        "context"
-        "fmt"
-        "log"
-        "strings"
-        "sync"
-        "time"
-        "explosive/internal/ledger"
+	"context"
+	"explosive/internal/ledger"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"time"
 )
 
-/* -------------------------------------------------------------------------
-   Deterministic port derivation helpers
-   - These helpers are intentionally non-invasive: they do not change Node
-     constructors or startup flow. Call ApplyDerivedListenAddrToNode(n, id, words)                               after restoring the miner identity to set the derived listen address.
-   - Default port range: [31000, 61000]
---------------------------------------------------------------------------- */
+/*
+	-------------------------------------------------------------------------
+	  Deterministic port derivation helpers
+	  - These helpers are intentionally non-invasive: they do not change Node
+	    constructors or startup flow. Call ApplyDerivedListenAddrToNode(n, id, words)                               after restoring the miner identity to set the derived listen address.
+	  - Default port range: [31000, 61000]
+
+---------------------------------------------------------------------------
+*/
 const (
-        defaultMinPort = 31000
-        defaultMaxPort = 61000
+	defaultMinPort = 31000
+	defaultMaxPort = 61000
 )
 
 // ProtocolVersion returns the node's protocol version.
@@ -29,63 +33,99 @@ func (n *Node) ProtocolVersion() uint16 {
 // normalizeAndJoinWords does light normalized join of 4 sacred words.
 // It trims spaces and collapses internal whitespace, then joins with '-'.
 func normalizeAndJoinWords(words []string) string {
-        parts := make([]string, 0, len(words))
-        for _, w := range words {
-                s := strings.TrimSpace(w)
-                // collapse internal runs of spaces to one space
-                s = strings.Join(strings.Fields(s), " ")
-                parts = append(parts, s)
-        }
-        return strings.Join(parts, "-")
+	parts := make([]string, 0, len(words))
+	for _, w := range words {
+		s := strings.TrimSpace(w)
+		// collapse internal runs of spaces to one space
+		s = strings.Join(strings.Fields(s), " ")
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, "-")
 }
 
 func (n *Node) PeerReconnectLoop() {
-    ticker := time.NewTicker(30 * time.Second)
-    defer ticker.Stop()
-    for {
-        select {
-        case <-n.ctx.Done():
-            return
-        case <-ticker.C:
-            n.PeersMutex.RLock()
-            peersCopy := append([]*Peer(nil), n.Peers...)
-            n.PeersMutex.RUnlock()
-            for _, p := range peersCopy {
-                if !p.IsConnected() {
-                    go func(peer *Peer) {
-                        if err := peer.Connect(); err != nil {
-                            log.Printf("⚠️ failed to reconnect to %s: %v", peer.addr, err)
-                        } else {
-                            log.Printf("🔄 reconnected to peer %s", peer.addr)
-                        }
-                    }(p)
-                }
-            }
-        }
-    }
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+
+		case <-ticker.C:
+			// A Peer represents one connection session.
+			// A closed session must never be reused for reconnection.
+			n.PeersMutex.RLock()
+
+			addresses := make([]string, 0, len(n.Peers))
+
+			for _, p := range n.Peers {
+				if p == nil {
+					continue
+				}
+
+				if p.IsConnected() {
+					continue
+				}
+
+				addr := strings.TrimSpace(p.addr)
+				if addr == "" {
+					continue
+				}
+
+				addresses = append(addresses, addr)
+			}
+
+			n.PeersMutex.RUnlock()
+
+			// Create a completely new Peer session for every
+			// disconnected peer address.
+			for _, addr := range addresses {
+				addr := addr
+
+				go func() {
+					peer := NewPeer("", addr, n)
+
+					if err := peer.Connect(); err != nil {
+						log.Printf(
+							"[p2p] ⚠️ failed to reconnect to %s: %v",
+							addr,
+							err,
+						)
+						return
+					}
+
+					log.Printf(
+						"[p2p] 🔄 new P2P session created for %s",
+						addr,
+					)
+				}()
+			}
+		}
+	}
 }
 
 // SendKnownPeers sends a list of known connected peers to the requesting peer.
 func (n *Node) SendKnownPeers(p *Peer) {
-    addrs := make([]string, 0, 32)
+	addrs := make([]string, 0, 32)
 
-    for i := range n.peerShards {
-        sh := &n.peerShards[i]
-        sh.mu.RLock()
-        for _, peer := range sh.peers {
-            if peer.IsConnected() && peer != p && peer.addr != n.listenAddr {
-                addrs = append(addrs, peer.addr)
-            }
-        }
-        sh.mu.RUnlock()
-    }
+	for i := range n.peerShards {
+		sh := &n.peerShards[i]
+		sh.mu.RLock()
+		for _, peer := range sh.peers {
+			if peer.IsConnected() && peer != p && peer.addr != n.listenAddr {
+				addrs = append(addrs, peer.addr)
+			}
+		}
+		sh.mu.RUnlock()
+	}
 
-    if len(addrs) == 0 {
-        return
-    }
+	if len(addrs) == 0 {
+		return
+	}
 
-    env, _ := NewEnvelopeFromPayload(n.protocolVersion, MsgTypePeers, PeersPayload{Addrs: addrs})
-    _ = p.SendEnvelope(env)
+	env, _ := NewEnvelopeFromPayload(n.protocolVersion, MsgTypePeers, PeersPayload{Addrs: addrs})
+	_ = p.SendEnvelope(env)
 }
 
 // SyncLedgerFromBestPeer synchronizes the local ledger with the peer
@@ -290,32 +330,32 @@ func (n *Node) SyncLedgerFromBestPeer(ctx context.Context) {
 }
 
 func (n *Node) StartSeedMode() {
-    n.config.IsSeedNode = true
-    log.Println("🌱 Seed mode enabled: responding with peer lists.")
+	n.config.IsSeedNode = true
+	log.Println("🌱 Seed mode enabled: responding with peer lists.")
 }
 
 func (n *Node) AllPeers() []*Peer {
-    n.PeersMutex.RLock()
-    defer n.PeersMutex.RUnlock()
-    return append([]*Peer(nil), n.Peers...)
+	n.PeersMutex.RLock()
+	defer n.PeersMutex.RUnlock()
+	return append([]*Peer(nil), n.Peers...)
 }
 
 func (n *Node) IsLedgerComplete() bool {
-    if n.PeerCount() == 0 || n.Ledger == nil {
-        return false
-    }
+	if n.PeerCount() == 0 || n.Ledger == nil {
+		return false
+	}
 
-    n.PeersMutex.RLock()
-    defer n.PeersMutex.RUnlock()
+	n.PeersMutex.RLock()
+	defer n.PeersMutex.RUnlock()
 
-    highest := n.Ledger.GetLatestBlockHeight()
-    for _, p := range n.Peers {
-        p.mu.RLock()
-        peerHeight := p.LatestHeight
-        p.mu.RUnlock()
-        if peerHeight > highest {
-            return false
-        }
-    }
-    return true
+	highest := n.Ledger.GetLatestBlockHeight()
+	for _, p := range n.Peers {
+		p.mu.RLock()
+		peerHeight := p.LatestHeight
+		p.mu.RUnlock()
+		if peerHeight > highest {
+			return false
+		}
+	}
+	return true
 }

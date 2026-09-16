@@ -1,14 +1,14 @@
 package p2p
 
 import (
-	"crypto/sha256"
+	"crypto/ed25519"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"log"
-        "crypto/ed25519"
-        "strings"
 	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -30,7 +30,7 @@ const (
 
 	basePoWDifficulty = 18
 
-	maxNonces           = 10000
+	maxNonces            = 10000
 	maxInactivityPenalty = 20
 )
 
@@ -46,120 +46,164 @@ type HandshakeChallenge struct {
 // Generate PoW challenge (server-side)
 func generateChallenge(difficulty int, networkID string) HandshakeChallenge {
 
-    b := make([]byte, 16)
-    _, _ = cryptorand.Read(b)
+	b := make([]byte, 16)
+	_, _ = cryptorand.Read(b)
 
-    nonce := hex.EncodeToString(b) + networkID
+	nonce := hex.EncodeToString(b) + networkID
 
-    return HandshakeChallenge{
-        Nonce:      nonce,
-        Difficulty: difficulty,
-    }
+	return HandshakeChallenge{
+		Nonce:      nonce,
+		Difficulty: difficulty,
+	}
 }
 
 // 🔥 PoW must bind nonce + identity (anti-replay + anti-share)
 func verifyPoW(nonce string, peerID PeerID, difficulty int) bool {
 
-    data := nonce + string(peerID)
+	data := nonce + string(peerID)
 
-    hash := sha256.Sum256([]byte(data))
-    hashHex := hex.EncodeToString(hash[:])
+	hash := sha256.Sum256([]byte(data))
+	hashHex := hex.EncodeToString(hash[:])
 
-    prefix := strings.Repeat("0", difficulty/4)
+	prefix := strings.Repeat("0", difficulty/4)
 
-    return strings.HasPrefix(hashHex, prefix)
+	return strings.HasPrefix(hashHex, prefix)
 }
 
 // Dynamic PoW difficulty based on network load
 func (n *Node) currentPoWDifficulty() int {
 
-    peers := n.PeerCount()
+	peers := n.PeerCount()
 
-    switch {
-    case peers > 100:
-        return 6
-    case peers > 50:
-        return 5
-    default:
-        return 4
-    }
+	switch {
+	case peers > 100:
+		return 6
+	case peers > 50:
+		return 5
+	default:
+		return 4
+	}
 }
 
-
-/* =========================
-   PEER REGISTRATION
-   ========================= */
+// =========================
+// PEER REGISTRATION
+// =========================
 
 func (n *Node) registerPeer(p *Peer, realID PeerID) {
+	if p == nil {
+		return
+	}
 
-        if p == nil {
-                return
-        }
+	if realID == "" {
+		log.Printf("[p2p] ❌ empty peer identity")
+		p.Close()
+		return
+	}
 
-        if realID == "" {
-                log.Printf("p2p: ❌ empty peer identity")
-                p.Close()
-                return
-        }
+	// ------------------------------------------------------------------
+	// 1. Consume the temporary TLS identity cache entry.
+	// ------------------------------------------------------------------
 
-        // ------------------------------------------------------------------
-        // 1. Validate TLS-authenticated identity
-        // ------------------------------------------------------------------
+	val, ok := n.tlsPeerCache.Load(string(realID))
 
-        val, ok := n.tlsPeerCache.Load(string(realID))
+	if ok {
+		if ts, ok := val.(time.Time); ok &&
+			time.Since(ts) <= tlsIdentityTTL {
+			n.tlsPeerCache.Delete(string(realID))
+		}
+	}
 
-        if ok {
-                if ts, ok := val.(time.Time); ok && time.Since(ts) <= tlsIdentityTTL {
-                        n.tlsPeerCache.Delete(string(realID))
-                }
-        }
+	// ------------------------------------------------------------------
+	// 2. Reputation gate.
+	// ------------------------------------------------------------------
 
-        // ------------------------------------------------------------------
-        // 2. Reputation gate
-        // ------------------------------------------------------------------
+	if rep := n.getReputation(realID); rep < minReputationReject {
+		log.Printf(
+			"[p2p] 🚫 rejected low reputation %s (%d)",
+			realID,
+			rep,
+		)
 
-        if rep := n.getReputation(realID); rep < minReputationReject {
+		p.Close()
+		return
+	}
 
-                log.Printf(
-                        "p2p: 🚫 rejected low reputation %s (%d)",
-                        realID,
-                        rep,
-                )
+	// ------------------------------------------------------------------
+	// 3. Register the authenticated P2P session.
+	//
+	// Miner verification MUST NOT be inferred from the ledger here.
+	// The handshake is responsible for cryptographically verifying the
+	// presented miner identity and MinerP2PProof.
+	// ------------------------------------------------------------------
 
-                p.Close()
-                return
-        }
+	p.mu.Lock()
 
-        // ------------------------------------------------------------------
-        // 3. Register peer regardless of ledger status.
-        // Ledger verification only sets trust level.
-        // ------------------------------------------------------------------
+	p.id = realID
+	p.lastSeen = time.Now()
 
-        verified := n.verifyPeerOnChain(realID)
+	// Preserve the verification result established by the handshake.
+	verifiedMiner := p.verifiedMiner
+	verifiedMinerID := p.verifiedMinerID
 
-        p.mu.Lock()
-        p.id = realID
-        p.lastSeen = time.Now()
-        p.verifiedMiner = verified
-        p.mu.Unlock()
+	p.mu.Unlock()
 
-        sh := n.shard(realID)
+	// ------------------------------------------------------------------
+	// 4. Register the current session in the shard.
+	// ------------------------------------------------------------------
 
-        sh.mu.Lock()
-        sh.peers[realID] = p
-        sh.mu.Unlock()
+	sh := n.shard(realID)
 
-        n.peerLastSeen.Store(realID, time.Now())
+	sh.mu.Lock()
 
-        if _, exists := n.peerReputation.Load(realID); !exists {
-                n.peerReputation.Store(realID, 0)
-        }
+	// Only replace an existing session if it is not the same session.
+	oldPeer, exists := sh.peers[realID]
 
-        if verified {
-                log.Printf("p2p: ✅ registered verified peer %s", realID)
-        } else {
-                log.Printf("p2p: ⚠ registered unverified peer %s", realID)
-        }
+	sh.peers[realID] = p
+
+	sh.mu.Unlock()
+
+	// ------------------------------------------------------------------
+	// 5. If another session existed for the same identity, close only
+	//    the old session after releasing the shard lock.
+	// ------------------------------------------------------------------
+
+	if exists && oldPeer != nil && oldPeer != p {
+		log.Printf(
+			"[p2p] ♻️ replacing stale peer session: id=%s old=%s new=%s",
+			realID,
+			oldPeer.addr,
+			p.addr,
+		)
+
+		oldPeer.Close()
+	}
+
+	// ------------------------------------------------------------------
+	// 6. Update peer activity and reputation state.
+	// ------------------------------------------------------------------
+
+	n.peerLastSeen.Store(realID, time.Now())
+
+	if _, exists := n.peerReputation.Load(realID); !exists {
+		n.peerReputation.Store(realID, 0)
+	}
+
+	// ------------------------------------------------------------------
+	// 7. Log the actual authentication state.
+	// ------------------------------------------------------------------
+
+	if verifiedMiner {
+		log.Printf(
+			"[p2p] ✅ registered authenticated miner session: %s (miner=%s)",
+			realID,
+			verifiedMinerID,
+		)
+	} else {
+		log.Printf(
+			"[p2p] 👁️ registered authenticated observer wallet session: %s",
+			realID,
+		)
+	}
 }
 
 /* =========================
@@ -312,49 +356,49 @@ func (n *Node) rewardPeer(id PeerID) {
    ========================= */
 
 func (n *Node) isReplay(nonce string) bool {
-    now := time.Now()
+	now := time.Now()
 
-    // Check replay
-    if val, exists := n.seenNonces.Load(nonce); exists {
-        if now.Sub(val.(time.Time)) < nonceTTL {
-            return true
-        }
-    }
+	// Check replay
+	if val, exists := n.seenNonces.Load(nonce); exists {
+		if now.Sub(val.(time.Time)) < nonceTTL {
+			return true
+		}
+	}
 
-    // Store nonce
-    n.seenNonces.Store(nonce, now)
+	// Store nonce
+	n.seenNonces.Store(nonce, now)
 
-    // Track nonce usage (thread-safe)
-    n.nonceMu.Lock()
-    n.nonceCount[nonce]++
-    n.nonceMu.Unlock()
+	// Track nonce usage (thread-safe)
+	n.nonceMu.Lock()
+	n.nonceCount[nonce]++
+	n.nonceMu.Unlock()
 
-    // Global counter (atomic)
-    atomic.AddInt64(&n.nonceTotal, 1)
+	// Global counter (atomic)
+	atomic.AddInt64(&n.nonceTotal, 1)
 
-    // Lightweight cleanup
-    if atomic.LoadInt64(&n.nonceTotal) > maxNonces {
+	// Lightweight cleanup
+	if atomic.LoadInt64(&n.nonceTotal) > maxNonces {
 
-        i := 0
+		i := 0
 
-        n.seenNonces.Range(func(key, value any) bool {
+		n.seenNonces.Range(func(key, value any) bool {
 
-            if i%10 == 0 {
-                n.seenNonces.Delete(key)
+			if i%10 == 0 {
+				n.seenNonces.Delete(key)
 
-                n.nonceMu.Lock()
-                delete(n.nonceCount, key.(string))
-                n.nonceMu.Unlock()
+				n.nonceMu.Lock()
+				delete(n.nonceCount, key.(string))
+				n.nonceMu.Unlock()
 
-                atomic.AddInt64(&n.nonceTotal, -1)
-            }
+				atomic.AddInt64(&n.nonceTotal, -1)
+			}
 
-            i++
-            return i < 1000
-        })
-    }
+			i++
+			return i < 1000
+		})
+	}
 
-    return false
+	return false
 }
 
 /* =========================
@@ -384,26 +428,26 @@ func (n *Node) validateHandshake(p *Peer, claimedID PeerID, nonce string) error 
 
 func (n *Node) verifyPeerOnChain(minerID PeerID) bool {
 
-        if n == nil || n.Ledger == nil {
-                return false
-        }
+	if n == nil || n.Ledger == nil {
+		return false
+	}
 
-        if minerID == "" {
-                return false
-        }
+	if minerID == "" {
+		return false
+	}
 
-        // Bootstrap: no identities exist yet.
-        if n.Ledger.GetLatestBlockHeight() == 0 {
-                return true
-        }
+	// Bootstrap: no identities exist yet.
+	if n.Ledger.GetLatestBlockHeight() == 0 {
+		return true
+	}
 
-        var pubKey []byte
+	var pubKey []byte
 
-        key := []byte("miner_pubkey:" + string(minerID))
+	key := []byte("miner_pubkey:" + string(minerID))
 
-        if err := n.Ledger.GetObject(key, &pubKey); err != nil {
-                return false
-        }
+	if err := n.Ledger.GetObject(key, &pubKey); err != nil {
+		return false
+	}
 
-        return len(pubKey) == ed25519.PublicKeySize
+	return len(pubKey) == ed25519.PublicKeySize
 }

@@ -190,18 +190,19 @@ func (p *Peer) backoffDial(ctx context.Context) (net.Conn, error) {
 	return nil, lastErr
 }
 
-// Connect dials the peer (if not already connected) and starts IO loops.
-// It uses Node.config.DialTimeout for dial timeout.
-// Subsequent calls when already connected are no-op.
+// Connect dials a remote peer.
 //
-// The connection is now established over TLS using the node's pre-generated
-// deterministic or fallback self-signed certificate.
+// Each Peer represents exactly one connection session.
+// A closed Peer must never be reused for another connection.
 //
-// The handshake is fully asynchronous and bidirectional: the function returns
-// success immediately after establishing the encrypted TLS connection.
-// Handshake completion occurs when the remote peer's MsgTypeHandshake message is received.
-
+// The connection attempt is bound to the Peer's context so a cancelled
+// session can stop the dial immediately. After TLS negotiation, the
+// session state is checked again before the connection is installed.
 func (p *Peer) Connect() error {
+	if p == nil {
+		return errors.New("nil peer")
+	}
+
 	// ------------------------------------------------------------------
 	// FAST CHECK
 	// ------------------------------------------------------------------
@@ -214,13 +215,20 @@ func (p *Peer) Connect() error {
 	}
 
 	// IMPORTANT:
-	// Do NOT call IsBanned() here because it would try to acquire
-	// the same RWMutex and can deadlock.
+	// Do NOT call IsBanned() here because it would acquire the same
+	// mutex again and can deadlock.
 	if time.Now().Before(p.banUntil) {
 		ban := p.banUntil
 		p.mu.Unlock()
-		return fmt.Errorf("peer %s is banned until %s", p.addr, ban.String())
+
+		return fmt.Errorf(
+			"peer %s is banned until %s",
+			p.addr,
+			ban.String(),
+		)
 	}
+
+	ctx := p.ctx
 
 	p.mu.Unlock()
 
@@ -236,7 +244,20 @@ func (p *Peer) Connect() error {
 		return errors.New("missing TLS configuration")
 	}
 
+	if ctx == nil {
+		return errors.New("peer context is missing")
+	}
+
+	// If this Peer session was already cancelled, never create a new
+	// network connection from it.
+	select {
+	case <-ctx.Done():
+		return errors.New("peer session already closed")
+	default:
+	}
+
 	dialTimeout := 10 * time.Second
+
 	if p.node.config.DialTimeout > 0 {
 		dialTimeout = p.node.config.DialTimeout
 	}
@@ -249,13 +270,26 @@ func (p *Peer) Connect() error {
 		Timeout: dialTimeout,
 	}
 
-	conn, err := tls.DialWithDialer(
-		dialer,
+	tlsDialer := &tls.Dialer{
+		NetDialer: dialer,
+		Config:    p.node.tlsConfig,
+	}
+
+	conn, err := tlsDialer.DialContext(
+		ctx,
 		"tcp",
 		p.addr,
-		p.node.tlsConfig,
 	)
 	if err != nil {
+		// A cancelled Peer session is expected during shutdown or
+		// reconnection replacement. Do not perform unnecessary
+		// diagnostics in that case.
+		select {
+		case <-ctx.Done():
+			return errors.New("peer session cancelled during TLS dial")
+		default:
+		}
+
 		log.Printf(
 			"[p2p] ❌ TLS connection FAILED to %s: %v",
 			p.addr,
@@ -269,6 +303,7 @@ func (p *Peer) Connect() error {
 		}
 
 		tcpConn, tcpErr := tcpDialer.Dial("tcp", p.addr)
+
 		if tcpErr != nil {
 			log.Printf(
 				"[p2p] ❌ TCP connection FAILED to %s: %v",
@@ -280,31 +315,72 @@ func (p *Peer) Connect() error {
 				"[p2p] ✅ TCP connection SUCCESSFUL to %s — TLS is the failing layer",
 				p.addr,
 			)
+
 			_ = tcpConn.Close()
 		}
 
-		return fmt.Errorf("TLS dial failed to %s: %w", p.addr, err)
+		return fmt.Errorf(
+			"TLS dial failed to %s: %w",
+			p.addr,
+			err,
+		)
 	}
 
-	state := conn.ConnectionState()
-
-	log.Printf(
-		"[p2p] 🔒 Secure TLS connection established to %s (TLS %d.%d, cipher=%s)",
-		p.addr,
-		state.Version>>8,
-		state.Version&0xff,
-		tls.CipherSuiteName(state.CipherSuite),
-	)
-
 	// ------------------------------------------------------------------
-	// STORE CONNECTION
+	// SESSION VALIDATION AFTER TLS
 	// ------------------------------------------------------------------
 
 	p.mu.Lock()
+
+	// The Peer may have been cancelled while TLS was completing.
+	// Never install a connection into a cancelled session.
+	select {
+	case <-ctx.Done():
+		p.mu.Unlock()
+		_ = conn.Close()
+
+		return errors.New(
+			"peer session cancelled before TLS connection was installed",
+		)
+
+	default:
+	}
+
+	// Another connection must never be installed into the same Peer
+	// session after this point.
+	if p.connected && p.conn != nil {
+		p.mu.Unlock()
+		_ = conn.Close()
+
+		return nil
+	}
+
 	p.conn = conn
 	p.connected = true
 	p.lastSeen = time.Now()
+
 	p.mu.Unlock()
+
+	// ------------------------------------------------------------------
+	// TLS INFORMATION
+	// ------------------------------------------------------------------
+
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		state := tlsConn.ConnectionState()
+
+		log.Printf(
+			"[p2p] 🔒 Secure TLS connection established to %s (TLS %d.%d, cipher=%s)",
+			p.addr,
+			state.Version>>8,
+			state.Version&0xff,
+			tls.CipherSuiteName(state.CipherSuite),
+		)
+	} else {
+		log.Printf(
+			"[p2p] 🔒 Secure TLS connection established to %s",
+			p.addr,
+		)
+	}
 
 	// ------------------------------------------------------------------
 	// START IO
@@ -320,7 +396,9 @@ func (p *Peer) Connect() error {
 	// ------------------------------------------------------------------
 
 	go func() {
-		delay := time.Duration(100+rand.Intn(501)) * time.Millisecond
+		delay := time.Duration(
+			100+rand.Intn(501),
+		) * time.Millisecond
 
 		log.Printf(
 			"[p2p] ⏳ Preparing outbound handshake to %s (delay=%v)",
@@ -328,17 +406,36 @@ func (p *Peer) Connect() error {
 			delay,
 		)
 
-		time.Sleep(delay)
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
 
-		log.Printf("[p2p] 🚀 Sending handshake to %s", p.addr)
+		select {
+		case <-p.ctx.Done():
+			return
+
+		case <-timer.C:
+		}
+
+		log.Printf(
+			"[p2p] 🚀 Sending handshake to %s",
+			p.addr,
+		)
 
 		if err := p.sendHandshake(); err != nil {
-			log.Printf("[p2p] ❌ Handshake failed to %s: %v", p.addr, err)
+			log.Printf(
+				"[p2p] ❌ Handshake failed to %s: %v",
+				p.addr,
+				err,
+			)
+
 			p.Close()
 			return
 		}
 
-		log.Printf("[p2p] ✅ Handshake queued for %s", p.addr)
+		log.Printf(
+			"[p2p] ✅ Handshake queued for %s",
+			p.addr,
+		)
 	}()
 
 	return nil
@@ -1132,42 +1229,41 @@ func (p *Peer) signEnvelope(
 	return nil
 }
 
-// Close gracefully shuts down peer: cancels context, closes conn and waits loops.
+// Close gracefully shuts down the current peer session.
+// A Peer represents one connection session and must never be reused
+// after it has been closed. The context cancellation stops the I/O
+// workers, while closing the connection unblocks network operations.
+//
+// Close intentionally does not close sendQ and does not wait on wg.
+// This prevents send-on-closed-channel races and avoids a deadlock when
+// Close is called from readLoop or writeLoop through disconnect handling.
 func (p *Peer) Close() {
-	p.mu.Lock()
-
-	// idempotent guard
-	if !p.connected {
-		if p.cancel != nil {
-			p.cancel()
-		}
-		p.mu.Unlock()
+	if p == nil {
 		return
 	}
 
+	p.mu.Lock()
+
+	// Capture the current session resources while holding the mutex.
+	cancel := p.cancel
+	conn := p.conn
+
+	// Mark the session as disconnected immediately.
 	p.connected = false
-
-	// signal goroutines
-	if p.cancel != nil {
-		p.cancel()
-	}
-
-	// close socket once
-	if p.conn != nil {
-		_ = p.conn.Close()
-		p.conn = nil
-	}
-
-	// close sendQ to unblock writeLoop
-	if p.sendQ != nil {
-		close(p.sendQ)
-		p.sendQ = nil
-	}
+	p.conn = nil
 
 	p.mu.Unlock()
 
-	// wait loops to exit
-	p.wg.Wait()
+	// Cancel all peer workers.
+	if cancel != nil {
+		cancel()
+	}
+
+	// Close the network connection.
+	// This also unblocks any pending Read or Write operation.
+	if conn != nil {
+		_ = conn.Close()
+	}
 }
 
 // getConn returns the underlying connection under read lock.
