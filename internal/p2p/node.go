@@ -149,6 +149,20 @@ type Node struct {
 	PeersMutex sync.RWMutex
 
 	// ------------------------------------------------------------------
+	// DURABLE KNOWN PEERS
+	// ------------------------------------------------------------------
+	// Peers contains only currently active network sessions.
+	// knownPeers survives session disconnects and stores the latest
+	// authenticated locator required to create a new session.
+	//
+	// Peer identity is permanent.
+	// Network sessions are temporary.
+	// ------------------------------------------------------------------
+
+	knownPeersMu sync.RWMutex
+	knownPeers   map[PeerID]string
+
+	// ------------------------------------------------------------------
 	// TLS IDENTITY CACHE
 	// ------------------------------------------------------------------
 	tlsPeerCache sync.Map

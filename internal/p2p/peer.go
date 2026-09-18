@@ -35,6 +35,14 @@ type Peer struct {
 	id   PeerID
 	addr string
 
+	// reconnectAddr is the durable network locator used to create
+	// a new session after the current TCP session disappears.
+	//
+	// addr may contain a temporary TCP source port for inbound
+	// connections. reconnectAddr must never depend on that ephemeral
+	// session port.
+	reconnectAddr string
+
 	// underlying network connection (may be nil until connected)
 	conn net.Conn
 
@@ -101,9 +109,10 @@ func NewPeer(id PeerID, addr string, node *Node) *Peer {
 	}
 
 	return &Peer{
-		id:   id,
-		addr: addr,
-		node: node,
+		id:            id,
+		addr:          addr,
+		reconnectAddr: addr,
+		node:          node,
 
 		sendQ: make(chan []byte, qsize),
 

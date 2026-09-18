@@ -469,11 +469,69 @@ func (n *Node) registerDefaultHandlers() {
 			alreadyDone := p.handshakeDone
 			p.handshakeDone = true
 
-			peerID := p.id
-
 			p.mu.Unlock()
 
 			if !alreadyDone {
+
+				// -----------------------------------------------------
+				// Store the durable reconnect locator only after the
+				// complete cryptographic handshake has succeeded.
+				//
+				// The TCP source address may contain an ephemeral port.
+				// Therefore the peer's advertised ListenAddr is used for
+				// the listening port while the observed source IP is used
+				// for inbound sessions.
+				//
+				// Example:
+				//
+				//   session:  192.168.43.1:50880
+				//   listen:   :48942
+				//
+				// becomes:
+				//
+				//   locator:  192.168.43.1:48942
+				// -----------------------------------------------------
+
+				p.mu.RLock()
+				sessionAddr := p.addr
+				peerID := p.id
+				p.mu.RUnlock()
+
+				reconnectAddr := buildInboundReconnectAddr(
+					sessionAddr,
+					hs.ListenAddr,
+				)
+
+				if reconnectAddr != "" {
+					p.mu.Lock()
+					p.reconnectAddr = reconnectAddr
+					p.mu.Unlock()
+
+					n.rememberPeerLocator(
+						peerID,
+						reconnectAddr,
+					)
+
+					log.Printf(
+						"[p2p] 📍 Peer reconnect locator: id=%s session=%s reconnect=%s",
+						peerID,
+						sessionAddr,
+						reconnectAddr,
+					)
+				} else {
+					// For an outbound connection, the original dial address is
+					// already a usable locator.
+					p.mu.RLock()
+					fallbackAddr := p.reconnectAddr
+					p.mu.RUnlock()
+
+					if fallbackAddr != "" {
+						n.rememberPeerLocator(
+							peerID,
+							fallbackAddr,
+						)
+					}
+				}
 
 				// -----------------------------------------------------
 				// Register the peer only after complete cryptographic

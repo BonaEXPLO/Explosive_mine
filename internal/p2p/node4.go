@@ -5,6 +5,7 @@ import (
 	"context"
 	"log"
 	"math/rand"
+	"net"
 	"strings"
 	"time"
 )
@@ -90,34 +91,90 @@ func (n *Node) PeerReconnectLoop() {
 		}
 
 		// ------------------------------------------------------------
-		// COLLECT DISCONNECTED PEER LOCATORS
+		// COLLECT DURABLE PEER LOCATORS
 		// ------------------------------------------------------------
+		//
+		// n.Peers contains only active sessions.
+		// A disconnected session is intentionally removed from n.Peers.
+		//
+		// knownPeers is therefore the source of truth for mobile
+		// reconnection. It survives Wi-Fi loss, TCP resets and normal
+		// session expiration.
 
-		n.PeersMutex.RLock()
+		n.knownPeersMu.RLock()
 
-		addresses := make([]string, 0, len(n.Peers))
+		known := make(map[PeerID]string, len(n.knownPeers))
 
-		for _, p := range n.Peers {
-			if p == nil {
+		for peerID, addr := range n.knownPeers {
+			if peerID == "" {
 				continue
 			}
 
-			if p.IsConnected() {
-				continue
-			}
-
-			addr := strings.TrimSpace(p.Addr())
+			addr = strings.TrimSpace(addr)
 			if addr == "" {
 				continue
 			}
 
-			// Do not create another session while a replacement
-			// session for this locator is already active.
+			known[peerID] = addr
+		}
+
+		n.knownPeersMu.RUnlock()
+
+		addresses := make([]string, 0, len(known))
+
+		for peerID, addr := range known {
+
+			// ----------------------------------------------------------
+			// Do not reconnect to ourselves.
+			// ----------------------------------------------------------
+
+			if peerID == n.id {
+				continue
+			}
+
+			// ----------------------------------------------------------
+			// Check whether this identity already has an active session.
+			// ----------------------------------------------------------
+
+			active := false
+
+			peers := n.AllPeers()
+
+			for _, p := range peers {
+				if p == nil {
+					continue
+				}
+
+				if !p.IsConnected() {
+					continue
+				}
+
+				p.mu.RLock()
+				activeID := p.id
+				p.mu.RUnlock()
+
+				if activeID == PeerID(peerID) {
+					active = true
+					break
+				}
+			}
+
+			if active {
+				continue
+			}
+
+			// ----------------------------------------------------------
+			// Prevent duplicate reconnect sessions.
+			// ----------------------------------------------------------
+
 			if _, exists := inFlight[addr]; exists {
 				continue
 			}
 
-			// Respect the current retry schedule.
+			// ----------------------------------------------------------
+			// Respect exponential retry schedule.
+			// ----------------------------------------------------------
+
 			if retryAt, exists := nextRetry[addr]; exists {
 				if now.Before(retryAt) {
 					continue
@@ -126,8 +183,6 @@ func (n *Node) PeerReconnectLoop() {
 
 			addresses = append(addresses, addr)
 		}
-
-		n.PeersMutex.RUnlock()
 
 		// ------------------------------------------------------------
 		// START NEW MOBILE SESSIONS
@@ -477,4 +532,106 @@ func (n *Node) IsLedgerComplete() bool {
 		}
 	}
 	return true
+}
+
+// rememberPeerLocator stores the durable network locator of an
+// authenticated peer.
+//
+// The locator is deliberately kept separate from the active Peer
+// session. A TCP session may use an ephemeral source port such as
+// 192.168.43.1:50880, while the peer's advertised listening port
+// may be 48942.
+//
+// Network loss is not identity loss.
+func (n *Node) rememberPeerLocator(peerID PeerID, addr string) {
+	if n == nil || peerID == "" {
+		return
+	}
+
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return
+	}
+
+	n.knownPeersMu.Lock()
+	if n.knownPeers == nil {
+		n.knownPeers = make(map[PeerID]string)
+	}
+
+	n.knownPeers[peerID] = addr
+	n.knownPeersMu.Unlock()
+
+	log.Printf(
+		"[p2p] 📍 Durable peer locator stored: id=%s addr=%s",
+		peerID,
+		addr,
+	)
+}
+
+// forgetPeerLocator removes a durable locator only when the peer
+// identity is explicitly invalidated or permanently removed.
+//
+// Ordinary network disconnection must NEVER call this function.
+func (n *Node) forgetPeerLocator(peerID PeerID) {
+	if n == nil || peerID == "" {
+		return
+	}
+
+	n.knownPeersMu.Lock()
+	delete(n.knownPeers, peerID)
+	n.knownPeersMu.Unlock()
+}
+
+// buildInboundReconnectAddr converts an authenticated peer's advertised
+// listening port into a durable locator.
+//
+// For example:
+//
+//	TCP session:      192.168.43.1:50880
+//	Handshake:        :48942
+//
+// becomes:
+//
+//	reconnectAddr:    192.168.43.1:48942
+//
+// The observed source IP is preferred for inbound sessions because the
+// advertised ListenAddr may contain only a port.
+func buildInboundReconnectAddr(sessionAddr, advertisedListenAddr string) string {
+	sessionAddr = strings.TrimSpace(sessionAddr)
+	advertisedListenAddr = strings.TrimSpace(advertisedListenAddr)
+
+	if sessionAddr == "" || advertisedListenAddr == "" {
+		return ""
+	}
+
+	sessionHost, _, err := net.SplitHostPort(sessionAddr)
+	if err != nil {
+		return ""
+	}
+
+	advertisedHost, advertisedPort, err := net.SplitHostPort(advertisedListenAddr)
+	if err == nil {
+		if advertisedPort == "" {
+			return ""
+		}
+
+		if advertisedHost != "" {
+			sessionHost = advertisedHost
+		}
+
+		return net.JoinHostPort(sessionHost, advertisedPort)
+	}
+
+	// A ListenAddr such as ":48942" is not accepted by SplitHostPort
+	// when it lacks the complete host:port form.
+	if strings.HasPrefix(advertisedListenAddr, ":") {
+		port := strings.TrimPrefix(advertisedListenAddr, ":")
+		if port == "" {
+			return ""
+		}
+
+		return net.JoinHostPort(sessionHost, port)
+	}
+
+	return ""
 }
