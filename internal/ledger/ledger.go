@@ -3,28 +3,28 @@ package ledger
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
-        "strings"
 	"fmt"
 	"log"
 	"math"
-	"encoding/hex"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"explosive/internal/address"
+	"explosive/internal/compressor"
 	"github.com/dgraph-io/badger/v4"
-        "explosive/internal/address"
-        "explosive/internal/compressor"
 	"github.com/fxamacker/cbor/v2"
 )
 
 // ---------------- Constants ----------------
 
 const (
-	PastaboPerEXPLO uint64 = 1_000_000_000
-	MaxEXPLOSupply  uint64 = 50_000_000
-	MaxPastaboSupply       = MaxEXPLOSupply * PastaboPerEXPLO
+	PastaboPerEXPLO  uint64 = 1_000_000_000
+	MaxEXPLOSupply   uint64 = 50_000_000
+	MaxPastaboSupply        = MaxEXPLOSupply * PastaboPerEXPLO
 )
 
 var (
@@ -71,9 +71,9 @@ func OpenLedger(path string) (*Ledger, error) {
 	}
 
 	l := &Ledger{
-		db:       db,
-		dbPath:   path,
-		asyncCh:  make(chan kvPair, 100_000),
+		db:        db,
+		dbPath:    path,
+		asyncCh:   make(chan kvPair, 100_000),
 		stopAsync: make(chan struct{}),
 		cborPool: sync.Pool{
 			New: func() interface{} { return new(bytes.Buffer) },
@@ -92,34 +92,34 @@ func OpenLedger(path string) (*Ledger, error) {
 }
 
 func InitLedger(l *Ledger) error {
-    if l == nil || l.db == nil {
-        return fmt.Errorf("ledger not initialized")
-    }
+	if l == nil || l.db == nil {
+		return fmt.Errorf("ledger not initialized")
+	}
 
-    // Try to fetch existing Genesis
-    block0, err := l.GetBlockByHeight(0)
-    if err == nil && block0 != nil {
-        if err := VerifyGenesis(l); err != nil {
-            return err
-        }
-        fmt.Println("✅ Genesis block already exists and verified.")
-        fmt.Printf("⚠️  %d EXPLO are permanently locked and cannot be spent.\n", GenesisEXPLO)
-        return nil
-    }
+	// Try to fetch existing Genesis
+	block0, err := l.GetBlockByHeight(0)
+	if err == nil && block0 != nil {
+		if err := VerifyGenesis(l); err != nil {
+			return err
+		}
+		fmt.Println("✅ Genesis block already exists and verified.")
+		fmt.Printf("⚠️  %d EXPLO are permanently locked and cannot be spent.\n", GenesisEXPLO)
+		return nil
+	}
 
-    // Genesis does not exist — create it
-    block0, err = CreateGenesisBlock(l)
-    if err != nil {
-        return fmt.Errorf("failed to create genesis: %w", err)
-    }
+	// Genesis does not exist — create it
+	block0, err = CreateGenesisBlock(l)
+	if err != nil {
+		return fmt.Errorf("failed to create genesis: %w", err)
+	}
 
-    // Double-check block 0 is now readable
-    blockCheck, err := l.GetBlockByHeight(0)
-    if err != nil || blockCheck == nil {
-        return fmt.Errorf("genesis block created but cannot be read: %w", err)
-    }
+	// Double-check block 0 is now readable
+	blockCheck, err := l.GetBlockByHeight(0)
+	if err != nil || blockCheck == nil {
+		return fmt.Errorf("genesis block created but cannot be read: %w", err)
+	}
 
-    return nil
+	return nil
 }
 
 func (l *Ledger) Close() error {
@@ -289,118 +289,116 @@ func NowMillis() int64 { return time.Now().UnixMilli() }
 
 func DBPathUnderHome(dir string) string { return filepath.Clean(dir) }
 
-
 // ---------------- Miner & Meta ----------------
 
 // ListAllMiners returns all miners efficiently for large-scale ledgers
 func (l *Ledger) ListAllMiners() ([]Miner, error) {
-    if l == nil || l.db == nil {
-        return nil, errors.New("ledger not initialized")
-    }
+	if l == nil || l.db == nil {
+		return nil, errors.New("ledger not initialized")
+	}
 
-    var miners []Miner
-    prefix := []byte(PrefixMiner)
+	var miners []Miner
+	prefix := []byte(PrefixMiner)
 
-    err := l.db.View(func(txn *badger.Txn) error {
-        opts := badger.DefaultIteratorOptions
-        opts.PrefetchValues = true
-        opts.Prefix = prefix
-        it := txn.NewIterator(opts)
-        defer it.Close()
+	err := l.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = true
+		opts.Prefix = prefix
+		it := txn.NewIterator(opts)
+		defer it.Close()
 
-        for it.Rewind(); it.Valid(); it.Next() {
-            item := it.Item()
-            val, err := item.ValueCopy(nil)
-            if err != nil {
-                return fmt.Errorf("failed to read miner value: %w", err)
-            }
-            var m Miner
-            if err := cbor.Unmarshal(val, &m); err != nil {
-                return fmt.Errorf("failed to decode miner: %w", err)
-            }
-            miners = append(miners, m)
-        }
-        return nil
-    })
-    return miners, err
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			val, err := item.ValueCopy(nil)
+			if err != nil {
+				return fmt.Errorf("failed to read miner value: %w", err)
+			}
+			var m Miner
+			if err := cbor.Unmarshal(val, &m); err != nil {
+				return fmt.Errorf("failed to decode miner: %w", err)
+			}
+			miners = append(miners, m)
+		}
+		return nil
+	})
+	return miners, err
 }
 
 func (l *Ledger) MarkRegistrationAttempt(minerID string) error {
-    return l.PutObjectAsync([]byte("reg_attempt:"+minerID), NowMillis())
+	return l.PutObjectAsync([]byte("reg_attempt:"+minerID), NowMillis())
 }
 
 func (l *Ledger) HasRecentRegAttempt(minerID string, windowMs int64) bool {
-    var ts int64
-    if err := l.GetObject([]byte("reg_attempt:"+minerID), &ts); err != nil {
-        return false
-    }
-    return NowMillis()-ts < windowMs
+	var ts int64
+	if err := l.GetObject([]byte("reg_attempt:"+minerID), &ts); err != nil {
+		return false
+	}
+	return NowMillis()-ts < windowMs
 }
 
 func (l *Ledger) HasMinerOnChain(minerID string) (bool, error) {
-    var flag bool
-    err := l.GetObject([]byte("onchain_miner:"+minerID), &flag)
-    if err != nil {
-        if errors.Is(err, badger.ErrKeyNotFound) {
-            return false, nil
-        }
-        return false, err
-    }
-    return flag, nil
+	var flag bool
+	err := l.GetObject([]byte("onchain_miner:"+minerID), &flag)
+	if err != nil {
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return flag, nil
 }
 
 func (l *Ledger) SetMinerOnChain(minerID string) error {
-    return l.PutObjectAsync([]byte("onchain_miner:"+minerID), true)
+	return l.PutObjectAsync([]byte("onchain_miner:"+minerID), true)
 }
-
 
 // ---------------- Supply ----------------
 
 func projectTotalSupply(l *Ledger, reward uint64) (uint64, error) {
-    current, err := l.GetTotalIssued()
-    if err != nil {
-        return 0, err
-    }
-    if reward > MaxPastaboSupply-current {
-        return 0, errors.New("supply cap exceeded")
-    }
-    return current + reward, nil
+	current, err := l.GetTotalIssued()
+	if err != nil {
+		return 0, err
+	}
+	if reward > MaxPastaboSupply-current {
+		return 0, errors.New("supply cap exceeded")
+	}
+	return current + reward, nil
 }
 
 func (l *Ledger) GetTotalIssued() (uint64, error) {
-    data, err := l.GetBytes(MetaTotalIssued)
-    if err != nil {
-        if err == badger.ErrKeyNotFound {
-            return 0, nil
-        }
-        return 0, err
-    }
-    if len(data) != 8 {
-        return 0, fmt.Errorf("invalid MetaTotalIssued")
-    }
-    return binary.BigEndian.Uint64(data), nil
+	data, err := l.GetBytes(MetaTotalIssued)
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if len(data) != 8 {
+		return 0, fmt.Errorf("invalid MetaTotalIssued")
+	}
+	return binary.BigEndian.Uint64(data), nil
 }
 
 func (l *Ledger) GetTotalIssuedEXPLO() (float64, error) {
-    total, err := l.GetTotalIssued()
-    if err != nil {
-        return 0, err
-    }
-    return float64(total) / float64(PastaboPerEXPLO), nil
+	total, err := l.GetTotalIssued()
+	if err != nil {
+		return 0, err
+	}
+	return float64(total) / float64(PastaboPerEXPLO), nil
 }
 
 func (l *Ledger) GetChainTipHeight() (uint64, error) {
-    data, err := l.GetBytes(MetaChainTip)
-    if err != nil {
-        if err == badger.ErrKeyNotFound {
-            return 0, nil
-        }
-        return 0, err
-    }
-    if len(data) != 8 {
-        return 0, fmt.Errorf("invalid chain tip meta")
-    }
-    return binary.BigEndian.Uint64(data), nil
+	data, err := l.GetBytes(MetaChainTip)
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if len(data) != 8 {
+		return 0, fmt.Errorf("invalid chain tip meta")
+	}
+	return binary.BigEndian.Uint64(data), nil
 }
 
 // RebuildMetaValuesFromBlocks performs a full and strict reconstruction
@@ -644,53 +642,107 @@ func extractHeightFromBlockKey(key []byte) (uint64, error) {
 	}
 	return binary.BigEndian.Uint64(key[len(PrefixBlock):]), nil
 }
+
 // ---------------- Low-level U64 ----------------
 
 func readU64(txn *badger.Txn, key string) (uint64, error) {
-    item, err := txn.Get([]byte(key))
-    if err != nil {
-        if err == badger.ErrKeyNotFound { return 0, nil }
-        return 0, err
-    }
-    val, err := item.ValueCopy(nil)
-    if err != nil { return 0, err }
-    if len(val) != 8 { return 0, fmt.Errorf("invalid u64 length") }
-    return binary.BigEndian.Uint64(val), nil
+	item, err := txn.Get([]byte(key))
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			return 0, nil
+		}
+		return 0, err
+	}
+	val, err := item.ValueCopy(nil)
+	if err != nil {
+		return 0, err
+	}
+	if len(val) != 8 {
+		return 0, fmt.Errorf("invalid u64 length")
+	}
+	return binary.BigEndian.Uint64(val), nil
 }
 
 func writeU64(txn *badger.Txn, key string, v uint64) error {
-    buf := make([]byte, 8)
-    binary.BigEndian.PutUint64(buf, v)
-    return txn.Set([]byte(key), buf)
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, v)
+	return txn.Set([]byte(key), buf)
 }
 
 func incU64(txn *badger.Txn, key string, delta uint64) error {
-    cur, err := readU64(txn, key)
-    if err != nil { return err }
-    if delta > math.MaxUint64-cur {
-        return fmt.Errorf("uint64 overflow on incU64")
-    }
-    return writeU64(txn, key, cur+delta)
+	cur, err := readU64(txn, key)
+	if err != nil {
+		return err
+	}
+	if delta > math.MaxUint64-cur {
+		return fmt.Errorf("uint64 overflow on incU64")
+	}
+	return writeU64(txn, key, cur+delta)
 }
 
 // ---------------- Identity Commitments ----------------
 
 func (l *Ledger) HasCommitment(commitment []byte) (bool, error) {
-    key := []byte("identity:" + hex.EncodeToString(commitment))
-    var tmp struct { PubKey, Signature []byte }
-    if err := l.GetObject(key, &tmp); err != nil {
-        if errors.Is(err, badger.ErrKeyNotFound) { return false, nil }
-        return false, err
-    }
-    return true, nil
+	key := []byte("identity:" + hex.EncodeToString(commitment))
+	var tmp struct{ PubKey, Signature []byte }
+	if err := l.GetObject(key, &tmp); err != nil {
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (l *Ledger) AddCommitment(commitment, pubKey, signature []byte) error {
-    key := []byte("identity:" + hex.EncodeToString(commitment))
-    exists, err := l.HasCommitment(commitment)
-    if err != nil { return err }
-    if exists { return fmt.Errorf("identity already exists") }
+	key := []byte("identity:" + hex.EncodeToString(commitment))
+	exists, err := l.HasCommitment(commitment)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("identity already exists")
+	}
 
-    record := struct { PubKey, Signature []byte }{pubKey, signature}
-    return l.PutObject(key, record)
+	record := struct{ PubKey, Signature []byte }{pubKey, signature}
+	return l.PutObject(key, record)
+}
+
+// GetStoredMinerByID returns exactly one locally stored miner by MinerID.
+//
+// This is a direct BadgerDB key lookup:
+//
+//	miner:<MinerID>
+//
+// It never scans the complete miner namespace and therefore remains
+// efficient even when the network contains a very large number of miners.
+func (l *Ledger) GetStoredMinerByID(minerID string) (*Miner, error) {
+	if l == nil || l.db == nil {
+		return nil, errors.New("ledger not initialized")
+	}
+
+	minerID = strings.TrimSpace(minerID)
+
+	if !IsValidEXPLOAddress(minerID) {
+		return nil, errors.New("invalid miner ID")
+	}
+
+	key := make([]byte, 0, len(PrefixMiner)+len(minerID))
+	key = append(key, PrefixMiner...)
+	key = append(key, minerID...)
+
+	var miner Miner
+
+	if err := l.GetObject(key, &miner); err != nil {
+		return nil, err
+	}
+
+	if !strings.EqualFold(
+		strings.TrimSpace(miner.ID),
+		minerID,
+	) {
+		return nil, errors.New("stored miner identity mismatch")
+	}
+
+	return &miner, nil
 }

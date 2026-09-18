@@ -2,12 +2,18 @@
 package p2p
 
 import (
+	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/dgraph-io/badger/v4"
 
 	"explosive/internal/ledger"
 )
@@ -233,9 +239,28 @@ func (n *Node) requestPeersFromAll() {
 	}
 }
 
-// AutoRegisterLocalMiners periodically announces unregistered local miners to the network.
-// FIX Bug #9: ticker loop now listens on n.ctx.Done() to avoid goroutine leak on node shutdown.
+// AutoRegisterLocalMiners periodically announces the local miner identity
+// when it is not yet registered on-chain.
+//
+// SCALABILITY DESIGN:
+//
+//   - Observer/investor nodes perform zero miner scans.
+//   - Only the configured local MinerID is queried.
+//   - The ledger lookup is a direct BadgerDB key lookup:
+//     miner:<MinerID>
+//   - No ListAllMiners() call is performed.
+//   - No Argon2 miner-key derivation is performed by this loop.
+//   - The P2P layer uses the already configured public miner identity
+//     and secure miner signing callback.
+//   - Sacred words and miner private keys never enter this function.
+//
+// This keeps the normal announcement path independent of the total
+// number of miners registered by the network.
 func (n *Node) AutoRegisterLocalMiners() {
+	if n == nil || n.Ledger == nil || n.ctx == nil {
+		return
+	}
+
 	ticker := time.NewTicker(3 * time.Minute)
 	defer ticker.Stop()
 
@@ -245,88 +270,262 @@ func (n *Node) AutoRegisterLocalMiners() {
 			return
 
 		case <-ticker.C:
-			miners, err := n.Ledger.ListAllMiners()
-			if err != nil || len(miners) == 0 {
+
+			// =========================================================
+			// 1. DETERMINE LOCAL NODE ROLE
+			// =========================================================
+
+			minerID, minerPubKey := n.getMinerIdentity()
+
+			minerID = strings.TrimSpace(minerID)
+
+			// Observer/investor nodes have no local MinerID.
+			// They must never scan the miner database and must never
+			// broadcast ANNOUNCE_MINER.
+			if minerID == "" {
 				continue
 			}
 
-			const batchSize = 15
-			sent := 0
+			// The local miner public identity must be a valid
+			// Ed25519 public key.
+			if len(minerPubKey) != ed25519.PublicKeySize {
+				log.Printf(
+					"[p2p] skipping miner announcement: invalid local miner public key",
+				)
+				continue
+			}
 
-			for _, m := range miners {
-				if sent >= batchSize {
-					break
-				}
+			// =========================================================
+			// 2. DIRECT LOCAL MINER LOOKUP
+			// =========================================================
+			//
+			// IMPORTANT:
+			// This performs ONE BadgerDB key lookup:
+			//
+			//     miner:<MinerID>
+			//
+			// It does not enumerate the miner namespace.
 
-				// Skip if already registered on-chain.
-				if onChain, _ := n.Ledger.HasMinerOnChain(m.ID); onChain {
-					continue
-				}
-
-				// Avoid spamming: max 1 attempt per 12 minutes.
-				if n.Ledger.HasRecentRegAttempt(m.ID, 12*60*1000) {
-					continue
-				}
-
-				// Ensure V3 deterministic identity is ready.
-				if err := ledger.EnsureMinerSignature(&m); err != nil {
+			miner, err := n.Ledger.GetStoredMinerByID(minerID)
+			if err != nil {
+				if !errors.Is(err, badger.ErrKeyNotFound) {
 					log.Printf(
-						"[p2p] skipping miner %s announcement — V3 identity not ready: %v",
-						m.ID,
+						"[p2p] local miner lookup failed for %s: %v",
+						minerID,
 						err,
 					)
-					continue
 				}
-
-				// Public announcement payload — includes Ed25519 PubKey as proof of identity.
-				// Sacred words are never transmitted.
-				payload := struct {
-					MinerID        string `cbor:"miner_id"`
-					PubKey         []byte `cbor:"pubkey"`
-					FingerprintSHA string `cbor:"fingerprint_sha3"`
-					Timestamp      int64  `cbor:"time"`
-					SourceNode     string `cbor:"source"`
-				}{
-					MinerID:        m.ID,
-					PubKey:         m.PubKey,
-					FingerprintSHA: ledger.FingerprintHash(m.ConsciousnessFingerprint),
-					Timestamp:      time.Now().UnixMilli(),
-					SourceNode:     string(n.id),
-				}
-
-				env, err := NewEnvelopeFromPayload(
-					n.ProtocolVersion(),
-					MsgTypeAnnounceMiner,
-					payload,
-				)
-				if err != nil {
-					continue
-				}
-
-				// Attach MinerInfo for redundancy and faster verification by peers.
-				env.MinerInfo = &MinerInfo{
-					MinerID:   m.ID,
-					Timestamp: env.Timestamp,
-					PubKey:    m.PubKey,
-				}
-
-				// Randomized jitter (0-800ms) to avoid synchronized broadcast bursts.
-				delay := time.Duration(rand.Intn(801)) * time.Millisecond
-
-				select {
-				case <-n.ctx.Done():
-					return
-
-				case <-time.After(delay):
-				}
-
-				n.BroadcastEnvelope(env)
-				_ = n.Ledger.MarkRegistrationAttempt(m.ID)
-				sent++
-
-				// Announcement is intentionally silent.
-				// The network operation still happens normally.
+				continue
 			}
+
+			if miner == nil {
+				continue
+			}
+
+			// =========================================================
+			// 3. VERIFY LOCAL PUBLIC IDENTITY
+			// =========================================================
+
+			if !strings.EqualFold(
+				strings.TrimSpace(miner.ID),
+				minerID,
+			) {
+				log.Printf(
+					"[p2p] refusing miner announcement: stored MinerID mismatch",
+				)
+				continue
+			}
+
+			if len(miner.PubKey) != ed25519.PublicKeySize {
+				log.Printf(
+					"[p2p] refusing miner announcement for %s: invalid stored public key",
+					minerID,
+				)
+				continue
+			}
+
+			if !bytes.Equal(miner.PubKey, minerPubKey) {
+				log.Printf(
+					"[p2p] refusing miner announcement for %s: public key mismatch",
+					minerID,
+				)
+				continue
+			}
+
+			// =========================================================
+			// 4. CHECK ON-CHAIN REGISTRATION
+			// =========================================================
+
+			onChain, err := n.Ledger.HasMinerOnChain(minerID)
+			if err != nil {
+				log.Printf(
+					"[p2p] failed to check on-chain status for miner %s: %v",
+					minerID,
+					err,
+				)
+				continue
+			}
+
+			if onChain {
+				continue
+			}
+
+			// =========================================================
+			// 5. REGISTRATION RATE LIMIT
+			// =========================================================
+
+			if n.Ledger.HasRecentRegAttempt(
+				minerID,
+				12*60*1000,
+			) {
+				continue
+			}
+
+			// =========================================================
+			// 6. BUILD PUBLIC ANNOUNCEMENT
+			// =========================================================
+			//
+			// Sacred words are never transmitted.
+			//
+			// The local P2P miner public key is already authenticated
+			// by SetMinerIdentity().
+
+			timestamp := time.Now().UnixMilli()
+
+			payload := struct {
+				MinerID        string `cbor:"miner_id"`
+				PubKey         []byte `cbor:"pubkey"`
+				FingerprintSHA string `cbor:"fingerprint_sha3"`
+				Timestamp      int64  `cbor:"time"`
+				SourceNode     string `cbor:"source"`
+			}{
+				MinerID: minerID,
+				PubKey: append(
+					[]byte(nil),
+					minerPubKey...,
+				),
+				FingerprintSHA: ledger.FingerprintHash(
+					miner.ConsciousnessFingerprint,
+				),
+				Timestamp:  timestamp,
+				SourceNode: string(n.id),
+			}
+
+			env, err := NewEnvelopeFromPayload(
+				n.ProtocolVersion(),
+				MsgTypeAnnounceMiner,
+				payload,
+			)
+			if err != nil {
+				log.Printf(
+					"[p2p] failed to create miner announcement for %s: %v",
+					minerID,
+					err,
+				)
+				continue
+			}
+
+			// =========================================================
+			// 7. CREATE MINER P2P PROOF
+			// =========================================================
+
+			proofPayload, err := BuildMinerP2PProof(
+				n.networkID,
+				minerID,
+				minerID,
+				string(n.id),
+				minerPubKey,
+				env.Timestamp,
+				env.Nonce,
+			)
+			if err != nil {
+				log.Printf(
+					"[p2p] failed to build miner P2P proof for %s: %v",
+					minerID,
+					err,
+				)
+				continue
+			}
+
+			// =========================================================
+			// 8. SIGN WITHOUT EXPOSING PRIVATE MATERIAL
+			// =========================================================
+
+			minerSignature, err := n.signMinerData(proofPayload)
+			if err != nil {
+				log.Printf(
+					"[p2p] failed to sign miner announcement for %s: %v",
+					minerID,
+					err,
+				)
+				continue
+			}
+
+			if len(minerSignature) != ed25519.SignatureSize {
+				log.Printf(
+					"[p2p] invalid miner signature size for %s: got %d, want %d",
+					minerID,
+					len(minerSignature),
+					ed25519.SignatureSize,
+				)
+				continue
+			}
+
+			// =========================================================
+			// 9. ATTACH MINER P2P PROOF
+			// =========================================================
+
+			env.MinerInfo = &MinerInfo{
+				MinerID:   minerID,
+				Timestamp: env.Timestamp,
+				PubKey: append(
+					[]byte(nil),
+					minerPubKey...,
+				),
+				Signature: append(
+					[]byte(nil),
+					minerSignature...,
+				),
+			}
+
+			// =========================================================
+			// 10. SMALL RANDOMIZED JITTER
+			// =========================================================
+			//
+			// Prevent synchronized announcement bursts without creating
+			// one timer per miner or maintaining a large scheduling queue.
+
+			delay := time.Duration(
+				rand.Intn(801),
+			) * time.Millisecond
+
+			timer := time.NewTimer(delay)
+
+			select {
+			case <-n.ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+
+			case <-timer.C:
+			}
+
+			// =========================================================
+			// 11. BROADCAST
+			// =========================================================
+
+			n.BroadcastEnvelope(env)
+
+			_ = n.Ledger.MarkRegistrationAttempt(minerID)
+
+			log.Printf(
+				"[p2p] 📡 ANNOUNCE_MINER broadcast: miner=%s",
+				minerID,
+			)
 		}
 	}
 }

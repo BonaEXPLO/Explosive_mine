@@ -90,9 +90,11 @@ func (n *Node) currentPoWDifficulty() int {
 // =========================
 
 func (n *Node) registerPeer(p *Peer, realID PeerID) {
-	if p == nil {
+	if n == nil || p == nil {
 		return
 	}
+
+	realID = PeerID(strings.TrimSpace(string(realID)))
 
 	if realID == "" {
 		log.Printf("[p2p] ❌ empty peer identity")
@@ -101,21 +103,19 @@ func (n *Node) registerPeer(p *Peer, realID PeerID) {
 	}
 
 	// ------------------------------------------------------------------
-	// 1. Consume the temporary TLS identity cache entry.
+	// 1. REPUTATION GATE
 	// ------------------------------------------------------------------
-
-	val, ok := n.tlsPeerCache.Load(string(realID))
-
-	if ok {
-		if ts, ok := val.(time.Time); ok &&
-			time.Since(ts) <= tlsIdentityTTL {
-			n.tlsPeerCache.Delete(string(realID))
-		}
-	}
-
-	// ------------------------------------------------------------------
-	// 2. Reputation gate.
-	// ------------------------------------------------------------------
+	//
+	// Reputation belongs to the permanent peer identity.
+	//
+	// It is NOT associated with:
+	//   - IP address
+	//   - TCP port
+	//   - network type
+	//   - current Peer session
+	//
+	// Therefore a mobile peer keeps the same reputation when its
+	// network locator changes.
 
 	if rep := n.getReputation(realID); rep < minReputationReject {
 		log.Printf(
@@ -129,33 +129,60 @@ func (n *Node) registerPeer(p *Peer, realID PeerID) {
 	}
 
 	// ------------------------------------------------------------------
-	// 3. Register the authenticated P2P session.
-	//
-	// Miner verification MUST NOT be inferred from the ledger here.
-	// The handshake is responsible for cryptographically verifying the
-	// presented miner identity and MinerP2PProof.
+	// 2. AUTHENTICATED SESSION IDENTITY
 	// ------------------------------------------------------------------
+	//
+	// The handshake has already authenticated the wallet identity and,
+	// when applicable, the miner identity.
+	//
+	// At this point realID is the permanent P2P identity.
+	// The current p.addr remains only the temporary network locator.
 
 	p.mu.Lock()
+
+	// Never mutate an already authenticated session into another identity.
+	if p.id != "" && p.id != realID {
+		p.mu.Unlock()
+
+		log.Printf(
+			"[p2p] 🚫 refusing identity mutation: current=%s claimed=%s",
+			p.id,
+			realID,
+		)
+
+		p.Close()
+		return
+	}
 
 	p.id = realID
 	p.lastSeen = time.Now()
 
-	// Preserve the verification result established by the handshake.
+	// Preserve verification results established by the handshake.
 	verifiedMiner := p.verifiedMiner
 	verifiedMinerID := p.verifiedMinerID
+
+	currentAddr := p.addr
 
 	p.mu.Unlock()
 
 	// ------------------------------------------------------------------
-	// 4. Register the current session in the shard.
+	// 3. REGISTER BY PERMANENT IDENTITY
 	// ------------------------------------------------------------------
+	//
+	// The shard key is the permanent identity.
+	//
+	// Example:
+	//
+	//   old session: PeerID=X, IP=192.168.1.20
+	//   new session: PeerID=X, IP=10.20.30.40
+	//
+	// These are the SAME peer identity.
+	// The new authenticated session replaces the old session.
 
 	sh := n.shard(realID)
 
 	sh.mu.Lock()
 
-	// Only replace an existing session if it is not the same session.
 	oldPeer, exists := sh.peers[realID]
 
 	sh.peers[realID] = p
@@ -163,45 +190,67 @@ func (n *Node) registerPeer(p *Peer, realID PeerID) {
 	sh.mu.Unlock()
 
 	// ------------------------------------------------------------------
-	// 5. If another session existed for the same identity, close only
-	//    the old session after releasing the shard lock.
+	// 4. REPLACE OLD NETWORK SESSION
 	// ------------------------------------------------------------------
+	//
+	// Only the old session is closed.
+	// The permanent identity and reputation remain untouched.
+	//
+	// This is essential for mobile devices changing:
+	//
+	//   Wi-Fi IP
+	//   cellular IP
+	//   router
+	//   network
+	//   connection
+	//
+	// The old session can never be allowed to close the new one.
 
 	if exists && oldPeer != nil && oldPeer != p {
 		log.Printf(
-			"[p2p] ♻️ replacing stale peer session: id=%s old=%s new=%s",
+			"[p2p] ♻️ replacing old mobile session: id=%s old=%s new=%s",
 			realID,
-			oldPeer.addr,
-			p.addr,
+			oldPeer.Addr(),
+			currentAddr,
 		)
 
 		oldPeer.Close()
 	}
 
 	// ------------------------------------------------------------------
-	// 6. Update peer activity and reputation state.
+	// 5. UPDATE IDENTITY ACTIVITY
 	// ------------------------------------------------------------------
+	//
+	// lastSeen is liveness/session information only.
+	//
+	// It does NOT affect reputation.
 
-	n.peerLastSeen.Store(realID, time.Now())
+	now := time.Now()
 
-	if _, exists := n.peerReputation.Load(realID); !exists {
-		n.peerReputation.Store(realID, 0)
-	}
+	n.peerLastSeen.Store(realID, now)
+
+	// Preserve an existing reputation.
+	//
+	// LoadOrStore is important here: never overwrite a reputation that
+	// another goroutine may have established concurrently.
+	n.peerReputation.LoadOrStore(realID, 0)
 
 	// ------------------------------------------------------------------
-	// 7. Log the actual authentication state.
+	// 6. AUTHENTICATION LOG
 	// ------------------------------------------------------------------
 
 	if verifiedMiner {
 		log.Printf(
-			"[p2p] ✅ registered authenticated miner session: %s (miner=%s)",
+			"[p2p] ✅ registered authenticated miner session: %s (miner=%s addr=%s)",
 			realID,
 			verifiedMinerID,
+			currentAddr,
 		)
 	} else {
 		log.Printf(
-			"[p2p] 👁️ registered authenticated observer wallet session: %s",
+			"[p2p] 👁️ registered authenticated observer/investor session: %s (addr=%s)",
 			realID,
+			currentAddr,
 		)
 	}
 }
@@ -240,28 +289,31 @@ func (n *Node) getReputation(id PeerID) int {
    ========================= */
 
 func (n *Node) computePeerScore(id PeerID) int {
+	if n == nil {
+		return reputationMin
+	}
 
+	// Reputation represents actual peer behavior.
+	//
+	// IMPORTANT FOR MOBILE NETWORKS:
+	//
+	// A peer may be offline for days, weeks, or months.
+	// Offline time is therefore NOT a reputation violation.
+	//
+	// The peer's identity remains permanent while its network
+	// connection is temporary.
 	base := n.getReputation(id)
 
-	lastSeenVal, ok := n.peerLastSeen.Load(id)
-	if !ok {
-		return base
+	// Keep the score inside the global reputation bounds.
+	if base > reputationMax {
+		return reputationMax
 	}
 
-	lastSeen := lastSeenVal.(time.Time)
-
-	inactivity := int(time.Since(lastSeen).Minutes())
-	if inactivity > maxInactivityPenalty {
-		inactivity = maxInactivityPenalty
+	if base < reputationMin {
+		return reputationMin
 	}
 
-	score := base - inactivity
-
-	if score < reputationMin {
-		score = reputationMin
-	}
-
-	return score
+	return base
 }
 
 /* =========================

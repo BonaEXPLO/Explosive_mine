@@ -532,19 +532,129 @@ func (n *Node) registerDefaultHandlers() {
 	})
 
 	// =========================================================
-	// PING / PONG (UNCHANGED)
+	// PING / PONG
 	// =========================================================
+	//
+	// PING/PONG measures the liveness of the CURRENT network session.
+	//
+	// IMPORTANT:
+	//   - No reputation penalty is applied for a missing PONG.
+	//   - Offline time is not malicious behavior.
+	//   - A PONG must match a PING nonce issued by this session.
+	//   - A valid PONG updates only session liveness metadata.
+	// =========================================================
+
 	n.RegisterHandler(MsgTypePing, func(p *Peer, env *Envelope) {
-		var ping PingPayload
-		if err := UnmarshalPayload(env.Payload, &ping); err != nil {
+		if p == nil {
 			return
 		}
-		pong := PongPayload{Nonce: ping.Nonce}
-		reply, _ := NewEnvelopeFromPayload(n.protocolVersion, MsgTypePong, pong)
-		_ = p.SendEnvelope(reply)
+
+		var ping PingPayload
+
+		if err := UnmarshalPayload(env.Payload, &ping); err != nil {
+			log.Printf(
+				"[p2p] ⚠️ invalid PING payload from %s: %v",
+				p.Addr(),
+				err,
+			)
+			return
+		}
+
+		if ping.Nonce == 0 {
+			log.Printf(
+				"[p2p] ⚠️ PING with invalid nonce from %s",
+				p.Addr(),
+			)
+			return
+		}
+
+		// Always answer a valid PING with the same nonce.
+		pong := PongPayload{
+			Nonce: ping.Nonce,
+		}
+
+		reply, err := NewEnvelopeFromPayload(
+			n.protocolVersion,
+			MsgTypePong,
+			pong,
+		)
+
+		if err != nil {
+			log.Printf(
+				"[p2p] ⚠️ failed to create PONG for %s: %v",
+				p.Addr(),
+				err,
+			)
+			return
+		}
+
+		if err := p.SendEnvelope(reply); err != nil {
+			log.Printf(
+				"[p2p] ⚠️ failed to send PONG to %s: %v",
+				p.Addr(),
+				err,
+			)
+			return
+		}
+
+		// Receiving a valid PING proves that the current network
+		// session is alive.
+		p.mu.Lock()
+		p.lastSeen = time.Now()
+		p.mu.Unlock()
 	})
 
-	n.RegisterHandler(MsgTypePong, func(p *Peer, env *Envelope) {})
+	n.RegisterHandler(MsgTypePong, func(p *Peer, env *Envelope) {
+		if p == nil {
+			return
+		}
+
+		var pong PongPayload
+
+		if err := UnmarshalPayload(env.Payload, &pong); err != nil {
+			log.Printf(
+				"[p2p] ⚠️ invalid PONG payload from %s: %v",
+				p.Addr(),
+				err,
+			)
+			return
+		}
+
+		if pong.Nonce == 0 {
+			log.Printf(
+				"[p2p] ⚠️ PONG with invalid nonce from %s",
+				p.Addr(),
+			)
+			return
+		}
+
+		rtt, valid := p.receivePong(pong.Nonce)
+
+		if !valid {
+			// Do NOT penalize the peer.
+			//
+			// An unmatched PONG can come from an old session, a delayed
+			// packet, or a stale network path. It is not enough to classify
+			// the permanent peer identity as malicious.
+			log.Printf(
+				"[p2p] ⚠️ unmatched PONG nonce from %s: %d",
+				p.Addr(),
+				pong.Nonce,
+			)
+			return
+		}
+
+		// A valid PONG proves that the current session is alive.
+		p.mu.Lock()
+		p.lastSeen = time.Now()
+		p.mu.Unlock()
+
+		log.Printf(
+			"[p2p] 💓 PONG received from %s (RTT=%s)",
+			p.Addr(),
+			rtt,
+		)
+	})
 
 	// =========================================================
 	// INV (SAFE + CONSENSUS AWARE)
@@ -1197,22 +1307,68 @@ func (n *Node) registerDefaultHandlers() {
 	})
 
 	// =========================================================
-	// METRICS (RESTORED EXACT LOGIC)
+	// METRICS
 	// =========================================================
+	//
+	// METRICS is available to every authenticated P2P participant.
+	//
+	// A peer does NOT need to be a miner to provide network metrics.
+	// Wallet authentication and the completed P2P handshake establish
+	// the peer's network identity.
+	//
+	// Miner status is an additional role, not a requirement for metrics.
+
 	n.RegisterHandler(MsgTypeMetrics, func(p *Peer, env *Envelope) {
 
-		if !p.IsVerifiedMiner() {
+		if p == nil {
+			log.Printf("[p2p] ⚠️ Ignoring METRICS from nil peer")
+			return
+		}
+
+		// =========================================================
+		// 1. REQUIRE COMPLETED HANDSHAKE
+		// =========================================================
+		//
+		// Both miners and observers/investors are valid P2P peers.
+		// The only requirement here is that the peer has completed
+		// the authenticated handshake.
+
+		p.mu.RLock()
+		handshakeDone := p.handshakeDone
+		peerID := p.id
+		verifiedMinerID := p.verifiedMinerID
+		p.mu.RUnlock()
+
+		if !handshakeDone {
+			log.Printf(
+				"[p2p] 🚫 Ignoring METRICS from unauthenticated peer %s",
+				p.addr,
+			)
 			p.Penalize(5, 0)
 			return
 		}
 
+		// =========================================================
+		// 2. DECODE METRICS
+		// =========================================================
+
 		var m MetricsData
+
 		if err := UnmarshalPayload(env.Payload, &m); err != nil {
+			log.Printf(
+				"[p2p] ⚠️ Invalid METRICS payload from %s: %v",
+				p.addr,
+				err,
+			)
+			p.Penalize(2, 0)
 			return
 		}
 
+		// =========================================================
+		// 3. UPDATE GLOBAL METRICS
+		// =========================================================
+
 		n.metricsMu.Lock()
-		defer n.metricsMu.Unlock()
 
 		n.GlobalMetrics = MetricsPayload{
 			Timestamp:        m.Timestamp,
@@ -1226,8 +1382,27 @@ func (n *Node) registerDefaultHandlers() {
 		n.CachedMetrics = m
 		n.cachedMetricsOnce = true
 
-		log.Printf("[p2p] Metrics updated by %s — %.3f EXPLO",
-			p.verifiedMinerID, m.Circulating)
+		n.metricsMu.Unlock()
+
+		// =========================================================
+		// 4. LOG ROLE
+		// =========================================================
+
+		if verifiedMinerID != "" {
+			log.Printf(
+				"[p2p] 📊 Metrics updated by authenticated miner %s (peer=%s) — %.3f EXPLO",
+				verifiedMinerID,
+				peerID,
+				m.Circulating,
+			)
+			return
+		}
+
+		log.Printf(
+			"[p2p] 📊 Metrics updated by authenticated observer/investor %s — %.3f EXPLO",
+			peerID,
+			m.Circulating,
+		)
 	})
 
 	// =========================================================

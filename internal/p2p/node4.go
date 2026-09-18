@@ -4,6 +4,7 @@ package p2p
 import (
 	"context"
 	"log"
+	"math/rand"
 	"strings"
 	"time"
 )
@@ -41,8 +42,32 @@ func normalizeAndJoinWords(words []string) string {
 }
 
 func (n *Node) PeerReconnectLoop() {
-	ticker := time.NewTicker(30 * time.Second)
+	if n == nil {
+		return
+	}
+
+	// Mobile peers may remain unreachable for days, weeks,
+	// or months. Reconnection therefore has no maximum number
+	// of attempts and no offline expiration.
+	const (
+		initialBackoff = 30 * time.Second
+		maxBackoff     = 24 * time.Hour
+		scanInterval   = 30 * time.Second
+	)
+
+	ticker := time.NewTicker(scanInterval)
 	defer ticker.Stop()
+
+	// Reconnection state is maintained independently from peer identity.
+	//
+	// A peer address is only a locator.
+	// The WalletAddress / PeerID remains the permanent identity.
+	nextRetry := make(map[string]time.Time)
+	attempts := make(map[string]uint64)
+
+	// Prevent multiple replacement sessions from being created for
+	// the same locator while a previous connection is still alive.
+	inFlight := make(map[string]*Peer)
 
 	for {
 		select {
@@ -50,54 +75,167 @@ func (n *Node) PeerReconnectLoop() {
 			return
 
 		case <-ticker.C:
-			// A Peer represents one connection session.
-			// A closed session must never be reused for reconnection.
-			n.PeersMutex.RLock()
+		}
 
-			addresses := make([]string, 0, len(n.Peers))
+		now := time.Now()
 
-			for _, p := range n.Peers {
-				if p == nil {
-					continue
-				}
+		// ------------------------------------------------------------
+		// CLEAN UP COMPLETED RECONNECTION SESSIONS
+		// ------------------------------------------------------------
 
-				if p.IsConnected() {
-					continue
-				}
+		for addr, peer := range inFlight {
+			if peer == nil || !peer.IsConnected() {
+				delete(inFlight, addr)
+			}
+		}
 
-				addr := strings.TrimSpace(p.addr)
-				if addr == "" {
-					continue
-				}
+		// ------------------------------------------------------------
+		// COLLECT DISCONNECTED PEER LOCATORS
+		// ------------------------------------------------------------
 
-				addresses = append(addresses, addr)
+		n.PeersMutex.RLock()
+
+		addresses := make([]string, 0, len(n.Peers))
+
+		for _, p := range n.Peers {
+			if p == nil {
+				continue
 			}
 
-			n.PeersMutex.RUnlock()
+			if p.IsConnected() {
+				continue
+			}
 
-			// Create a completely new Peer session for every
-			// disconnected peer address.
-			for _, addr := range addresses {
-				addr := addr
+			addr := strings.TrimSpace(p.Addr())
+			if addr == "" {
+				continue
+			}
 
-				go func() {
-					peer := NewPeer("", addr, n)
+			// Do not create another session while a replacement
+			// session for this locator is already active.
+			if _, exists := inFlight[addr]; exists {
+				continue
+			}
 
-					if err := peer.Connect(); err != nil {
-						log.Printf(
-							"[p2p] ⚠️ failed to reconnect to %s: %v",
-							addr,
-							err,
-						)
-						return
-					}
+			// Respect the current retry schedule.
+			if retryAt, exists := nextRetry[addr]; exists {
+				if now.Before(retryAt) {
+					continue
+				}
+			}
 
+			addresses = append(addresses, addr)
+		}
+
+		n.PeersMutex.RUnlock()
+
+		// ------------------------------------------------------------
+		// START NEW MOBILE SESSIONS
+		// ------------------------------------------------------------
+
+		for _, addr := range addresses {
+			addr := addr
+
+			// Double-check the in-flight state because another
+			// address may have been discovered more than once
+			// during the same scan.
+			if _, exists := inFlight[addr]; exists {
+				continue
+			}
+
+			attempts[addr]++
+			attempt := attempts[addr]
+
+			// Exponential backoff:
+			//
+			// attempt 1 -> 30s
+			// attempt 2 -> 1m
+			// attempt 3 -> 2m
+			// ...
+			// eventually -> 24h
+			backoff := initialBackoff
+
+			for i := uint64(1); i < attempt; i++ {
+				if backoff >= maxBackoff {
+					backoff = maxBackoff
+					break
+				}
+
+				backoff *= 2
+
+				if backoff >= maxBackoff {
+					backoff = maxBackoff
+					break
+				}
+			}
+
+			// Add up to 25% jitter.
+			// This prevents a large mobile population from
+			// reconnecting simultaneously.
+			jitterRange := backoff / 4
+			var jitter time.Duration
+
+			if jitterRange > 0 {
+				jitter = time.Duration(
+					rand.Int63n(int64(jitterRange)),
+				)
+			}
+
+			nextRetry[addr] = now.Add(backoff + jitter)
+
+			// Create a completely new Peer session.
+			//
+			// The old Peer may have been disconnected for a long
+			// time. It is never reused.
+			peer := NewPeer("", addr, n)
+
+			inFlight[addr] = peer
+
+			log.Printf(
+				"[p2p] 📱 mobile reconnect attempt #%d to %s",
+				attempt,
+				addr,
+			)
+
+			go func() {
+				if err := peer.Connect(); err != nil {
 					log.Printf(
-						"[p2p] 🔄 new P2P session created for %s",
+						"[p2p] 📱 reconnect attempt #%d to %s failed: %v",
+						attempt,
 						addr,
+						err,
 					)
-				}()
-			}
+
+					// Network failure is not peer misbehavior.
+					//
+					// Do NOT call Penalize().
+					peer.Close()
+					return
+				}
+
+				log.Printf(
+					"[p2p] 🔄 new P2P session established to %s; awaiting HANDSHAKE",
+					addr,
+				)
+
+				// Keep this locator marked as in-flight while the
+				// newly-created session is alive.
+				//
+				// Connect() starts the handshake asynchronously.
+				// We therefore wait until the session actually ends.
+				for {
+					select {
+					case <-n.ctx.Done():
+						peer.Close()
+						return
+
+					case <-time.After(30 * time.Second):
+						if !peer.IsConnected() {
+							return
+						}
+					}
+				}
+			}()
 		}
 	}
 }
