@@ -198,11 +198,6 @@ func (n *Node) registerDefaultHandlers() {
 
 			p.mu.Lock()
 			p.id = PeerID(hs.PeerID)
-			p.mu.Unlock()
-
-			// Store the remote blockchain height announced by the authenticated
-			// handshake. This value is used only for synchronization decisions.
-			p.mu.Lock()
 			p.LatestHeight = hs.ChainHeight
 			p.mu.Unlock()
 
@@ -403,8 +398,6 @@ func (n *Node) registerDefaultHandlers() {
 				// 9.11 Store VERIFIED MINER identity
 				// -----------------------------------------------------
 				//
-				// IMPORTANT:
-				//
 				// verifiedPubKey is the MINER public key here.
 				// It is intentionally different from env.PubKey,
 				// which is the WALLET public key.
@@ -482,11 +475,17 @@ func (n *Node) registerDefaultHandlers() {
 
 			if !alreadyDone {
 
-				// Register peer only after complete cryptographic
+				// -----------------------------------------------------
+				// Register the peer only after complete cryptographic
 				// validation.
+				// -----------------------------------------------------
+
 				n.addPeer(p)
 
+				// -----------------------------------------------------
 				// Release bootstrap waiters.
+				// -----------------------------------------------------
+
 				select {
 				case <-p.handshakeCh:
 					// Already closed.
@@ -500,6 +499,34 @@ func (n *Node) registerDefaultHandlers() {
 					role,
 					hs.WalletAddress,
 				)
+
+				// -----------------------------------------------------
+				// 11. IMMEDIATE LEDGER SYNCHRONIZATION TRIGGER
+				// -----------------------------------------------------
+				//
+				// The remote chain height was authenticated above and
+				// stored in p.LatestHeight.
+				//
+				// If this node is behind the remote peer,
+				// SyncLedgerFromBestPeer() will immediately select this
+				// peer and request the missing block range.
+				//
+				// Synchronization is deliberately asynchronous so the
+				// handshake/message processing loop is never blocked.
+				// -----------------------------------------------------
+
+				go func() {
+					if n == nil || n.Ledger == nil {
+						return
+					}
+
+					log.Printf(
+						"[p2p] 🔄 Peer authenticated — checking ledger synchronization with %s",
+						peerID,
+					)
+
+					n.SyncLedgerFromBestPeer(n.ctx)
+				}()
 			}
 		})
 	})
