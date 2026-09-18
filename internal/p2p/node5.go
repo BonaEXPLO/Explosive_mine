@@ -361,14 +361,16 @@ func (n *Node) handlePeerDisconnect(p *Peer) {
 	)
 }
 
-/* -------------------------------------------------------------------------
-   WATCHDOG
---------------------------------------------------------------------------- */
-
 func (n *Node) watchdogLoop() {
 	defer n.wg.Done()
 
-	ticker := time.NewTicker(1 * time.Minute)
+	// Mobile heartbeat interval.
+	//
+	// This is a session-liveness mechanism only.
+	// Missing PONGs never modify peer reputation.
+	const pingInterval = 1 * time.Minute
+
+	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
 
 	for {
@@ -377,186 +379,236 @@ func (n *Node) watchdogLoop() {
 			return
 
 		case <-ticker.C:
-			now := time.Now()
 
-			evictBefore := now.Add(
-				-n.config.PeerEvictionTimeout,
-			)
-
-			// ----------------------------------------------------------
-			// 1. EVICT INACTIVE PEERS
-			// ----------------------------------------------------------
+			// ------------------------------------------------------------------
+			// 1. SEND MOBILE HEARTBEATS
+			// ------------------------------------------------------------------
+			//
+			// A heartbeat is sent only to an active authenticated session.
+			//
+			// The permanent peer identity is not affected by heartbeat state.
+			// A peer may disappear from the network for an unlimited period.
 
 			for i := range n.peerShards {
 				sh := &n.peerShards[i]
 
-				var toEvict []*Peer
+				sh.mu.RLock()
 
-				sh.mu.Lock()
+				peers := make([]*Peer, 0, len(sh.peers))
 
-				for id, p := range sh.peers {
+				for _, p := range sh.peers {
+					if p == nil {
+						continue
+					}
+
 					p.mu.RLock()
-					lastSeen := p.lastSeen
+
+					connected := p.connected && p.conn != nil
+					handshakeDone := p.handshakeDone
+					peerID := p.id
+					peerAddr := p.addr
+
 					p.mu.RUnlock()
 
-					if lastSeen.IsZero() ||
-						lastSeen.Before(evictBefore) {
-
-						delete(sh.peers, id)
-
-						log.Printf(
-							"[p2p] evicted inactive peer id=%s addr=%s",
-							id,
-							p.addr,
-						)
-
-						toEvict = append(
-							toEvict,
-							p,
-						)
+					if !connected || !handshakeDone || peerID == "" {
+						continue
 					}
+
+					peers = append(peers, p)
+
+					log.Printf(
+						"[p2p] 💓 scheduling mobile heartbeat to %s (%s)",
+						peerID,
+						peerAddr,
+					)
 				}
 
-				sh.mu.Unlock()
+				sh.mu.RUnlock()
 
-				// Do not acquire PeersMutex while holding sh.mu.
-				if len(toEvict) > 0 {
-					n.PeersMutex.Lock()
-
-					for _, p := range toEvict {
-						for j, peer := range n.Peers {
-							if peer == p {
-								n.Peers = append(
-									n.Peers[:j],
-									n.Peers[j+1:]...,
-								)
-
-								break
-							}
-						}
+				for _, p := range peers {
+					if p == nil {
+						continue
 					}
 
-					n.PeersMutex.Unlock()
-
-					for _, p := range toEvict {
-						go p.Close()
+					// The session may have disappeared after the shard
+					// lock was released.
+					if !p.IsConnected() {
+						continue
 					}
+
+					nonce := p.nextPingNonce()
+
+					if nonce == 0 {
+						continue
+					}
+
+					p.registerPing(nonce)
+
+					ping := PingPayload{
+						Nonce: nonce,
+					}
+
+					env, err := NewEnvelopeFromPayload(
+						n.protocolVersion,
+						MsgTypePing,
+						ping,
+					)
+
+					if err != nil {
+						log.Printf(
+							"[p2p] ⚠️ failed to create PING for %s: %v",
+							p.Addr(),
+							err,
+						)
+						continue
+					}
+
+					if err := p.SendEnvelope(env); err != nil {
+						// Sending failure is a network-session event.
+						// It is NOT a reputation violation.
+						log.Printf(
+							"[p2p] ⚠️ PING send failed to %s: %v",
+							p.Addr(),
+							err,
+						)
+						continue
+					}
+
+					log.Printf(
+						"[p2p] 💓 PING sent to %s nonce=%d",
+						p.Addr(),
+						nonce,
+					)
 				}
 			}
 
-			// ----------------------------------------------------------
-			// 2. ENFORCE MAXIMUM PEER CAPACITY
-			// ----------------------------------------------------------
+			// ------------------------------------------------------------------
+			// 2. PEER CAPACITY MANAGEMENT
+			// ------------------------------------------------------------------
+			//
+			// Capacity management is a resource constraint.
+			// It is never a reputation decision.
+			//
+			// Disconnected sessions are removed first.
+			// Connected sessions are considered only when the node is
+			// actually above MaxPeers.
 
-			for n.PeerCount() > n.config.MaxPeers {
-				var victim *Peer
-				oldest := now
+			maxPeers := n.config.MaxPeers
 
-				for i := range n.peerShards {
-					sh := &n.peerShards[i]
+			if maxPeers > 0 {
+				for n.PeerCount() > maxPeers {
 
-					sh.mu.RLock()
+					var victim *Peer
+					var disconnectedVictim *Peer
 
-					for _, p := range sh.peers {
-						p.mu.RLock()
-						ls := p.lastSeen
-						p.mu.RUnlock()
+					var oldest time.Time
+					var oldestDisconnected time.Time
 
-						if ls.Before(oldest) {
-							oldest = ls
-							victim = p
+					now := time.Now()
+
+					oldest = now
+					oldestDisconnected = now
+
+					for i := range n.peerShards {
+						sh := &n.peerShards[i]
+
+						sh.mu.RLock()
+
+						for _, p := range sh.peers {
+							if p == nil {
+								continue
+							}
+
+							p.mu.RLock()
+
+							connected := p.connected && p.conn != nil
+							lastSeen := p.lastSeen
+
+							p.mu.RUnlock()
+
+							if !connected {
+								if disconnectedVictim == nil ||
+									lastSeen.Before(oldestDisconnected) {
+
+									oldestDisconnected = lastSeen
+									disconnectedVictim = p
+								}
+
+								continue
+							}
+
+							if victim == nil ||
+								lastSeen.Before(oldest) {
+
+								oldest = lastSeen
+								victim = p
+							}
 						}
+
+						sh.mu.RUnlock()
 					}
 
-					sh.mu.RUnlock()
-				}
+					if disconnectedVictim != nil {
+						log.Printf(
+							"[p2p] capacity cleanup: removing disconnected session id=%s addr=%s",
+							disconnectedVictim.ID(),
+							disconnectedVictim.Addr(),
+						)
 
-				if victim != nil {
-					log.Printf(
-						"[p2p] capacity eviction of peer id=%s addr=%s",
-						victim.id,
-						victim.addr,
-					)
+						// Capacity cleanup is not punishment.
+						n.handlePeerDisconnect(disconnectedVictim)
+						continue
+					}
 
-					n.handlePeerDisconnect(victim)
-				} else {
+					if victim != nil {
+						log.Printf(
+							"[p2p] capacity cleanup: removing connected session id=%s addr=%s",
+							victim.ID(),
+							victim.Addr(),
+						)
+
+						// Capacity eviction is NOT a reputation penalty.
+						// The permanent peer identity remains valid.
+						n.handlePeerDisconnect(victim)
+						continue
+					}
+
 					break
 				}
 			}
 
-			// ----------------------------------------------------------
-			// 3. PERIODIC BLOCK SYNCHRONIZATION
-			// ----------------------------------------------------------
+			// ------------------------------------------------------------------
+			// 3. NO INACTIVITY PENALTY
+			// ------------------------------------------------------------------
+			//
+			// IMPORTANT:
+			//
+			// We intentionally do NOT:
+			//
+			//   - inspect lastSeen and punish old timestamps
+			//   - punish missing PONGs
+			//   - ban silent peers
+			//   - delete permanent peer identity because of inactivity
+			//
+			// TCP/readLoop handles the current session.
+			// PeerReconnectLoop creates a new session when connectivity
+			// becomes available again.
+			//
+			// Offline duration is therefore irrelevant to reputation.
 
-			newBlocks, err := n.FetchBlocks()
-			if err != nil {
-				log.Printf(
-					"[p2p] block fetch failed: %v",
-					err,
-				)
-
-				continue
-			}
-
-			for _, blk := range newBlocks {
-				// Verify block signature strictly according to V3 rules.
-				valid, err := blk.VerifySignature()
-				if err != nil {
-					log.Printf(
-						"[p2p] block %d signature verification error: %v",
-						blk.Header.Height,
-						err,
-					)
-
-					continue
-				}
-
-				// Reject unsigned/invalid blocks in strict mode.
-				if !valid && n.config.RequireStrictBlockSig {
-					log.Printf(
-						"[p2p] rejecting unsigned/invalid block %d (strict mode)",
-						blk.Header.Height,
-					)
-
-					continue
-				}
-
-				// Accept only one block per height.
-				existing, err := n.Ledger.GetBlockByHeight(
-					blk.Header.Height,
-				)
-
-				if err == nil && existing != nil {
-					if existing.BlockHash != blk.BlockHash {
-						log.Printf(
-							"[p2p] ⚠️ fork detected at height %d",
-							blk.Header.Height,
-						)
-					}
-
-					continue
-				}
-
-				// Attempt to add block to ledger.
-				if err := n.Ledger.AddBlock(blk); err != nil {
-					log.Printf(
-						"[p2p] failed to apply fetched block %d: %v",
-						blk.Header.Height,
-						err,
-					)
-				} else {
-					log.Printf(
-						"[p2p] successfully applied fetched block %d",
-						blk.Header.Height,
-					)
-
-					// Relay block through lightweight inventory announcement.
-					n.BroadcastBlockInv(
-						[]byte(blk.BlockHash),
-						InvKindBlockFull,
-					)
-				}
-			}
+			// ------------------------------------------------------------------
+			// 4. BLOCKCHAIN SYNCHRONIZATION
+			// ------------------------------------------------------------------
+			//
+			// Blockchain synchronization remains completely independent
+			// from heartbeat/liveness.
+			//
+			// It is handled by:
+			//
+			//   SyncLedgerFromBestPeer()
+			//   startLightSyncCycles()
+			//   GETBLOCKSRANGE
+			//   BLOCKSRESPONSE
 		}
 	}
 }

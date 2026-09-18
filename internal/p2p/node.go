@@ -238,7 +238,7 @@ func NewNode(listenAddr, networkID, userAgent string, minerID string, sacredWord
 		ListenAddr:       listenAddr,
 		DialTimeout:      60 * time.Second,
 		ConnReadTimeout:  90 * time.Second,
-		ConnWriteTimeout: 90 * time.Second,
+		ConnWriteTimeout: 2 * time.Minute,
 		FlushInterval:    500 * time.Millisecond,
 		PeerDialPeriod:   30 * time.Second,
 

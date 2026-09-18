@@ -15,6 +15,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"os"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -53,6 +54,17 @@ type Peer struct {
 	connected bool
 	lastSeen  time.Time
 
+	// ---- PING / PONG LIVENESS ----
+	//
+	// These fields describe the current network session only.
+	// They are NOT part of peer reputation.
+	//
+	// A peer can remain offline for days/weeks/months without punishment.
+	pingMu       sync.Mutex
+	pendingPings map[int64]time.Time
+	lastPong     time.Time
+	pingSequence uint64
+
 	// anti-abuse / scoring
 	score    int
 	banUntil time.Time
@@ -81,18 +93,26 @@ func init() {
 // It reads queue sizing from node.config.SendQueueSize.
 func NewPeer(id PeerID, addr string, node *Node) *Peer {
 	ctx, cancel := context.WithCancel(context.Background())
+
 	qsize := 64
+
 	if node != nil && node.config.SendQueueSize > 0 {
 		qsize = node.config.SendQueueSize
 	}
+
 	return &Peer{
-		id:          id,
-		addr:        addr,
-		node:        node,
-		sendQ:       make(chan []byte, qsize),
-		ctx:         ctx,
-		cancel:      cancel,
+		id:   id,
+		addr: addr,
+		node: node,
+
+		sendQ: make(chan []byte, qsize),
+
+		ctx:    ctx,
+		cancel: cancel,
+
 		handshakeCh: make(chan struct{}),
+
+		pendingPings: make(map[int64]time.Time),
 	}
 }
 
@@ -157,54 +177,134 @@ func (p *Peer) Penalize(delta int, banDur time.Duration) {
 	)
 }
 
-// backoffDial tries to dial with exponential backoff + jitter using the peer context.
 func (p *Peer) backoffDial(ctx context.Context) (net.Conn, error) {
-	base := time.Second
-	max := 30 * time.Second
-	var lastErr error
-	for attempt := 0; attempt < 6; attempt++ {
-		// respect provided DialTimeout from node config if present
-		dialTimeout := time.Second * 10
+	if p == nil {
+		return nil, errors.New("nil peer")
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Mobile networks may remain unavailable for days, weeks,
+	// or months. Reconnection therefore has no artificial maximum
+	// number of attempts and no fixed maximum backoff period.
+	//
+	// Offline time is never treated as peer misbehavior.
+	const baseBackoff = 5 * time.Second
+
+	var attempt uint64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		// Respect the configured TCP dial timeout.
+		dialTimeout := 10 * time.Second
+
 		if p.node != nil && p.node.config.DialTimeout > 0 {
 			dialTimeout = p.node.config.DialTimeout
 		}
-		d := net.Dialer{Timeout: dialTimeout}
-		conn, err := d.DialContext(ctx, "tcp", p.addr)
+
+		d := net.Dialer{
+			Timeout: dialTimeout,
+		}
+
+		conn, err := d.DialContext(
+			ctx,
+			"tcp",
+			p.addr,
+		)
+
 		if err == nil {
 			return conn, nil
 		}
-		lastErr = err
-		// compute backoff + jitter
-		sleep := base * (1 << uint(attempt))
-		if sleep > max {
-			sleep = max
+
+		attempt++
+
+		// ==========================================================
+		// EXPONENTIAL BACKOFF
+		// ==========================================================
+		//
+		// The retry interval grows until 24 hours.
+		// There is NO limit on the number of retries.
+		//
+		// 5s -> 10s -> 20s -> 40s -> ... -> 24h -> 24h -> ...
+		//
+		// The 24-hour value is only a retry interval.
+		// It is NOT an offline or identity expiration limit.
+
+		backoff := baseBackoff
+
+		for i := uint64(1); i < attempt; i++ {
+			if backoff >= 24*time.Hour {
+				backoff = 24 * time.Hour
+				break
+			}
+
+			backoff *= 2
+
+			if backoff >= 24*time.Hour {
+				backoff = 24 * time.Hour
+				break
+			}
 		}
-		jitter := time.Duration(rand.Int63n(int64(250 * time.Millisecond)))
+
+		// ==========================================================
+		// RANDOM JITTER
+		// ==========================================================
+		//
+		// Prevents many mobile peers from reconnecting at exactly
+		// the same moment after a common network outage.
+
+		jitterRange := backoff / 4
+		var jitter time.Duration
+
+		if jitterRange > 0 {
+			jitter = time.Duration(
+				rand.Int63n(int64(jitterRange)),
+			)
+		}
+
+		delay := backoff + jitter
+
+		log.Printf(
+			"[p2p] mobile reconnect attempt #%d to %s failed: %v; retry in %s",
+			attempt,
+			p.addr,
+			err,
+			delay,
+		)
+
+		timer := time.NewTimer(delay)
+
 		select {
-		case <-time.After(sleep + jitter):
+		case <-timer.C:
 			continue
+
 		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+
 			return nil, ctx.Err()
 		}
 	}
-	return nil, lastErr
 }
 
-// Connect dials a remote peer.
-//
-// Each Peer represents exactly one connection session.
-// A closed Peer must never be reused for another connection.
-//
-// The connection attempt is bound to the Peer's context so a cancelled
-// session can stop the dial immediately. After TLS negotiation, the
-// session state is checked again before the connection is installed.
 func (p *Peer) Connect() error {
 	if p == nil {
 		return errors.New("nil peer")
 	}
 
 	// ------------------------------------------------------------------
-	// FAST CHECK
+	// SESSION CHECK
 	// ------------------------------------------------------------------
 
 	p.mu.Lock()
@@ -214,9 +314,7 @@ func (p *Peer) Connect() error {
 		return nil
 	}
 
-	// IMPORTANT:
-	// Do NOT call IsBanned() here because it would acquire the same
-	// mutex again and can deadlock.
+	// Do not call IsBanned() here because it acquires p.mu again.
 	if time.Now().Before(p.banUntil) {
 		ban := p.banUntil
 		p.mu.Unlock()
@@ -248,13 +346,17 @@ func (p *Peer) Connect() error {
 		return errors.New("peer context is missing")
 	}
 
-	// If this Peer session was already cancelled, never create a new
-	// network connection from it.
+	// A cancelled Peer represents an expired network session.
+	// A new session must use a new Peer object.
 	select {
 	case <-ctx.Done():
 		return errors.New("peer session already closed")
 	default:
 	}
+
+	// ------------------------------------------------------------------
+	// DIAL CONFIGURATION
+	// ------------------------------------------------------------------
 
 	dialTimeout := 10 * time.Second
 
@@ -263,7 +365,22 @@ func (p *Peer) Connect() error {
 	}
 
 	// ------------------------------------------------------------------
-	// TLS CONNECTION
+	// TCP + TLS
+	// ------------------------------------------------------------------
+	//
+	// This is a temporary network session.
+	//
+	// Mobile networks may disappear at any moment:
+	//
+	// Wi-Fi -> 4G
+	// 4G -> 5G
+	// phone sleep
+	// router restart
+	// IP change
+	// phone powered off
+	//
+	// None of these events are identity violations.
+	// The session simply ends and a future Peer reconnects.
 	// ------------------------------------------------------------------
 
 	dialer := &net.Dialer{
@@ -281,9 +398,8 @@ func (p *Peer) Connect() error {
 		p.addr,
 	)
 	if err != nil {
-		// A cancelled Peer session is expected during shutdown or
-		// reconnection replacement. Do not perform unnecessary
-		// diagnostics in that case.
+		// If this session was cancelled, this is normal session
+		// lifecycle behavior and does not require diagnostics.
 		select {
 		case <-ctx.Done():
 			return errors.New("peer session cancelled during TLS dial")
@@ -296,13 +412,17 @@ func (p *Peer) Connect() error {
 			err,
 		)
 
-		// Also test plain TCP separately so we can distinguish
-		// network connectivity from TLS negotiation failure.
+		// Diagnostic TCP probe only.
+		// Failure here is network/session failure, not peer misbehavior.
 		tcpDialer := &net.Dialer{
 			Timeout: dialTimeout,
 		}
 
-		tcpConn, tcpErr := tcpDialer.Dial("tcp", p.addr)
+		tcpConn, tcpErr := tcpDialer.DialContext(
+			ctx,
+			"tcp",
+			p.addr,
+		)
 
 		if tcpErr != nil {
 			log.Printf(
@@ -332,8 +452,7 @@ func (p *Peer) Connect() error {
 
 	p.mu.Lock()
 
-	// The Peer may have been cancelled while TLS was completing.
-	// Never install a connection into a cancelled session.
+	// The session may have been cancelled while TLS was completing.
 	select {
 	case <-ctx.Done():
 		p.mu.Unlock()
@@ -346,8 +465,7 @@ func (p *Peer) Connect() error {
 	default:
 	}
 
-	// Another connection must never be installed into the same Peer
-	// session after this point.
+	// Never install a second connection into the same Peer session.
 	if p.connected && p.conn != nil {
 		p.mu.Unlock()
 		_ = conn.Close()
@@ -383,7 +501,7 @@ func (p *Peer) Connect() error {
 	}
 
 	// ------------------------------------------------------------------
-	// START IO
+	// START SESSION IO
 	// ------------------------------------------------------------------
 
 	p.wg.Add(2)
@@ -393,6 +511,16 @@ func (p *Peer) Connect() error {
 
 	// ------------------------------------------------------------------
 	// SEND HANDSHAKE
+	// ------------------------------------------------------------------
+	//
+	// The handshake is intentionally asynchronous.
+	//
+	// TLS establishes the encrypted transport first.
+	// EXPLOSIVE HANDSHAKE then authenticates the wallet identity
+	// and, when applicable, the miner identity.
+	//
+	// Wallet password, BIP39 words, sacred words and private keys
+	// never cross this connection.
 	// ------------------------------------------------------------------
 
 	go func() {
@@ -416,6 +544,16 @@ func (p *Peer) Connect() error {
 		case <-timer.C:
 		}
 
+		// The connection may have disappeared while the handshake
+		// delay was running.
+		if !p.IsConnected() {
+			log.Printf(
+				"[p2p] ⛔ Session disappeared before handshake to %s",
+				p.addr,
+			)
+			return
+		}
+
 		log.Printf(
 			"[p2p] 🚀 Sending handshake to %s",
 			p.addr,
@@ -428,6 +566,9 @@ func (p *Peer) Connect() error {
 				err,
 			)
 
+			// Handshake failure closes this temporary session.
+			// The reconnect system may create a completely new Peer
+			// session later.
 			p.Close()
 			return
 		}
@@ -749,6 +890,7 @@ func (p *Peer) sendHandshake() error {
 
 	// ------------------------------------------------------------------
 	// FINAL SECURITY CHECK
+
 	// ------------------------------------------------------------------
 
 	if isMiner {
@@ -1306,7 +1448,15 @@ func (p *Peer) writeLoop() {
 			len(pending), pendingBytes, p.addr)
 
 		if c, ok := conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
-			_ = c.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			writeTimeout := 2 * time.Minute
+
+			if p.node != nil && p.node.config.ConnWriteTimeout > 0 {
+				writeTimeout = p.node.config.ConnWriteTimeout
+			}
+
+			_ = c.SetWriteDeadline(
+				time.Now().Add(writeTimeout),
+			)
 		}
 
 		for i, b := range pending {
@@ -1410,10 +1560,6 @@ func (p *Peer) writeLoop() {
 	}
 }
 
-// readLoop continuously reads framed messages from the peer and dispatches them to handlers.
-// The handshake is purely bidirectional: it is considered complete as soon as
-// the remote peer's MsgTypeHandshake message is received.
-
 func (p *Peer) readLoop() {
 	defer p.wg.Done()
 
@@ -1422,7 +1568,8 @@ func (p *Peer) readLoop() {
 		return
 	}
 
-	// Use full readTimeout for initial deadline.
+	// The read deadline protects the current network session.
+	// A timeout is NOT a reputation violation.
 	readTimeout := 5 * time.Minute
 	if p.node != nil && p.node.config.ConnReadTimeout > 0 {
 		readTimeout = p.node.config.ConnReadTimeout
@@ -1456,16 +1603,25 @@ func (p *Peer) readLoop() {
 		var lenBuf [4]byte
 
 		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-			if !errors.Is(err, io.EOF) &&
-				!errors.Is(err, net.ErrClosed) {
 
+			// Network interruption, timeout, EOF or closed socket
+			// are session events, NOT reputation violations.
+			if errors.Is(err, os.ErrDeadlineExceeded) ||
+				errors.Is(err, net.ErrClosed) ||
+				errors.Is(err, io.EOF) ||
+				errors.Is(err, io.ErrUnexpectedEOF) {
+
+				log.Printf(
+					"[p2p] network session ended with %s: %v",
+					p.addr,
+					err,
+				)
+			} else {
 				log.Printf(
 					"[p2p] read header error from %s: %v",
 					p.addr,
 					err,
 				)
-
-				p.Penalize(1, 0)
 			}
 
 			if p.node != nil {
@@ -1507,16 +1663,23 @@ func (p *Peer) readLoop() {
 
 		if _, err := io.ReadFull(r, payload); err != nil {
 
-			if !errors.Is(err, io.EOF) &&
-				!errors.Is(err, net.ErrClosed) {
+			// Again: network loss is not malicious behaviour.
+			if errors.Is(err, os.ErrDeadlineExceeded) ||
+				errors.Is(err, net.ErrClosed) ||
+				errors.Is(err, io.EOF) ||
+				errors.Is(err, io.ErrUnexpectedEOF) {
 
+				log.Printf(
+					"[p2p] network session ended while reading payload from %s: %v",
+					p.addr,
+					err,
+				)
+			} else {
 				log.Printf(
 					"[p2p] read payload error from %s: %v",
 					p.addr,
 					err,
 				)
-
-				p.Penalize(1, 0)
 			}
 
 			if p.node != nil {
@@ -1562,8 +1725,6 @@ func (p *Peer) readLoop() {
 				err,
 			)
 
-			// Do not ban immediately — the message may be caused by
-			// a protocol/version mismatch or clock-related issue.
 			p.Penalize(10, 0)
 			continue
 		}
@@ -1571,12 +1732,11 @@ func (p *Peer) readLoop() {
 		// ==========================================================
 		// HANDSHAKE GATE
 		//
-		// The handshake gate is intentionally not enforced here.
-		//
-		// node3.go is the single source of truth for handshake
-		// lifecycle and authentication. Blocking messages here can
-		// cause valid mobile peers to be disconnected when messages
-		// arrive close together during connection establishment.
+		// node3.go remains the single source of truth for:
+		// - handshake authentication
+		// - wallet identity verification
+		// - miner identity verification
+		// - peer registration
 		// ==========================================================
 
 		// ==========================================================
@@ -1584,15 +1744,6 @@ func (p *Peer) readLoop() {
 		// ==========================================================
 
 		if criticalMessages[env.Type] {
-
-			// Critical P2P messages MUST contain a valid wallet
-			// cryptographic identity.
-			//
-			// Envelope.PubKey is the WALLET public key.
-			// Envelope.Signature is the WALLET signature.
-			//
-			// MinerInfo is a separate identity and is never compared
-			// directly with Envelope.PubKey.
 
 			if len(env.PubKey) != ed25519.PublicKeySize ||
 				len(env.Signature) != ed25519.SignatureSize {
@@ -1631,24 +1782,6 @@ func (p *Peer) readLoop() {
 		}
 
 		// ==========================================================
-		// MINER IDENTITY
-		// ==========================================================
-		//
-		// IMPORTANT:
-		//
-		// Envelope.PubKey             = WalletPublicKey
-		// Envelope.MinerInfo.PubKey   = MinerPublicKey
-		//
-		// These keys are intentionally different.
-		//
-		// MinerInfo authentication is therefore NOT performed by
-		// comparing the two public keys.
-		//
-		// The complete MinerInfo proof is verified by node3.go using
-		// VerifyMinerP2PProof().
-		// ==========================================================
-
-		// ==========================================================
 		// REPLAY PROTECTION
 		// ==========================================================
 
@@ -1659,7 +1792,6 @@ func (p *Peer) readLoop() {
 			if now.Sub(lastCleanup) > 5*time.Minute {
 
 				for nonce, ts := range seenNonces {
-
 					if now.Sub(ts) > 10*time.Minute {
 						delete(seenNonces, nonce)
 					}
@@ -1685,6 +1817,7 @@ func (p *Peer) readLoop() {
 
 		// ==========================================================
 		// BLOCK VALIDATION
+		//
 		// Pre-dispatch DailyPoW verification.
 		// ==========================================================
 
@@ -1744,14 +1877,6 @@ func (p *Peer) readLoop() {
 		//
 		// All messages, including HANDSHAKE, are dispatched through
 		// the node handler.
-		//
-		// node3.go handles:
-		// - handshake authentication
-		// - wallet identity verification
-		// - miner P2P proof verification
-		// - on-chain miner verification
-		// - peer registration
-		// - handshake completion
 		// ==========================================================
 
 		if p.node != nil {
@@ -1890,4 +2015,118 @@ func (p *Peer) getTLSIdentity() (string, bool) {
 	cert := state.PeerCertificates[0]
 
 	return cert.Subject.CommonName, true
+}
+
+// nextPingNonce generates a unique nonce for the current peer session.
+func (p *Peer) nextPingNonce() int64 {
+	if p == nil {
+		return 0
+	}
+
+	p.pingMu.Lock()
+	defer p.pingMu.Unlock()
+
+	p.pingSequence++
+
+	// Combine the current timestamp with a per-peer sequence.
+	// This avoids relying on wall-clock uniqueness alone.
+	now := time.Now().UnixNano()
+
+	nonce := now ^ int64(p.pingSequence)
+
+	if nonce == 0 {
+		nonce = int64(p.pingSequence)
+	}
+
+	return nonce
+}
+
+// registerPing records an outbound PING awaiting its PONG.
+func (p *Peer) registerPing(nonce int64) {
+	if p == nil || nonce == 0 {
+		return
+	}
+
+	p.pingMu.Lock()
+	defer p.pingMu.Unlock()
+
+	if p.pendingPings == nil {
+		p.pendingPings = make(map[int64]time.Time)
+	}
+
+	p.pendingPings[nonce] = time.Now()
+
+	// Keep the pending table bounded.
+	// A missing PONG is a session issue, never a reputation violation.
+	if len(p.pendingPings) > 64 {
+		cutoff := time.Now().Add(-10 * time.Minute)
+
+		for pendingNonce, sentAt := range p.pendingPings {
+			if sentAt.Before(cutoff) {
+				delete(p.pendingPings, pendingNonce)
+			}
+		}
+
+		// Hard safety bound in case the clock behaves unexpectedly.
+		for len(p.pendingPings) > 64 {
+			for pendingNonce := range p.pendingPings {
+				delete(p.pendingPings, pendingNonce)
+				break
+			}
+		}
+	}
+}
+
+// receivePong validates a PONG against an outstanding PING.
+//
+// The returned duration is the measured round-trip time.
+// A false result means that the nonce was not issued by this session.
+func (p *Peer) receivePong(nonce int64) (time.Duration, bool) {
+	if p == nil || nonce == 0 {
+		return 0, false
+	}
+
+	p.pingMu.Lock()
+	defer p.pingMu.Unlock()
+
+	sentAt, ok := p.pendingPings[nonce]
+	if !ok {
+		return 0, false
+	}
+
+	delete(p.pendingPings, nonce)
+
+	rtt := time.Since(sentAt)
+
+	if rtt < 0 {
+		rtt = 0
+	}
+
+	p.lastPong = time.Now()
+
+	return rtt, true
+}
+
+// LastPong returns the last successful PONG time for the current session.
+func (p *Peer) LastPong() time.Time {
+	if p == nil {
+		return time.Time{}
+	}
+
+	p.pingMu.Lock()
+	defer p.pingMu.Unlock()
+
+	return p.lastPong
+}
+
+// PendingPingCount returns the number of PINGs currently awaiting PONG.
+func (p *Peer) PendingPingCount() int {
+	if p == nil {
+		return 0
+	}
+
+	p.pingMu.Lock()
+	defer p.pingMu.Unlock()
+
+	return len(p.pendingPings)
 }
