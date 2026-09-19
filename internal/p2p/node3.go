@@ -1343,7 +1343,7 @@ func (n *Node) registerDefaultHandlers() {
 	})
 
 	// =========================================================
-	// TRANSACTIONS (UNCHANGED)
+	// TRANSACTIONS
 	// =========================================================
 	n.RegisterHandler(MsgTypeTx, func(p *Peer, env *Envelope) {
 
@@ -1462,6 +1462,65 @@ func (n *Node) registerDefaultHandlers() {
 			"[p2p] 📊 Metrics updated by authenticated observer/investor %s — %.3f EXPLO",
 			peerID,
 			m.Circulating,
+		)
+	})
+
+	// =========================================================
+	// REQUEST_PEERS DISCOVERY
+	// =========================================================
+	// REQUEST_PEERS asks an already authenticated peer to return
+	// public network locators for other known peers.
+	//
+	// No wallet password, mnemonic, sacred word or private key is
+	// ever transmitted through peer discovery.
+	n.RegisterHandler(MsgTypeRequestPeers, func(p *Peer, env *Envelope) {
+
+		if n == nil || p == nil || env == nil {
+			return
+		}
+
+		// ------------------------------------------------------------
+		// 1. The requester must have completed the P2P handshake.
+		// ------------------------------------------------------------
+		p.mu.RLock()
+		peerID := p.id
+		peerAddr := p.addr
+		handshakeDone := p.handshakeDone
+		p.mu.RUnlock()
+
+		if peerID == "" {
+			log.Printf(
+				"[p2p] ⚠️ REQUEST_PEERS rejected: requester has no authenticated PeerID",
+			)
+			return
+		}
+
+		if !handshakeDone {
+			log.Printf(
+				"[p2p] ⚠️ REQUEST_PEERS rejected from %s: handshake not completed",
+				peerID,
+			)
+			return
+		}
+
+		// ------------------------------------------------------------
+		// 2. The envelope has already passed the global validation
+		//    and wallet-signature verification pipeline.
+		// ------------------------------------------------------------
+		log.Printf(
+			"[p2p] 🔎 REQUEST_PEERS accepted from %s (%s)",
+			peerID,
+			peerAddr,
+		)
+
+		// ------------------------------------------------------------
+		// 3. Return public peer locators only.
+		// ------------------------------------------------------------
+		n.SendKnownPeers(p)
+
+		log.Printf(
+			"[p2p] 📡 PEERS discovery response sent to %s",
+			peerID,
 		)
 	})
 
