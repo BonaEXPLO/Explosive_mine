@@ -295,27 +295,203 @@ func (n *Node) PeerReconnectLoop() {
 	}
 }
 
-// SendKnownPeers sends a list of known connected peers to the requesting peer.
+// SendKnownPeers sends authenticated public network locators to the requesting peer.
+//
+// Peer identity is permanent while network locators are temporary.
+// Only public networking information is shared here.
 func (n *Node) SendKnownPeers(p *Peer) {
-	addrs := make([]string, 0, 32)
-
-	for i := range n.peerShards {
-		sh := &n.peerShards[i]
-		sh.mu.RLock()
-		for _, peer := range sh.peers {
-			if peer.IsConnected() && peer != p && peer.addr != n.listenAddr {
-				addrs = append(addrs, peer.addr)
-			}
-		}
-		sh.mu.RUnlock()
-	}
-
-	if len(addrs) == 0 {
+	if n == nil || p == nil {
 		return
 	}
 
-	env, _ := NewEnvelopeFromPayload(n.protocolVersion, MsgTypePeers, PeersPayload{Addrs: addrs})
-	_ = p.SendEnvelope(env)
+	announcements := make([]PeerAnnouncement, 0, 32)
+	legacyAddrs := make([]string, 0, 32)
+
+	// ------------------------------------------------------------
+	// 1. Share locators known by the new discovery layer.
+	// ------------------------------------------------------------
+	if n.Discovery != nil {
+		snapshot := n.Discovery.Snapshot()
+
+		for peerID, locators := range snapshot {
+			if peerID == "" || peerID == n.id {
+				continue
+			}
+
+			for _, locator := range locators {
+				if !locator.IsValid() {
+					continue
+				}
+
+				// Never advertise the requesting peer back to itself.
+				p.mu.RLock()
+				requestingPeerID := p.id
+				p.mu.RUnlock()
+
+				if peerID == requestingPeerID {
+					continue
+				}
+
+				announcements = append(
+					announcements,
+					PeerAnnouncement{
+						PeerID:    peerID,
+						Address:   locator.Address,
+						Network:   locator.Network,
+						Source:    locator.Source,
+						LastSeen:  locator.LastSeen,
+						ExpiresAt: locator.ExpiresAt,
+					},
+				)
+
+				if len(announcements) >= 64 {
+					break
+				}
+			}
+
+			if len(announcements) >= 64 {
+				break
+			}
+		}
+	}
+
+	// ------------------------------------------------------------
+	// 2. Also expose currently connected peers.
+	//
+	// This preserves compatibility with the existing mobile
+	// session architecture and gives discovery fresh locators.
+	// ------------------------------------------------------------
+	for i := range n.peerShards {
+		sh := &n.peerShards[i]
+
+		sh.mu.RLock()
+
+		for _, peer := range sh.peers {
+			if peer == nil || peer == p || !peer.IsConnected() {
+				continue
+			}
+
+			peer.mu.RLock()
+			peerID := peer.id
+			addr := strings.TrimSpace(peer.reconnectAddr)
+
+			if addr == "" {
+				addr = strings.TrimSpace(peer.addr)
+			}
+
+			peer.mu.RUnlock()
+
+			if peerID == "" || peerID == n.id {
+				continue
+			}
+
+			p.mu.RLock()
+			requestingPeerID := p.id
+			p.mu.RUnlock()
+
+			if peerID == requestingPeerID {
+				continue
+			}
+
+			if addr == "" {
+				continue
+			}
+
+			// Add the locator to our discovery layer.
+			if n.Discovery != nil {
+				locator := PeerLocator{
+					PeerID:   peerID,
+					Address:  addr,
+					Network:  n.networkID,
+					Source:   PeerDiscoverySourceLocal,
+					LastSeen: time.Now().Unix(),
+				}
+
+				if err := n.Discovery.AddLocator(locator); err != nil {
+					log.Printf(
+						"[p2p] discovery locator rejected for peer=%s addr=%s: %v",
+						peerID,
+						addr,
+						err,
+					)
+				}
+			}
+
+			legacyAddrs = append(legacyAddrs, addr)
+
+			if len(legacyAddrs) >= 32 {
+				break
+			}
+		}
+
+		sh.mu.RUnlock()
+
+		if len(legacyAddrs) >= 32 {
+			break
+		}
+	}
+
+	// ------------------------------------------------------------
+	// 3. If discovery has nothing to share, do not send an empty
+	//    discovery response.
+	// ------------------------------------------------------------
+	if len(announcements) == 0 && len(legacyAddrs) == 0 {
+		return
+	}
+
+	// ------------------------------------------------------------
+	// 4. Remove duplicate legacy addresses.
+	// ------------------------------------------------------------
+	uniqueLegacy := make([]string, 0, len(legacyAddrs))
+	seenLegacy := make(map[string]struct{}, len(legacyAddrs))
+
+	for _, addr := range legacyAddrs {
+		addr = strings.TrimSpace(addr)
+
+		if addr == "" {
+			continue
+		}
+
+		if _, exists := seenLegacy[addr]; exists {
+			continue
+		}
+
+		seenLegacy[addr] = struct{}{}
+		uniqueLegacy = append(uniqueLegacy, addr)
+	}
+
+	payload := PeersPayload{
+		Addrs: uniqueLegacy,
+		Peers: announcements,
+	}
+
+	env, err := NewEnvelopeFromPayload(
+		n.protocolVersion,
+		MsgTypePeers,
+		payload,
+	)
+
+	if err != nil {
+		log.Printf(
+			"[p2p] failed to create PEERS response: %v",
+			err,
+		)
+		return
+	}
+
+	if err := p.SendEnvelope(env); err != nil {
+		log.Printf(
+			"[p2p] failed to send PEERS response: %v",
+			err,
+		)
+		return
+	}
+
+	log.Printf(
+		"[p2p] 📡 PEERS sent: %d authenticated locators, %d legacy addresses",
+		len(announcements),
+		len(uniqueLegacy),
+	)
 }
 
 // SyncLedgerFromBestPeer starts one asynchronous ledger synchronization

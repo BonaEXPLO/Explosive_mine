@@ -24,13 +24,26 @@ import (
 	"explosive/internal/ledger"
 )
 
-/* =========================
-   PAYLOAD (UTILISÉ POUR P2P DISCOVERY)
-   ========================= */
+// PeerAnnouncement describes a publicly shareable network locator
+// belonging to a permanent peer identity.
+//
+// No private key, password, mnemonic or sacred word is ever included.
+type PeerAnnouncement struct {
+	PeerID    PeerID `cbor:"peer_id"`
+	Address   string `cbor:"address"`
+	Network   string `cbor:"network,omitempty"`
+	Source    string `cbor:"source,omitempty"`
+	LastSeen  int64  `cbor:"last_seen,omitempty"`
+	ExpiresAt int64  `cbor:"expires_at,omitempty"`
+}
 
-// ✔ UTILE : utilisé pour échange de peers (Bootstrap / discovery)
+// PeersPayload contains public peer locators learned through discovery.
+//
+// The legacy Addrs field is intentionally retained for protocol compatibility
+// with older EXPLOSIVE nodes.
 type PeersPayload struct {
-	Addrs []string
+	Addrs []string           `cbor:"addrs,omitempty"`
+	Peers []PeerAnnouncement `cbor:"peers,omitempty"`
 }
 
 /* =========================
@@ -163,6 +176,13 @@ type Node struct {
 	knownPeers   map[PeerID]string
 
 	// ------------------------------------------------------------------
+	// PEER DISCOVERY
+	// ------------------------------------------------------------------
+	// Discovery stores temporary network locators for permanent peer
+	// identities. It is separate from active network sessions.
+	Discovery *PeerDiscovery
+
+	// ------------------------------------------------------------------
 	// TLS IDENTITY CACHE
 	// ------------------------------------------------------------------
 	tlsPeerCache sync.Map
@@ -244,6 +264,11 @@ func NewNode(listenAddr, networkID, userAgent string, minerID string, sacredWord
 	// --- Anti-Sybil / IP tracking init ---
 	n.peerIPCount = make(map[string]int)
 
+	// --- Durable peer discovery init ---
+	// Peer identity is permanent while network locators are temporary.
+	n.knownPeers = make(map[PeerID]string)
+	n.Discovery = NewPeerDiscovery()
+
 	// --- TLS configuration ---
 	n.tlsConfig = n.setupTLSConfig(tlsCert)
 
@@ -294,8 +319,8 @@ func NewNode(listenAddr, networkID, userAgent string, minerID string, sacredWord
 	n.userAgent = userAgent
 	n.config = cfg
 
-	// 🔐 CRITICAL FIX
-	// Prevent handshake Version=0
+	// --- Protocol version ---
+	// Prevent handshake Version=0.
 	n.protocolVersion = CurrentProtocolVersion
 
 	n.peerShards = shards

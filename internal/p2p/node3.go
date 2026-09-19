@@ -8,6 +8,8 @@ import (
 	"explosive/internal/ledger"
 	"github.com/fxamacker/cbor/v2"
 	"log"
+	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -1464,23 +1466,263 @@ func (n *Node) registerDefaultHandlers() {
 	})
 
 	// =========================================================
-	// PEERS (UNCHANGED)
+	// PEERS DISCOVERY
 	// =========================================================
+	// PEERS contains locator hints learned from an authenticated peer.
+	//
+	// IMPORTANT:
+	// A PeerAnnouncement is NOT an identity proof.
+	// The announced PeerID/address pair is only a network locator hint.
+	// The actual remote identity is authenticated later by HANDSHAKE.
 	n.RegisterHandler(MsgTypePeers, func(p *Peer, env *Envelope) {
 
-		var pl PeersPayload
-		if err := UnmarshalPayload(env.Payload, &pl); err != nil {
+		if n == nil || p == nil || env == nil {
 			return
 		}
 
-		for _, addr := range pl.Addrs {
-			if addr != n.listenAddr {
-				go n.Connect(addr)
-			}
-		}
-	})
+		// ------------------------------------------------------------
+		// 1. The sender must already have a completed P2P session.
+		// ------------------------------------------------------------
+		p.mu.RLock()
+		senderID := p.id
+		senderAddr := p.addr
+		handshakeDone := p.handshakeDone
+		p.mu.RUnlock()
 
-	n.RegisterHandler(MsgTypeRequestPeers, func(p *Peer, env *Envelope) {
-		n.SendKnownPeers(p)
+		if senderID == "" {
+			log.Printf(
+				"[p2p] ⚠️ PEERS rejected: sender has no authenticated PeerID",
+			)
+			return
+		}
+
+		if !handshakeDone {
+			log.Printf(
+				"[p2p] ⚠️ PEERS rejected from %s: handshake not completed",
+				senderID,
+			)
+			return
+		}
+
+		// ------------------------------------------------------------
+		// 2. Decode payload.
+		// ------------------------------------------------------------
+		var pl PeersPayload
+
+		if err := UnmarshalPayload(env.Payload, &pl); err != nil {
+			log.Printf(
+				"[p2p] ⚠️ Invalid PEERS payload from %s: %v",
+				senderAddr,
+				err,
+			)
+			return
+		}
+
+		// ------------------------------------------------------------
+		// 3. Limit discovery amplification.
+		// ------------------------------------------------------------
+		const maxAnnouncementsPerMessage = 64
+
+		if len(pl.Peers) > maxAnnouncementsPerMessage {
+			log.Printf(
+				"[p2p] ⚠️ PEERS from %s contains too many announcements: %d",
+				senderID,
+				len(pl.Peers),
+			)
+
+			pl.Peers = pl.Peers[:maxAnnouncementsPerMessage]
+		}
+
+		// ------------------------------------------------------------
+		// 4. Process modern peer announcements.
+		// ------------------------------------------------------------
+		for _, announcement := range pl.Peers {
+
+			peerID := PeerID(
+				strings.TrimSpace(
+					string(announcement.PeerID),
+				),
+			)
+
+			address := strings.TrimSpace(
+				announcement.Address,
+			)
+
+			networkID := strings.TrimSpace(
+				announcement.Network,
+			)
+
+			// --------------------------------------------------------
+			// Basic identity validation.
+			// --------------------------------------------------------
+			if peerID == "" {
+				continue
+			}
+
+			// Never store our own identity.
+			if peerID == n.id {
+				continue
+			}
+
+			// Never accept an empty locator.
+			if address == "" {
+				continue
+			}
+
+			// --------------------------------------------------------
+			// Network isolation.
+			//
+			// A locator belonging to another EXPLOSIVE network must
+			// never be imported into this node's discovery table.
+			// --------------------------------------------------------
+			if networkID != "" && networkID != n.networkID {
+				log.Printf(
+					"[p2p] ⚠️ Ignoring locator from foreign network: peer=%s network=%s",
+					peerID,
+					networkID,
+				)
+				continue
+			}
+
+			// --------------------------------------------------------
+			// Validate host:port.
+			// --------------------------------------------------------
+			host, port, err := net.SplitHostPort(address)
+
+			if err != nil {
+				log.Printf(
+					"[p2p] ⚠️ Invalid discovered locator: peer=%s addr=%s",
+					peerID,
+					address,
+				)
+				continue
+			}
+
+			host = strings.TrimSpace(host)
+			port = strings.TrimSpace(port)
+
+			if host == "" || port == "" {
+				continue
+			}
+
+			portNumber, err := strconv.Atoi(port)
+
+			if err != nil || portNumber < 1 || portNumber > 65535 {
+				log.Printf(
+					"[p2p] ⚠️ Invalid discovered port: peer=%s addr=%s",
+					peerID,
+					address,
+				)
+				continue
+			}
+
+			// --------------------------------------------------------
+			// Never use a locator whose address is our own listener.
+			// --------------------------------------------------------
+			if address == n.listenAddr {
+				continue
+			}
+
+			// --------------------------------------------------------
+			// IMPORTANT SECURITY RULE:
+			//
+			// Do NOT trust LastSeen or ExpiresAt supplied by the
+			// remote peer.
+			//
+			// The receiving node decides when this locator expires.
+			// --------------------------------------------------------
+			now := time.Now()
+
+			locator := PeerLocator{
+				PeerID:    peerID,
+				Address:   address,
+				Network:   n.networkID,
+				Source:    PeerDiscoverySourcePeer,
+				LastSeen:  now.Unix(),
+				ExpiresAt: now.Add(PeerLocatorTTL).Unix(),
+			}
+
+			if err := n.Discovery.AddLocator(locator); err != nil {
+				log.Printf(
+					"[p2p] ⚠️ Rejected discovered locator peer=%s addr=%s: %v",
+					peerID,
+					address,
+					err,
+				)
+				continue
+			}
+
+			log.Printf(
+				"[p2p] 🔎 Locator discovered: peer=%s addr=%s via=%s",
+				peerID,
+				address,
+				senderID,
+			)
+
+			// --------------------------------------------------------
+			// The locator is only a connection hint.
+			//
+			// Connect() will establish a new TLS session and the
+			// remote HANDSHAKE will cryptographically authenticate
+			// the actual PeerID.
+			// --------------------------------------------------------
+			go n.Connect(address)
+		}
+
+		// ------------------------------------------------------------
+		// 5. Legacy addresses.
+		//
+		// Older EXPLOSIVE nodes may only send Addrs.
+		//
+		// These addresses have NO PeerID and therefore are treated
+		// strictly as bootstrap/session hints.
+		// ------------------------------------------------------------
+		const maxLegacyAddresses = 32
+
+		if len(pl.Addrs) > maxLegacyAddresses {
+			pl.Addrs = pl.Addrs[:maxLegacyAddresses]
+		}
+
+		for _, addr := range pl.Addrs {
+
+			addr = strings.TrimSpace(addr)
+
+			if addr == "" || addr == n.listenAddr {
+				continue
+			}
+
+			// Validate host:port before dialing.
+			_, port, err := net.SplitHostPort(addr)
+
+			if err != nil {
+				log.Printf(
+					"[p2p] ⚠️ Invalid legacy discovery address: %s",
+					addr,
+				)
+				continue
+			}
+
+			portNumber, err := strconv.Atoi(
+				strings.TrimSpace(port),
+			)
+
+			if err != nil ||
+				portNumber < 1 ||
+				portNumber > 65535 {
+				log.Printf(
+					"[p2p] ⚠️ Invalid legacy discovery port: %s",
+					addr,
+				)
+				continue
+			}
+
+			log.Printf(
+				"[p2p] 🔎 Legacy locator discovered: %s via=%s",
+				addr,
+				senderID,
+			)
+
+			go n.Connect(addr)
+		}
 	})
 }
