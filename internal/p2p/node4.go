@@ -94,19 +94,81 @@ func (n *Node) PeerReconnectLoop() {
 		// COLLECT DURABLE PEER LOCATORS
 		// ------------------------------------------------------------
 		//
-		// n.Peers contains only active sessions.
-		// A disconnected session is intentionally removed from n.Peers.
+		// PeerDiscovery is the primary source of truth.
 		//
-		// knownPeers is therefore the source of truth for mobile
-		// reconnection. It survives Wi-Fi loss, TCP resets and normal
-		// session expiration.
+		// A permanent PeerID may have multiple valid network locators:
+		//
+		//     PeerID
+		//       ├── LAN IPv4
+		//       ├── IPv6
+		//       ├── public/reflexive address
+		//       └── relay address
+		//
+		// knownPeers is retained temporarily as a compatibility fallback.
+		//
+		// Active Peer sessions remain separate from discovery state.
+
+		type reconnectCandidate struct {
+			peerID  PeerID
+			address string
+		}
+
+		candidates := make([]reconnectCandidate, 0, 32)
+		seenAddresses := make(map[string]struct{})
+
+		// ------------------------------------------------------------
+		// 1. PRIMARY SOURCE: MULTI-LOCATOR DISCOVERY
+		// ------------------------------------------------------------
+
+		if n.Discovery != nil {
+			snapshot := n.Discovery.Snapshot()
+
+			for peerID, locators := range snapshot {
+				if peerID == "" || peerID == n.id {
+					continue
+				}
+
+				for _, locator := range locators {
+					if !locator.IsValid() {
+						continue
+					}
+
+					if locator.Network != "" &&
+						n.networkID != "" &&
+						locator.Network != n.networkID {
+						continue
+					}
+
+					addr := strings.TrimSpace(locator.Address)
+					if addr == "" {
+						continue
+					}
+
+					if _, exists := seenAddresses[addr]; exists {
+						continue
+					}
+
+					seenAddresses[addr] = struct{}{}
+
+					candidates = append(
+						candidates,
+						reconnectCandidate{
+							peerID:  peerID,
+							address: addr,
+						},
+					)
+				}
+			}
+		}
+
+		// ------------------------------------------------------------
+		// 2. COMPATIBILITY FALLBACK: LEGACY knownPeers
+		// ------------------------------------------------------------
 
 		n.knownPeersMu.RLock()
 
-		known := make(map[PeerID]string, len(n.knownPeers))
-
 		for peerID, addr := range n.knownPeers {
-			if peerID == "" {
+			if peerID == "" || peerID == n.id {
 				continue
 			}
 
@@ -115,37 +177,51 @@ func (n *Node) PeerReconnectLoop() {
 				continue
 			}
 
-			known[peerID] = addr
+			if _, exists := seenAddresses[addr]; exists {
+				continue
+			}
+
+			seenAddresses[addr] = struct{}{}
+
+			candidates = append(
+				candidates,
+				reconnectCandidate{
+					peerID:  peerID,
+					address: addr,
+				},
+			)
 		}
 
 		n.knownPeersMu.RUnlock()
 
-		addresses := make([]string, 0, len(known))
+		// ------------------------------------------------------------
+		// 3. FILTER ACTIVE PEERS AND RETRY STATE
+		// ------------------------------------------------------------
 
-		for peerID, addr := range known {
+		addresses := make([]string, 0, len(candidates))
 
-			// ----------------------------------------------------------
-			// Do not reconnect to ourselves.
-			// ----------------------------------------------------------
+		for _, candidate := range candidates {
+			peerID := candidate.peerID
+			addr := candidate.address
+
+			if peerID == "" || addr == "" {
+				continue
+			}
 
 			if peerID == n.id {
 				continue
 			}
 
-			// ----------------------------------------------------------
+			// --------------------------------------------------------
 			// Check whether this identity already has an active session.
-			// ----------------------------------------------------------
+			// --------------------------------------------------------
 
 			active := false
 
 			peers := n.AllPeers()
 
 			for _, p := range peers {
-				if p == nil {
-					continue
-				}
-
-				if !p.IsConnected() {
+				if p == nil || !p.IsConnected() {
 					continue
 				}
 
@@ -153,7 +229,7 @@ func (n *Node) PeerReconnectLoop() {
 				activeID := p.id
 				p.mu.RUnlock()
 
-				if activeID == PeerID(peerID) {
+				if activeID == peerID {
 					active = true
 					break
 				}
@@ -163,17 +239,17 @@ func (n *Node) PeerReconnectLoop() {
 				continue
 			}
 
-			// ----------------------------------------------------------
+			// --------------------------------------------------------
 			// Prevent duplicate reconnect sessions.
-			// ----------------------------------------------------------
+			// --------------------------------------------------------
 
 			if _, exists := inFlight[addr]; exists {
 				continue
 			}
 
-			// ----------------------------------------------------------
+			// --------------------------------------------------------
 			// Respect exponential retry schedule.
-			// ----------------------------------------------------------
+			// --------------------------------------------------------
 
 			if retryAt, exists := nextRetry[addr]; exists {
 				if now.Before(retryAt) {
@@ -710,15 +786,14 @@ func (n *Node) IsLedgerComplete() bool {
 	return true
 }
 
-// rememberPeerLocator stores the durable network locator of an
+// rememberPeerLocator stores a durable network locator of an
 // authenticated peer.
 //
-// The locator is deliberately kept separate from the active Peer
-// session. A TCP session may use an ephemeral source port such as
-// 192.168.43.1:50880, while the peer's advertised listening port
-// may be 48942.
+// The discovery layer is the primary source of truth because one
+// permanent PeerID may have multiple valid network locators.
 //
-// Network loss is not identity loss.
+// knownPeers is kept temporarily as a compatibility fallback for
+// older mobile-session logic.
 func (n *Node) rememberPeerLocator(peerID PeerID, addr string) {
 	if n == nil || peerID == "" {
 		return
@@ -729,12 +804,42 @@ func (n *Node) rememberPeerLocator(peerID PeerID, addr string) {
 		return
 	}
 
+	// ------------------------------------------------------------
+	// PRIMARY STORAGE: multi-locator discovery
+	// ------------------------------------------------------------
+	if n.Discovery != nil {
+		locator := PeerLocator{
+			PeerID:   peerID,
+			Address:  addr,
+			Network:  n.networkID,
+			Source:   PeerDiscoverySourceHandshake,
+			LastSeen: time.Now().Unix(),
+		}
+
+		if err := n.Discovery.AddLocator(locator); err != nil {
+			log.Printf(
+				"[p2p] ⚠️ Failed to store discovery locator: peer=%s addr=%s err=%v",
+				peerID,
+				addr,
+				err,
+			)
+		}
+	}
+
+	// ------------------------------------------------------------
+	// COMPATIBILITY STORAGE
+	// ------------------------------------------------------------
+	//
+	// Keep the old map during the migration period.
+	// It is no longer the primary discovery database.
 	n.knownPeersMu.Lock()
+
 	if n.knownPeers == nil {
 		n.knownPeers = make(map[PeerID]string)
 	}
 
 	n.knownPeers[peerID] = addr
+
 	n.knownPeersMu.Unlock()
 
 	log.Printf(
