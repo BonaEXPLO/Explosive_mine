@@ -390,8 +390,12 @@ func extractLocalIP(addr net.Addr) net.IP {
 	return net.ParseIP(strings.TrimSpace(addr.String()))
 }
 
-// isLANIPv4 identifies RFC1918 IPv4 addresses normally used by local
-// Wi-Fi, hotspot and private LAN networks.
+// isLANIPv4 identifies IPv4 addresses commonly used by local
+// Wi-Fi and hotspot networks.
+//
+// The 10.0.0.0/8 range is deliberately excluded because mobile
+// operators and CGNAT networks may use it for private cellular
+// connectivity.
 func isLANIPv4(ip net.IP) bool {
 	if ip == nil {
 		return false
@@ -403,16 +407,13 @@ func isLANIPv4(ip net.IP) bool {
 	}
 
 	switch {
-	case ip4[0] == 10:
+	case ip4[0] == 192 &&
+		ip4[1] == 168:
 		return true
 
 	case ip4[0] == 172 &&
 		ip4[1] >= 16 &&
 		ip4[1] <= 31:
-		return true
-
-	case ip4[0] == 192 &&
-		ip4[1] == 168:
 		return true
 
 	default:
