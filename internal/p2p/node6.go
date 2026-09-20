@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
@@ -478,28 +479,37 @@ func (n *Node) validateHandshake(p *Peer, claimedID PeerID, nonce string) error 
 	return nil
 }
 
-func (n *Node) verifyPeerOnChain(minerID PeerID) bool {
-
+func (n *Node) verifyPeerOnChain(minerID PeerID, minerPubKey []byte) bool {
 	if n == nil || n.Ledger == nil {
 		return false
 	}
 
+	minerID = PeerID(strings.ToLower(strings.TrimSpace(string(minerID))))
 	if minerID == "" {
 		return false
 	}
 
-	// Bootstrap: no identities exist yet.
+	if len(minerPubKey) != ed25519.PublicKeySize {
+		return false
+	}
+
+	// Bootstrap: no on-chain miner identities exist yet.
+	// Cryptographic P2P proof remains the source of authentication.
 	if n.Ledger.GetLatestBlockHeight() == 0 {
 		return true
 	}
 
-	var pubKey []byte
+	var storedPubKey []byte
 
 	key := []byte("miner_pubkey:" + string(minerID))
 
-	if err := n.Ledger.GetObject(key, &pubKey); err != nil {
+	if err := n.Ledger.GetObject(key, &storedPubKey); err != nil {
 		return false
 	}
 
-	return len(pubKey) == ed25519.PublicKeySize
+	if len(storedPubKey) != ed25519.PublicKeySize {
+		return false
+	}
+
+	return bytes.Equal(storedPubKey, minerPubKey)
 }

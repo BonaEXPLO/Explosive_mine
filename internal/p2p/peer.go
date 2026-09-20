@@ -97,31 +97,27 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
-// NewPeer constructs a Peer object (not connected).
-// It reads queue sizing from node.config.SendQueueSize.
 func NewPeer(id PeerID, addr string, node *Node) *Peer {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	qsize := 64
-
 	if node != nil && node.config.SendQueueSize > 0 {
 		qsize = node.config.SendQueueSize
 	}
 
+	// The network address is only a temporary locator.
+	// A peer's permanent identity is established only after
+	// the EXPLOSIVE handshake verifies the remote wallet identity.
 	return &Peer{
 		id:            id,
 		addr:          addr,
 		reconnectAddr: addr,
 		node:          node,
-
-		sendQ: make(chan []byte, qsize),
-
-		ctx:    ctx,
-		cancel: cancel,
-
-		handshakeCh: make(chan struct{}),
-
-		pendingPings: make(map[int64]time.Time),
+		sendQ:         make(chan []byte, qsize),
+		ctx:           ctx,
+		cancel:        cancel,
+		handshakeCh:   make(chan struct{}),
+		pendingPings:  make(map[int64]time.Time),
 	}
 }
 
@@ -715,6 +711,18 @@ func (p *Peer) sendHandshake() error {
 
 	if strings.TrimSpace(h.PeerID) == "" {
 		return errors.New("local peer ID is empty")
+	}
+
+	if !strings.EqualFold(h.PeerID, h.WalletAddress) {
+		return fmt.Errorf(
+			"local peer identity mismatch: peer_id=%s wallet_address=%s",
+			h.PeerID,
+			h.WalletAddress,
+		)
+	}
+
+	if strings.TrimSpace(h.Network) == "" {
+		return errors.New("local network ID is empty")
 	}
 
 	if strings.TrimSpace(h.Network) == "" {

@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
+	"explosive/internal/address"
 	"fmt"
 	"log"
 	"math/big"
@@ -126,6 +127,7 @@ type Node struct {
 	walletIdentityMu sync.RWMutex
 	walletAddress    string
 	walletPublicKey  []byte
+	identityReady    bool
 
 	// ------------------------------------------------------------------
 	// WALLET SIGNER
@@ -238,41 +240,64 @@ type Node struct {
 
 func NewNode(listenAddr, networkID, userAgent string, minerID string, sacredWords []string) (*Node, error) {
 
-	// --- Normalize listen address (dual-stack safe) ---
+	// ------------------------------------------------------------------
+	// TRANSPORT ADDRESS
+	// ------------------------------------------------------------------
+	// The listen address is a network locator only.
+	// It is never used as the permanent node identity.
 	listenAddr = normalizeListenAddr(listenAddr, 8443)
 
-	// --- Generate deterministic TLS certificate ---
-	tlsCert, err := generateDeterministicTLSCert(minerID, sacredWords)
+	// ------------------------------------------------------------------
+	// TLS TRANSPORT IDENTITY
+	// ------------------------------------------------------------------
+	// TLS is used to secure the transport session.
+	//
+	// It must NOT determine the permanent EXPLOSIVE PeerID.
+	//
+	// The permanent PeerID is established later from the authenticated
+	// wallet identity through SetWalletIdentity().
+	//
+	// Miner credentials are intentionally not used to derive the TLS
+	// transport identity.
+	_ = minerID
+	_ = sacredWords
+
+	tlsCert, err := generateDeterministicTLSCert("", nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// --- Stable Node ID derived from TLS public key ---
-	pub, ok := tlsCert.Leaf.PublicKey.(ed25519.PublicKey)
-	if !ok {
-		return nil, errors.New("TLS certificate public key is not Ed25519")
-	}
-
-	id := PeerID(hex.EncodeToString(pub))
-
-	// --- Create Node instance ---
+	// ------------------------------------------------------------------
+	// CREATE NODE
+	// ------------------------------------------------------------------
 	n := &Node{}
 
-	// --- Anti-replay / nonce tracking init ---
+	// ------------------------------------------------------------------
+	// ANTI-REPLAY / NONCE TRACKING
+	// ------------------------------------------------------------------
 	n.nonceCount = make(map[string]int)
 
-	// --- Anti-Sybil / IP tracking init ---
+	// ------------------------------------------------------------------
+	// ANTI-SYBIL / IP TRACKING
+	// ------------------------------------------------------------------
 	n.peerIPCount = make(map[string]int)
 
-	// --- Durable peer discovery init ---
-	// Peer identity is permanent while network locators are temporary.
+	// ------------------------------------------------------------------
+	// DURABLE PEER DISCOVERY
+	// ------------------------------------------------------------------
+	// Discovery stores temporary network locators belonging to permanent
+	// peer identities.
 	n.knownPeers = make(map[PeerID]string)
 	n.Discovery = NewPeerDiscovery()
 
-	// --- TLS configuration ---
+	// ------------------------------------------------------------------
+	// TLS CONFIGURATION
+	// ------------------------------------------------------------------
 	n.tlsConfig = n.setupTLSConfig(tlsCert)
 
-	// --- Node configuration ---
+	// ------------------------------------------------------------------
+	// NODE CONFIGURATION
+	// ------------------------------------------------------------------
 	cfg := NodeConfig{
 		ListenAddr:       listenAddr,
 		DialTimeout:      60 * time.Second,
@@ -300,10 +325,14 @@ func NewNode(listenAddr, networkID, userAgent string, minerID string, sacredWord
 		PeerInvalidMsgThreshold: 4,
 	}
 
-	// --- Context lifecycle ---
+	// ------------------------------------------------------------------
+	// CONTEXT LIFECYCLE
+	// ------------------------------------------------------------------
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// --- Peer sharding ---
+	// ------------------------------------------------------------------
+	// PEER SHARDING
+	// ------------------------------------------------------------------
 	shards := make([]peerShard, 64)
 
 	for i := range shards {
@@ -312,15 +341,25 @@ func NewNode(listenAddr, networkID, userAgent string, minerID string, sacredWord
 		}
 	}
 
-	// --- Assign core fields ---
-	n.id = id
+	// ------------------------------------------------------------------
+	// CORE NODE STATE
+	// ------------------------------------------------------------------
+	// IMPORTANT:
+	//
+	// n.id intentionally starts empty.
+	//
+	// The permanent PeerID is assigned only after the wallet has been
+	// authenticated through SetWalletIdentity().
+	n.id = ""
+
 	n.listenAddr = listenAddr
 	n.networkID = networkID
 	n.userAgent = userAgent
 	n.config = cfg
 
-	// --- Protocol version ---
-	// Prevent handshake Version=0.
+	// ------------------------------------------------------------------
+	// PROTOCOL VERSION
+	// ------------------------------------------------------------------
 	n.protocolVersion = CurrentProtocolVersion
 
 	n.peerShards = shards
@@ -329,22 +368,27 @@ func NewNode(listenAddr, networkID, userAgent string, minerID string, sacredWord
 	n.ctx = ctx
 	n.cancel = cancel
 
-	// --- Channels & handlers ---
+	// ------------------------------------------------------------------
+	// CHANNELS & HANDLERS
+	// ------------------------------------------------------------------
 	n.inboundCh = make(chan *incomingMsg, 1024)
 
 	n.handlers = make(map[MessageType]func(*Peer, *Envelope))
 
-	// --- Critical state initialization ---
+	// ------------------------------------------------------------------
+	// CRITICAL STATE INITIALIZATION
+	// ------------------------------------------------------------------
 	n.cachedMetricsOnce = false
 	n.lastNonceCleanup = time.Now()
 
 	log.Printf(
-		"[p2p] protocol initialized: version=%d nodeID=%s",
+		"[p2p] transport initialized: version=%d identity=pending",
 		n.protocolVersion,
-		n.id,
 	)
 
-	// --- Register protocol handlers ---
+	// ------------------------------------------------------------------
+	// REGISTER PROTOCOL HANDLERS
+	// ------------------------------------------------------------------
 	n.registerDefaultHandlers()
 	go n.processIncoming()
 
@@ -356,9 +400,14 @@ func (n *Node) SetWalletIdentity(walletAddress string, publicKey []byte) error {
 		return errors.New("nil P2P node")
 	}
 
-	walletAddress = strings.TrimSpace(walletAddress)
+	walletAddress = strings.ToLower(strings.TrimSpace(walletAddress))
+
 	if walletAddress == "" {
 		return errors.New("wallet address is empty")
+	}
+
+	if !address.IsValidEXPLOAddress(walletAddress) {
+		return errors.New("invalid EXPLO wallet address")
 	}
 
 	if len(publicKey) != ed25519.PublicKeySize {
@@ -369,15 +418,53 @@ func (n *Node) SetWalletIdentity(walletAddress string, publicKey []byte) error {
 		)
 	}
 
+	// The wallet address must be cryptographically derived
+	// from the supplied Ed25519 public key.
+	expectedAddress := address.GenerateEXPLOAddress(
+		ed25519.PublicKey(publicKey),
+	)
+
+	if !strings.EqualFold(expectedAddress, walletAddress) {
+		return errors.New(
+			"wallet identity mismatch: address does not match public key",
+		)
+	}
+
 	// Copy the public key so callers cannot mutate node identity
 	// through the original byte slice.
 	pubCopy := make([]byte, len(publicKey))
 	copy(pubCopy, publicKey)
 
 	n.walletIdentityMu.Lock()
+	defer n.walletIdentityMu.Unlock()
+
+	// A permanent wallet identity must never be silently replaced.
+	if n.identityReady {
+		if !strings.EqualFold(n.walletAddress, walletAddress) {
+			return errors.New(
+				"permanent wallet identity cannot be changed",
+			)
+		}
+
+		if !ed25519.PublicKey(n.walletPublicKey).Equal(
+			ed25519.PublicKey(pubCopy),
+		) {
+			return errors.New(
+				"permanent wallet public key cannot be changed",
+			)
+		}
+
+		return nil
+	}
+
 	n.walletAddress = walletAddress
 	n.walletPublicKey = pubCopy
-	n.walletIdentityMu.Unlock()
+
+	// The wallet address is the permanent EXPLOSIVE
+	// network identity of this node.
+	n.id = PeerID(walletAddress)
+
+	n.identityReady = true
 
 	return nil
 }
@@ -665,48 +752,127 @@ func sha256Sum(s string) []byte {
 	return h.Sum(nil)
 }
 
-// Start launches the P2P node with full TLS encryption and dual-stack IPv4/IPv6 listening.
-//
-// It uses the pre-generated tlsConfig from NewNode (deterministic or random self-signed Ed25519 certificate)
-// to create a secure TLS listener. All inbound connections are automatically upgraded to TLS.
-//
-// The rest of the node lifecycle (accept loop, message processing, watchdog, bootstrap, etc.)
-// remains unchanged and works transparently over the encrypted tls.Listener.
 func (n *Node) Start() error {
-	if n.listenAddr == "" {
+	if n == nil {
+		return errors.New("nil P2P node")
+	}
+
+	// ------------------------------------------------------------------
+	// PERMANENT WALLET IDENTITY
+	// ------------------------------------------------------------------
+	// A P2P node must never start without a verified wallet identity.
+	//
+	// The permanent PeerID is established by SetWalletIdentity().
+	// TLS is only the secure transport layer.
+	n.walletIdentityMu.RLock()
+	identityReady := n.identityReady
+	walletAddress := n.walletAddress
+	walletPublicKey := len(n.walletPublicKey)
+	peerID := n.id
+	n.walletIdentityMu.RUnlock()
+
+	if !identityReady {
+		return errors.New(
+			"wallet identity is not configured; call SetWalletIdentity before Start",
+		)
+	}
+
+	if walletAddress == "" {
+		return errors.New(
+			"wallet identity is incomplete: wallet address is empty",
+		)
+	}
+
+	if walletPublicKey != ed25519.PublicKeySize {
+		return errors.New(
+			"wallet identity is incomplete: wallet public key is missing",
+		)
+	}
+
+	if peerID == "" {
+		return errors.New(
+			"permanent PeerID is not initialized",
+		)
+	}
+
+	if !strings.EqualFold(string(peerID), walletAddress) {
+		return errors.New(
+			"permanent PeerID does not match wallet address",
+		)
+	}
+
+	// ------------------------------------------------------------------
+	// LISTEN ADDRESS
+	// ------------------------------------------------------------------
+	if strings.TrimSpace(n.listenAddr) == "" {
 		return errors.New("listen address not set")
 	}
 
+	// ------------------------------------------------------------------
+	// TLS TRANSPORT
+	// ------------------------------------------------------------------
 	if n.tlsConfig == nil {
-		return errors.New("TLS configuration missing - node must be created with TLS support")
+		return errors.New(
+			"TLS configuration missing - node must be created with TLS support",
+		)
 	}
 
-	// Create a TLS listener using the deterministic or fallback certificate
+	// ------------------------------------------------------------------
+	// PREVENT DOUBLE START
+	// ------------------------------------------------------------------
+	if n.ln != nil {
+		return errors.New("P2P node is already started")
+	}
+
+	// ------------------------------------------------------------------
+	// CREATE SECURE TLS LISTENER
+	// ------------------------------------------------------------------
 	ln, err := tls.Listen("tcp", n.listenAddr, n.tlsConfig)
 	if err != nil {
-		return fmt.Errorf("failed to start TLS listener on %s: %w", n.listenAddr, err)
+		return fmt.Errorf(
+			"failed to start TLS listener on %s: %w",
+			n.listenAddr,
+			err,
+		)
 	}
+
 	n.ln = ln
 
-	log.Printf("p2p: 🔒 Secure TLS node listening on %s (id=%s, dual-stack IPv4/IPv6)", n.listenAddr, n.id)
-	log.Printf("p2p: TLS certificate subject: CN=%s (deterministic V3 identity)",
-		n.tlsConfig.Certificates[0].Leaf.Subject.CommonName)
+	log.Printf(
+		"[p2p] 🔒 Secure TLS node listening on %s (peerID=%s)",
+		n.listenAddr,
+		n.id,
+	)
 
-	// --- Accept incoming encrypted connections ---
+	if len(n.tlsConfig.Certificates) > 0 &&
+		n.tlsConfig.Certificates[0].Leaf != nil {
+
+		log.Printf(
+			"[p2p] TLS transport certificate subject: CN=%s",
+			n.tlsConfig.Certificates[0].Leaf.Subject.CommonName,
+		)
+	}
+
+	// ------------------------------------------------------------------
+	// ACCEPT INCOMING CONNECTIONS
+	// ------------------------------------------------------------------
 	n.wg.Add(1)
 	go n.acceptLoop()
 
-	// --- Process inbound messages ---
-	n.wg.Add(1)
-
-	// --- Watchdog: peer eviction + periodic block sync ---
+	// ------------------------------------------------------------------
+	// WATCHDOG
+	// ------------------------------------------------------------------
 	n.wg.Add(1)
 	go n.watchdogLoop()
 
-	// --- Bootstrap: connect to seed nodes over TLS ---
+	// ------------------------------------------------------------------
+	// BOOTSTRAP
+	// ------------------------------------------------------------------
 	n.Bootstrap()
 
-	// --- Automatic peer reconnection loop ---
+	// ------------------------------------------------------------------
+	// AUTOMATIC PEER RECONNECTION
+	// ------------------------------------------------------------------
 	n.wg.Add(1)
 	go n.PeerReconnectLoop()
 
@@ -715,19 +881,51 @@ func (n *Node) Start() error {
 
 // Stop gracefully stops the node.
 func (n *Node) Stop() {
-	n.cancel()
+	if n == nil {
+		return
+	}
+
+	// ------------------------------------------------------------------
+	// CANCEL NODE CONTEXT
+	// ------------------------------------------------------------------
+	if n.cancel != nil {
+		n.cancel()
+	}
+
+	// ------------------------------------------------------------------
+	// CLOSE LISTENER
+	// ------------------------------------------------------------------
 	if n.ln != nil {
 		_ = n.ln.Close()
+		n.ln = nil
 	}
-	// take snapshot of peers and close to avoid locking during Close which may call back
+
+	// ------------------------------------------------------------------
+	// CLOSE ACTIVE PEER SESSIONS
+	// ------------------------------------------------------------------
 	for i := range n.peerShards {
 		sh := &n.peerShards[i]
+
 		sh.mu.RLock()
+
+		peers := make([]*Peer, 0, len(sh.peers))
+
 		for _, p := range sh.peers {
+			if p != nil {
+				peers = append(peers, p)
+			}
+		}
+
+		sh.mu.RUnlock()
+
+		for _, p := range peers {
 			p.Close()
 		}
-		sh.mu.RUnlock()
 	}
+
+	// ------------------------------------------------------------------
+	// WAIT FOR NODE WORKERS
+	// ------------------------------------------------------------------
 	n.wg.Wait()
 }
 
@@ -1017,15 +1215,79 @@ func (n *Node) addPeer(p *Peer) {
 	}
 }
 
-// Connect dials a remote peer.
-// Enhanced with randomized handshake jitter delay on outbound connections
-// to prevent simultaneous handshake collisions in mutual connections.
+// Connect dials a remote peer using a network locator.
+//
+// The address is only a temporary network locator.
+// It is NOT treated as the peer's permanent identity.
+//
+// Permanent peer identity is established only after the
+// EXPLOSIVE handshake verifies the remote wallet identity.
 func (n *Node) Connect(addr string) (*Peer, error) {
+	if n == nil {
+		return nil, errors.New("nil P2P node")
+	}
 
+	addr = strings.TrimSpace(addr)
+
+	if addr == "" {
+		return nil, errors.New("peer address is empty")
+	}
+
+	if n.ctx == nil {
+		return nil, errors.New("P2P node context is not initialized")
+	}
+
+	select {
+	case <-n.ctx.Done():
+		return nil, errors.New("P2P node is stopped")
+	default:
+	}
+
+	// ------------------------------------------------------------------
+	// VALIDATE NETWORK LOCATOR
+	// ------------------------------------------------------------------
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"invalid peer network locator %q: %w",
+			addr,
+			err,
+		)
+	}
+
+	if strings.TrimSpace(host) == "" {
+		return nil, errors.New("peer locator host is empty")
+	}
+
+	if strings.TrimSpace(port) == "" {
+		return nil, errors.New("peer locator port is empty")
+	}
+
+	// ------------------------------------------------------------------
+	// CREATE A NEW SESSION
+	// ------------------------------------------------------------------
+	//
+	// A locator identifies where we should try to connect.
+	// It does not identify the peer itself.
+	//
+	// Every connection attempt gets a fresh Peer session.
 	p := NewPeer("", addr, n)
 
+	if p == nil {
+		return nil, errors.New("failed to create peer session")
+	}
+
+	// ------------------------------------------------------------------
+	// CONNECT
+	// ------------------------------------------------------------------
 	if err := p.Connect(); err != nil {
-		return nil, err
+		p.Close()
+
+		return nil, fmt.Errorf(
+			"failed to connect to peer locator %s: %w",
+			addr,
+			err,
+		)
 	}
 
 	return p, nil

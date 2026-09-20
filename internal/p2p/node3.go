@@ -188,7 +188,7 @@ func (n *Node) registerDefaultHandlers() {
 			// 8. PEER ID CHECK
 			// =========================================================
 
-			if hs.PeerID == "" {
+			if strings.TrimSpace(hs.PeerID) == "" {
 				log.Printf(
 					"[p2p] Handshake rejected from %s: peer ID missing",
 					p.addr,
@@ -198,8 +198,25 @@ func (n *Node) registerDefaultHandlers() {
 				return
 			}
 
+			// The permanent P2P identity is the authenticated EXPLO wallet address.
+			// A network locator, IP address or TCP session address is never a PeerID.
+			if !strings.EqualFold(hs.PeerID, hs.WalletAddress) {
+				log.Printf(
+					"[p2p] 🚫 Peer identity mismatch from %s: peer_id=%s wallet=%s",
+					p.addr,
+					hs.PeerID,
+					hs.WalletAddress,
+				)
+
+				p.Penalize(20, time.Hour)
+				p.Close()
+				return
+			}
+
+			remotePeerID := PeerID(strings.ToLower(strings.TrimSpace(hs.WalletAddress)))
+
 			p.mu.Lock()
-			p.id = PeerID(hs.PeerID)
+			p.id = remotePeerID
 			p.LatestHeight = hs.ChainHeight
 			p.mu.Unlock()
 
@@ -381,7 +398,10 @@ func (n *Node) registerDefaultHandlers() {
 				// 9.10 On-chain miner identity verification
 				// -----------------------------------------------------
 
-				if !n.verifyPeerOnChain(PeerID(hs.MinerID)) {
+				if !n.verifyPeerOnChain(
+					PeerID(hs.MinerID),
+					env.MinerInfo.PubKey,
+				) {
 					log.Printf(
 						"[p2p] 🚫 miner identity not found in ledger: %s",
 						hs.MinerID,
