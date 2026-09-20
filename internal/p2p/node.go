@@ -185,6 +185,16 @@ type Node struct {
 	Discovery *PeerDiscovery
 
 	// ------------------------------------------------------------------
+	// LOCAL NETWORK CANDIDATES
+	// ------------------------------------------------------------------
+	// NAT candidates are temporary transport locators.
+	//
+	// They are never used as permanent peer identity.
+	// PeerID remains equal to the authenticated wallet address.
+	natCandidatesMu sync.RWMutex
+	natCandidates   []NATCandidate
+
+	// ------------------------------------------------------------------
 	// TLS IDENTITY CACHE
 	// ------------------------------------------------------------------
 	tlsPeerCache sync.Map
@@ -289,6 +299,13 @@ func NewNode(listenAddr, networkID, userAgent string, minerID string, sacredWord
 	// peer identities.
 	n.knownPeers = make(map[PeerID]string)
 	n.Discovery = NewPeerDiscovery()
+
+	// ------------------------------------------------------------------
+	// NAT / NETWORK CANDIDATES
+	// ------------------------------------------------------------------
+	// The candidate list contains only temporary network locators.
+	// It does not contain wallet secrets or permanent peer identity.
+	n.natCandidates = make([]NATCandidate, 0, 8)
 
 	// ------------------------------------------------------------------
 	// TLS CONFIGURATION
@@ -822,6 +839,20 @@ func (n *Node) Start() error {
 	// ------------------------------------------------------------------
 	if n.ln != nil {
 		return errors.New("P2P node is already started")
+	}
+	// ------------------------------------------------------------------
+	// DISCOVER LOCAL NETWORK CANDIDATES
+	// ------------------------------------------------------------------
+	// Discover the network paths currently available on this device.
+	//
+	// Failure to discover a local candidate must not prevent the P2P node
+	// from starting. The existing TLS + EXPLOSIVE HANDSHAKE transport
+	// remains authoritative.
+	if err := n.refreshNATCandidates(); err != nil {
+		log.Printf(
+			"[p2p] ⚠️ local network candidate discovery unavailable: %v",
+			err,
+		)
 	}
 
 	// ------------------------------------------------------------------
