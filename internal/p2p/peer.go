@@ -90,6 +90,19 @@ type Peer struct {
 	handshakeDone bool          // true once handshake fully validated
 	handshakeOnce sync.Once     // guarantees single handshake execution
 	handshakeCh   chan struct{} // closed when handshake completes
+
+	// ---- NAT CANDIDATE EXCHANGE ----
+	//
+	// Remote NAT candidates are public network locators.
+	// They are never treated as peer identity.
+	//
+	// Candidate exchange is performed only after the authenticated
+	// EXPLOSIVE handshake has completed.
+	candidateExchangeOnce sync.Once
+
+	candidateExchangeMu sync.RWMutex
+	remoteNATCandidates []NATCandidate
+	seenCandidateNonces map[uint64]time.Time
 }
 
 func init() {
@@ -109,15 +122,16 @@ func NewPeer(id PeerID, addr string, node *Node) *Peer {
 	// A peer's permanent identity is established only after
 	// the EXPLOSIVE handshake verifies the remote wallet identity.
 	return &Peer{
-		id:            id,
-		addr:          addr,
-		reconnectAddr: addr,
-		node:          node,
-		sendQ:         make(chan []byte, qsize),
-		ctx:           ctx,
-		cancel:        cancel,
-		handshakeCh:   make(chan struct{}),
-		pendingPings:  make(map[int64]time.Time),
+		id:                  id,
+		addr:                addr,
+		reconnectAddr:       addr,
+		node:                node,
+		sendQ:               make(chan []byte, qsize),
+		ctx:                 ctx,
+		cancel:              cancel,
+		handshakeCh:         make(chan struct{}),
+		pendingPings:        make(map[int64]time.Time),
+		seenCandidateNonces: make(map[uint64]time.Time),
 	}
 }
 
@@ -2146,4 +2160,82 @@ func (p *Peer) PendingPingCount() int {
 	defer p.pingMu.Unlock()
 
 	return len(p.pendingPings)
+}
+
+// RemoteNATCandidates returns a defensive copy of the authenticated
+// peer's advertised network candidates.
+//
+// Candidates are network locators only. They do not define peer identity.
+func (p *Peer) RemoteNATCandidates() []NATCandidate {
+	if p == nil {
+		return nil
+	}
+
+	p.candidateExchangeMu.RLock()
+	defer p.candidateExchangeMu.RUnlock()
+
+	if len(p.remoteNATCandidates) == 0 {
+		return nil
+	}
+
+	out := make([]NATCandidate, len(p.remoteNATCandidates))
+	copy(out, p.remoteNATCandidates)
+
+	return out
+}
+
+// setRemoteNATCandidates replaces the remote candidate set.
+//
+// The caller must have already authenticated the peer and validated
+// every candidate.
+func (p *Peer) setRemoteNATCandidates(candidates []NATCandidate) {
+	if p == nil {
+		return
+	}
+
+	p.candidateExchangeMu.Lock()
+	defer p.candidateExchangeMu.Unlock()
+
+	p.remoteNATCandidates = make(
+		[]NATCandidate,
+		len(candidates),
+	)
+
+	copy(p.remoteNATCandidates, candidates)
+}
+
+// acceptCandidateExchangeNonce records a candidate-exchange nonce.
+//
+// A nonce can only be accepted once during its validity window.
+// This prevents replay of a previously authenticated candidate set.
+func (p *Peer) acceptCandidateExchangeNonce(nonce uint64) bool {
+	if p == nil || nonce == 0 {
+		return false
+	}
+
+	now := time.Now()
+
+	p.candidateExchangeMu.Lock()
+	defer p.candidateExchangeMu.Unlock()
+
+	if p.seenCandidateNonces == nil {
+		p.seenCandidateNonces = make(map[uint64]time.Time)
+	}
+
+	// Remove expired replay entries.
+	maxAge := time.Duration(MaxClockSkew) * time.Millisecond
+
+	for seenNonce, seenAt := range p.seenCandidateNonces {
+		if now.Sub(seenAt) > maxAge {
+			delete(p.seenCandidateNonces, seenNonce)
+		}
+	}
+
+	if _, exists := p.seenCandidateNonces[nonce]; exists {
+		return false
+	}
+
+	p.seenCandidateNonces[nonce] = now
+
+	return true
 }

@@ -580,6 +580,25 @@ func (n *Node) registerDefaultHandlers() {
 					hs.WalletAddress,
 				)
 
+				// ------------------------------------------------------------
+				// CANDIDATE EXCHANGE
+				// ------------------------------------------------------------
+				//
+				// Candidate exchange is allowed only after the wallet-authenticated
+				// EXPLOSIVE handshake has completed.
+				//
+				// Each side independently advertises its current public network
+				// candidates. No wallet password, mnemonic, sacred words, or
+				// private key material is transmitted.
+				//
+				// The exchange is sent asynchronously so it never blocks the
+				// handshake or ledger synchronization path.
+				go func() {
+					p.candidateExchangeOnce.Do(func() {
+						n.sendCandidateExchange(p)
+					})
+				}()
+
 				// -----------------------------------------------------
 				// 11. IMMEDIATE LEDGER SYNCHRONIZATION TRIGGER
 				// -----------------------------------------------------
@@ -609,6 +628,177 @@ func (n *Node) registerDefaultHandlers() {
 				}()
 			}
 		})
+	})
+
+	// ================================================================
+	// CANDIDATE EXCHANGE
+	// ================================================================
+	//
+	// Candidate exchange is accepted only after the authenticated
+	// EXPLOSIVE handshake.
+	//
+	// The wallet identity has already been authenticated by the
+	// envelope verification layer and the handshake.
+	//
+	// Candidate addresses are locators only. They do not establish
+	// peer identity.
+	//
+	// No wallet password, mnemonic, sacred words, or private key
+	// material is accepted or processed here.
+	n.RegisterHandler(MsgTypeCandidateExchange, func(p *Peer, env *Envelope) {
+
+		if p == nil {
+			return
+		}
+
+		if env == nil {
+			log.Printf(
+				"[p2p] rejected candidate exchange from nil envelope",
+			)
+			return
+		}
+
+		// ------------------------------------------------------------
+		// HANDSHAKE MUST ALREADY BE COMPLETE
+		// ------------------------------------------------------------
+
+		if !p.handshakeDone {
+			log.Printf(
+				"[p2p] rejected candidate exchange from %s: handshake incomplete",
+				p.Addr(),
+			)
+			p.Penalize(1, 0)
+			return
+		}
+
+		// ------------------------------------------------------------
+		// DECODE
+		// ------------------------------------------------------------
+
+		var payload CandidateExchangePayload
+
+		if err := cbor.Unmarshal(env.Payload, &payload); err != nil {
+			log.Printf(
+				"[p2p] rejected candidate exchange from %s: invalid payload: %v",
+				p.Addr(),
+				err,
+			)
+			p.Penalize(1, 0)
+			return
+		}
+
+		// ------------------------------------------------------------
+		// TIMESTAMP VALIDATION
+		// ------------------------------------------------------------
+
+		now := time.Now().UnixMilli()
+
+		if payload.Timestamp <= 0 {
+			log.Printf(
+				"[p2p] rejected candidate exchange from %s: missing timestamp",
+				p.Addr(),
+			)
+			p.Penalize(1, 0)
+			return
+		}
+
+		if absInt64(now-payload.Timestamp) > MaxClockSkew {
+			log.Printf(
+				"[p2p] rejected candidate exchange from %s: timestamp outside allowed clock skew",
+				p.Addr(),
+			)
+			p.Penalize(1, 0)
+			return
+		}
+
+		// ------------------------------------------------------------
+		// NONCE VALIDATION / REPLAY PROTECTION
+		// ------------------------------------------------------------
+
+		if payload.Nonce == 0 {
+			log.Printf(
+				"[p2p] rejected candidate exchange from %s: missing nonce",
+				p.Addr(),
+			)
+			p.Penalize(1, 0)
+			return
+		}
+
+		if !p.acceptCandidateExchangeNonce(payload.Nonce) {
+			log.Printf(
+				"[p2p] rejected replayed candidate exchange from %s",
+				p.Addr(),
+			)
+			p.Penalize(1, 0)
+			return
+		}
+
+		// ------------------------------------------------------------
+		// PEER ID MUST MATCH AUTHENTICATED HANDSHAKE IDENTITY
+		// ------------------------------------------------------------
+
+		expectedPeerID := strings.ToLower(
+			strings.TrimSpace(string(p.ID())),
+		)
+
+		receivedPeerID := strings.ToLower(
+			strings.TrimSpace(payload.PeerID),
+		)
+
+		if expectedPeerID == "" ||
+			receivedPeerID == "" ||
+			receivedPeerID != expectedPeerID {
+
+			log.Printf(
+				"[p2p] rejected candidate exchange from %s: peer identity mismatch expected=%s received=%s",
+				p.Addr(),
+				expectedPeerID,
+				receivedPeerID,
+			)
+
+			p.Penalize(5, 0)
+			return
+		}
+
+		// ------------------------------------------------------------
+		// PARSE AND VALIDATE CANDIDATES
+		// ------------------------------------------------------------
+
+		candidates := ParseCandidateExchangePayload(
+			payload,
+			expectedPeerID,
+		)
+
+		if len(candidates) == 0 {
+			log.Printf(
+				"[p2p] candidate exchange from %s contained no valid candidates",
+				p.ID(),
+			)
+			return
+		}
+
+		// ------------------------------------------------------------
+		// STORE REMOTE CANDIDATES
+		// ------------------------------------------------------------
+
+		p.setRemoteNATCandidates(candidates)
+
+		log.Printf(
+			"[p2p] candidate exchange accepted from %s: %d valid candidates",
+			p.ID(),
+			len(candidates),
+		)
+
+		for _, candidate := range candidates {
+			log.Printf(
+				"[p2p] remote candidate peer=%s type=%v addr=%s protocol=%s priority=%d",
+				p.ID(),
+				candidate.Type,
+				candidate.Addr(),
+				candidate.Protocol,
+				candidate.Priority,
+			)
+		}
 	})
 
 	// =========================================================
@@ -1804,4 +1994,103 @@ func (n *Node) registerDefaultHandlers() {
 			go n.Connect(addr)
 		}
 	})
+}
+
+// sendCandidateExchange advertises this node's currently known
+// public network candidates to an authenticated peer.
+//
+// The message itself is authenticated by Peer.SendEnvelope(), which
+// signs regular P2P messages with the local wallet identity.
+//
+// No wallet secret, mnemonic, sacred words, password, or private key
+// is ever included in the candidate exchange.
+func (n *Node) sendCandidateExchange(p *Peer) {
+	if n == nil || p == nil {
+		return
+	}
+
+	if !p.handshakeDone {
+		log.Printf(
+			"[p2p] candidate exchange skipped for %s: handshake not complete",
+			p.Addr(),
+		)
+		return
+	}
+
+	// ------------------------------------------------------------
+	// READ AUTHENTICATED LOCAL WALLET IDENTITY
+	// ------------------------------------------------------------
+
+	n.walletIdentityMu.RLock()
+	localPeerID := strings.TrimSpace(n.walletAddress)
+	n.walletIdentityMu.RUnlock()
+
+	if localPeerID == "" {
+		log.Printf(
+			"[p2p] candidate exchange skipped: local wallet identity unavailable",
+		)
+		return
+	}
+
+	// ------------------------------------------------------------
+	// REFRESH LOCAL NETWORK CANDIDATES
+	// ------------------------------------------------------------
+
+	n.refreshNATCandidates()
+
+	candidates := n.NATCandidates()
+
+	if len(candidates) == 0 {
+		log.Printf(
+			"[p2p] no NAT candidates available for peer %s",
+			p.ID(),
+		)
+		return
+	}
+
+	if len(candidates) > nat2MaxCandidates {
+		candidates = candidates[:nat2MaxCandidates]
+	}
+
+	payload := BuildCandidateExchangePayload(
+		localPeerID,
+		candidates,
+	)
+
+	env, err := NewEnvelopeFromPayload(
+		n.ProtocolVersion(),
+		MsgTypeCandidateExchange,
+		payload,
+	)
+	if err != nil {
+		log.Printf(
+			"[p2p] candidate exchange envelope failed for %s: %v",
+			p.ID(),
+			err,
+		)
+		return
+	}
+
+	if err := p.SendEnvelope(env); err != nil {
+		log.Printf(
+			"[p2p] candidate exchange send failed to %s: %v",
+			p.ID(),
+			err,
+		)
+		return
+	}
+
+	log.Printf(
+		"[p2p] candidate exchange sent to %s: %d candidates",
+		p.ID(),
+		len(candidates),
+	)
+}
+
+func absInt64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+
+	return v
 }

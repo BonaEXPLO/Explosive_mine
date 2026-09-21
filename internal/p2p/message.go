@@ -33,6 +33,8 @@ type MessageType string
 const (
 	MsgTypeHandshake MessageType = "HANDSHAKE"
 
+	MsgTypeCandidateExchange MessageType = "CANDIDATE_EXCHANGE"
+
 	MsgTypePing           MessageType = "PING"
 	MsgTypePong           MessageType = "PONG"
 	MsgTypeInv            MessageType = "INV"
@@ -263,6 +265,31 @@ type HandshakePayload struct {
 	// No wallet password, private key, BIP39 mnemonic or sacred words
 	// are ever transmitted.
 	ChainHeight uint64 `cbor:"chain_height"`
+}
+
+// CandidatePayload represents one public transport candidate.
+//
+// SECURITY:
+//   - Address is only a network locator.
+//   - PeerID remains the cryptographic identity.
+//   - No wallet secret, private key, mnemonic or sacred word is included.
+type CandidatePayload struct {
+	Type     NATCandidateType `cbor:"type"`
+	Address  string           `cbor:"address"`
+	Port     uint16           `cbor:"port"`
+	Protocol string           `cbor:"protocol"`
+	Priority uint16           `cbor:"priority"`
+}
+
+// CandidateExchangePayload carries the authenticated node's reachable
+// network candidates.
+//
+// The payload is intentionally bounded by the receiver before use.
+type CandidateExchangePayload struct {
+	PeerID     string             `cbor:"peer_id"`
+	Candidates []CandidatePayload `cbor:"candidates"`
+	Timestamp  int64              `cbor:"timestamp"`
+	Nonce      uint64             `cbor:"nonce"`
 }
 
 type PingPayload struct {
@@ -813,4 +840,108 @@ func DecodeGetDataPayload(
 	}
 
 	return &p, nil
+}
+
+// BuildCandidateExchangePayload converts local NAT candidates into a
+// wire-safe payload.
+//
+// Only validated TCP candidates are exported.
+func BuildCandidateExchangePayload(
+	peerID string,
+	candidates []NATCandidate,
+) CandidateExchangePayload {
+
+	if len(candidates) > nat2MaxCandidates {
+		candidates = candidates[:nat2MaxCandidates]
+	}
+
+	payload := CandidateExchangePayload{
+		PeerID:     peerID,
+		Timestamp:  time.Now().UnixMilli(),
+		Nonce:      generateCandidateExchangeNonce(),
+		Candidates: make([]CandidatePayload, 0, len(candidates)),
+	}
+
+	for _, candidate := range candidates {
+		if !candidate.IsValid() {
+			continue
+		}
+
+		if candidate.Addr() == "" {
+			continue
+		}
+
+		payload.Candidates = append(
+			payload.Candidates,
+			CandidatePayload{
+				Type:     candidate.Type,
+				Address:  candidate.Address,
+				Port:     candidate.Port,
+				Protocol: candidate.Protocol,
+				Priority: candidate.Priority,
+			},
+		)
+
+		if len(payload.Candidates) >= nat2MaxCandidates {
+			break
+		}
+	}
+
+	return payload
+}
+
+// ParseCandidateExchangePayload converts a received candidate exchange
+// into validated NAT candidates.
+//
+// Invalid, unsupported or malformed candidates are discarded.
+func ParseCandidateExchangePayload(
+	payload CandidateExchangePayload,
+	expectedPeerID string,
+) []NATCandidate {
+
+	if expectedPeerID == "" {
+		return nil
+	}
+
+	if payload.PeerID != expectedPeerID {
+		return nil
+	}
+
+	if len(payload.Candidates) > nat2MaxCandidates {
+		return nil
+	}
+
+	result := make([]NATCandidate, 0, len(payload.Candidates))
+
+	for _, item := range payload.Candidates {
+		candidate := NATCandidate{
+			Type:     item.Type,
+			Address:  item.Address,
+			Port:     item.Port,
+			Protocol: item.Protocol,
+			Priority: item.Priority,
+		}
+
+		if !candidate.IsValid() {
+			continue
+		}
+
+		if candidate.Addr() == "" {
+			continue
+		}
+
+		result = append(result, candidate)
+	}
+
+	return result
+}
+
+func generateCandidateExchangeNonce() uint64 {
+	var raw [8]byte
+
+	if _, err := rand.Read(raw[:]); err != nil {
+		return uint64(time.Now().UnixNano())
+	}
+
+	return binary.BigEndian.Uint64(raw[:])
 }
