@@ -485,6 +485,13 @@ func ValidateEnvelope(e *Envelope) error {
 		MsgTypePeers:
 		// Payload optional.
 
+	case MsgTypeCandidateExchange:
+		if len(e.Payload) == 0 {
+			return errors.New(
+				"candidate exchange payload is empty",
+			)
+		}
+
 	case MsgTypeGetBlocksRange:
 		// GETBLOCKSRANGE is a valid blockchain synchronization request.
 		// The payload is validated by the registered message handler.
