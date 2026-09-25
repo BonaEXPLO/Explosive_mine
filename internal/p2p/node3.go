@@ -8,6 +8,7 @@ import (
 	"explosive/internal/ledger"
 	"github.com/fxamacker/cbor/v2"
 	"log"
+        "context"
 	"net"
 	"strconv"
 	"strings"
@@ -799,8 +800,82 @@ func (n *Node) registerDefaultHandlers() {
 				candidate.Priority,
 			)
 		}
-	})
 
+		// ------------------------------------------------------------
+		// NAT2 CONNECTIVITY DIAGNOSTIC
+		// ------------------------------------------------------------
+		//
+		// NAT2 only tests direct TCP reachability.
+		//
+		// It does NOT replace the current authenticated session,
+		// perform the EXPLOSIVE handshake, or change peer identity.
+		//
+		// A failed probe means only that this candidate was not
+		// directly reachable from the current network path.
+		//
+
+		go func(peer *Peer, peerID PeerID, remoteCandidates []NATCandidate) {
+			if peer == nil || len(remoteCandidates) == 0 {
+				return
+			}
+
+			ctx, cancel := context.WithTimeout(
+				peer.ctx,
+				15*time.Second,
+			)
+			defer cancel()
+
+			result := CheckNAT2Candidates(
+				ctx,
+				string(peerID),
+				remoteCandidates,
+				DefaultNAT2Config(),
+			)
+
+			log.Printf(
+				"[p2p] NAT2 diagnostic peer=%s: %s",
+				peerID,
+				NAT2CandidateDiagnostics(result),
+			)
+
+			for _, probe := range result.Results {
+				if probe.Success {
+					log.Printf(
+						"[p2p] NAT2 reachable peer=%s addr=%s latency=%s priority=%d type=%v",
+						peerID,
+						probe.Address,
+						probe.Latency.Round(time.Millisecond),
+						probe.Candidate.Candidate.Priority,
+						probe.Candidate.Candidate.Type,
+					)
+					continue
+				}
+
+				log.Printf(
+					"[p2p] NAT2 unreachable peer=%s addr=%s error=%s priority=%d type=%v",
+					peerID,
+					probe.Address,
+					probe.Error,
+					probe.Candidate.Candidate.Priority,
+					probe.Candidate.Candidate.Type,
+				)
+			}
+
+			if result.Selected != nil {
+				log.Printf(
+					"[p2p] NAT2 selected peer=%s addr=%s latency=%s",
+					peerID,
+					result.Selected.Address,
+					result.Selected.Latency.Round(time.Millisecond),
+				)
+			} else {
+				log.Printf(
+					"[p2p] NAT2 no directly reachable candidate for peer=%s",
+					peerID,
+				)
+			}
+		}(p, p.ID(), candidates)
+	})
 	// =========================================================
 	// PING / PONG
 	// =========================================================
