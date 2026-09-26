@@ -90,6 +90,15 @@ type Node struct {
 	userAgent       string
 	protocolVersion uint16
 	config          NodeConfig
+	// ------------------------------------------------------------------
+	// RELAY TRANSPORT
+	// ------------------------------------------------------------------
+	// The relay is only a transport fallback.
+	//
+	// It never becomes a blockchain authority and never replaces
+	// the authenticated EXPLOSIVE peer identity.
+	relayMu     sync.RWMutex
+	relayClient *RelayClient
 
 	ln         net.Listener
 	tlsConfig  *tls.Config
@@ -891,6 +900,18 @@ func (n *Node) Start() error {
 	go n.acceptLoop()
 
 	// ------------------------------------------------------------------
+	// RELAY INCOMING TUNNELS
+	// ------------------------------------------------------------------
+	//
+	// The relay is only a transport fallback.
+	// The normal EXPLOSIVE handshake remains authoritative.
+	// ------------------------------------------------------------------
+	if n.RelayClient() != nil {
+		n.wg.Add(1)
+		go n.relayAcceptLoop()
+	}
+
+	// ------------------------------------------------------------------
 	// WATCHDOG
 	// ------------------------------------------------------------------
 	n.wg.Add(1)
@@ -921,6 +942,15 @@ func (n *Node) Stop() {
 	// ------------------------------------------------------------------
 	if n.cancel != nil {
 		n.cancel()
+	}
+
+	// ------------------------------------------------------------------
+	// CLOSE RELAY TRANSPORT
+	// ------------------------------------------------------------------
+	// Closing the relay client unblocks relayAcceptLoop().
+	// ------------------------------------------------------------------
+	if relayClient := n.RelayClient(); relayClient != nil {
+		relayClient.Close()
 	}
 
 	// ------------------------------------------------------------------
@@ -958,6 +988,68 @@ func (n *Node) Stop() {
 	// WAIT FOR NODE WORKERS
 	// ------------------------------------------------------------------
 	n.wg.Wait()
+}
+
+// relayAcceptLoop accepts authenticated relay tunnels.
+//
+// A relay tunnel is only a transport path. The remote wallet identity
+// is still authenticated by the normal EXPLOSIVE handshake.
+func (n *Node) relayAcceptLoop() {
+	defer n.wg.Done()
+
+	client := n.RelayClient()
+	if client == nil {
+		return
+	}
+
+	log.Printf(
+		"[p2p] 🔄 Relay incoming-tunnel worker started",
+	)
+
+	for {
+		tunnel, err := client.AcceptTunnel(n.ctx)
+		if err != nil {
+			select {
+			case <-n.ctx.Done():
+				return
+			default:
+			}
+
+			log.Printf(
+				"[p2p] ⚠️ Relay AcceptTunnel stopped: %v",
+				err,
+			)
+			return
+		}
+
+		if tunnel == nil || tunnel.targetPeerID == "" {
+			if tunnel != nil {
+				tunnel.Close()
+			}
+			log.Printf(
+				"[p2p] ⚠️ Ignoring invalid incoming relay tunnel",
+			)
+			continue
+		}
+
+		remotePeerID := tunnel.targetPeerID
+
+		log.Printf(
+			"[p2p] 🔄 Incoming relay tunnel from peer %s",
+			remotePeerID,
+		)
+
+		conn := newRelayNetConn(
+			tunnel,
+			string(n.id),
+			remotePeerID,
+		)
+
+		// Reuse the normal inbound peer lifecycle.
+		// The EXPLOSIVE handshake remains responsible for
+		// authenticating the remote wallet identity.
+		n.handleNewConnection(conn)
+	}
 }
 
 func (n *Node) acceptLoop() {
@@ -1336,6 +1428,22 @@ func (n *Node) PeerCount() int {
 	return total
 }
 
+// RelayTLSConfig returns a cloned TLS configuration for the relay transport.
+//
+// The returned configuration is independent from the node's internal
+// TLS configuration and can be safely customized by the relay client.
+func (n *Node) RelayTLSConfig() (*tls.Config, error) {
+	if n == nil {
+		return nil, errors.New("nil node")
+	}
+
+	if n.tlsConfig == nil {
+		return nil, errors.New("node TLS configuration is not initialized")
+	}
+
+	return n.tlsConfig.Clone(), nil
+}
+
 func (n *Node) setupTLSConfig(tlsCert tls.Certificate) *tls.Config {
 	return &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
@@ -1432,4 +1540,108 @@ func (n *Node) processIncoming() {
 			}()
 		}
 	}
+}
+
+// ============================================================================
+// RELAY TRANSPORT
+// ============================================================================
+
+// SetRelayClient attaches an authenticated relay client to the node.
+//
+// The relay is only a transport mechanism. It does not become part of the
+// blockchain trust model and does not replace the permanent PeerID.
+func (n *Node) SetRelayClient(client *RelayClient) error {
+	if n == nil {
+		return errors.New("nil node")
+	}
+
+	n.relayMu.Lock()
+	n.relayClient = client
+	n.relayMu.Unlock()
+
+	if client == nil {
+		log.Printf("[p2p] relay transport disabled")
+		return nil
+	}
+
+	log.Printf(
+		"[p2p] relay transport attached to node %s",
+		n.id,
+	)
+
+	return nil
+}
+
+// RelayClient returns the currently configured relay client.
+//
+// The returned pointer is safe to use concurrently. The RelayClient itself
+// remains responsible for its own connection synchronization.
+func (n *Node) RelayClient() *RelayClient {
+	if n == nil {
+		return nil
+	}
+
+	n.relayMu.RLock()
+	client := n.relayClient
+	n.relayMu.RUnlock()
+
+	return client
+}
+
+// connectRelayPeer creates a relay-backed network connection to a known
+// EXPLOSIVE PeerID.
+//
+// The relay carries opaque P2P bytes only. The normal Peer read/write loops
+// and EXPLOSIVE handshake remain responsible for authentication.
+func (n *Node) connectRelayPeer(
+	ctx context.Context,
+	peerID PeerID,
+) (net.Conn, error) {
+
+	if n == nil {
+		return nil, errors.New("nil node")
+	}
+
+	if peerID == "" {
+		return nil, errors.New("relay target PeerID is empty")
+	}
+
+	if peerID == n.id {
+		return nil, errors.New("relay target cannot be local PeerID")
+	}
+
+	client := n.RelayClient()
+
+	if client == nil {
+		return nil, errors.New("relay transport is not configured")
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	tunnel, err := client.OpenTunnel(
+		ctx,
+		string(peerID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"relay OPEN to peer %s failed: %w",
+			peerID,
+			err,
+		)
+	}
+
+	conn := newRelayNetConn(
+		tunnel,
+		string(n.id),
+		string(peerID),
+	)
+
+	log.Printf(
+		"[p2p] 🔄 Relay transport established to peer %s",
+		peerID,
+	)
+
+	return conn, nil
 }

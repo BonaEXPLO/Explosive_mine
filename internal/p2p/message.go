@@ -35,6 +35,8 @@ const (
 
 	MsgTypeCandidateExchange MessageType = "CANDIDATE_EXCHANGE"
 
+	MsgTypeNAT4Probe MessageType = "NAT4_PROBE"
+
 	MsgTypePing           MessageType = "PING"
 	MsgTypePong           MessageType = "PONG"
 	MsgTypeInv            MessageType = "INV"
@@ -487,9 +489,12 @@ func ValidateEnvelope(e *Envelope) error {
 
 	case MsgTypeCandidateExchange:
 		if len(e.Payload) == 0 {
-			return errors.New(
-				"candidate exchange payload is empty",
-			)
+			return errors.New("candidate exchange payload is empty")
+		}
+
+	case MsgTypeNAT4Probe:
+		if len(e.Payload) == 0 {
+			return errors.New("NAT4 probe payload is empty")
 		}
 
 	case MsgTypeGetBlocksRange:

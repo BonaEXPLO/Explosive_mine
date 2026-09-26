@@ -2,13 +2,13 @@
 package p2p
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"explosive/internal/address"
 	"explosive/internal/ledger"
 	"github.com/fxamacker/cbor/v2"
 	"log"
-        "context"
 	"net"
 	"strconv"
 	"strings"
@@ -875,6 +875,168 @@ func (n *Node) registerDefaultHandlers() {
 				)
 			}
 		}(p, p.ID(), candidates)
+	})
+
+	// ================================================================
+	// NAT4 COORDINATED TCP PROBE
+	// ================================================================
+	//
+	// NAT4 performs authenticated coordination for TCP connectivity
+	// diagnostics.
+	//
+	// It does not replace the current P2P session.
+	// It does not transfer wallet secrets.
+	// It does not claim that TCP hole punching succeeded.
+	//
+	// A successful NAT4 probe only proves that a TCP path could be
+	// established to the supplied target address.
+	// ================================================================
+
+	n.RegisterHandler(MsgTypeNAT4Probe, func(p *Peer, env *Envelope) {
+		if p == nil || env == nil {
+			return
+		}
+
+		if !p.handshakeDone {
+			log.Printf(
+				"[p2p] rejected NAT4 probe from %s: handshake incomplete",
+				p.Addr(),
+			)
+			p.Penalize(1, 0)
+			return
+		}
+
+		var payload NAT4ProbePayload
+
+		if err := cbor.Unmarshal(env.Payload, &payload); err != nil {
+			log.Printf(
+				"[p2p] rejected NAT4 probe from %s: invalid payload: %v",
+				p.Addr(),
+				err,
+			)
+			p.Penalize(1, 0)
+			return
+		}
+
+		expectedPeerID := strings.TrimSpace(string(p.ID()))
+
+		if err := ValidateNAT4ProbePayload(
+			payload,
+			expectedPeerID,
+		); err != nil {
+			log.Printf(
+				"[p2p] rejected NAT4 probe from %s: %v",
+				p.Addr(),
+				err,
+			)
+			p.Penalize(1, 0)
+			return
+		}
+
+		if !p.acceptNAT4Nonce(payload.Nonce) {
+			log.Printf(
+				"[p2p] rejected replayed NAT4 probe from %s",
+				p.ID(),
+			)
+			p.Penalize(1, 0)
+			return
+		}
+
+		// ------------------------------------------------------------
+		// RESULT MESSAGES ARE TERMINAL
+		// ------------------------------------------------------------
+
+		if payload.Kind == nat4ProbeKindResult {
+			log.Printf(
+				"[p2p] NAT4 result from %s target=%s success=%t latency=%dms error=%s",
+				p.ID(),
+				payload.TargetAddr,
+				payload.Success,
+				payload.LatencyMs,
+				payload.Error,
+			)
+			return
+		}
+
+		// ------------------------------------------------------------
+		// REQUEST
+		// ------------------------------------------------------------
+
+		log.Printf(
+			"[p2p] NAT4 probe request from %s target=%s",
+			p.ID(),
+			payload.TargetAddr,
+		)
+
+		go func(peer *Peer, request NAT4ProbePayload) {
+			if peer == nil {
+				return
+			}
+
+			ctx, cancel := context.WithTimeout(
+				peer.ctx,
+				nat4DefaultProbeTimeout,
+			)
+			defer cancel()
+
+			result := NAT4DialCandidate(
+				ctx,
+				request.TargetAddr,
+				nat4DefaultProbeTimeout,
+			)
+
+			response := NAT4ProbePayload{
+				PeerID:       strings.TrimSpace(string(n.id)),
+				Kind:         nat4ProbeKindResult,
+				TargetAddr:   request.TargetAddr,
+				ObservedAddr: peer.Addr(),
+				Timestamp:    time.Now().UnixMilli(),
+				Nonce:        secureRelayNonce(),
+				AttemptAt:    request.AttemptAt,
+				Success:      result.Success,
+				LatencyMs:    result.Latency.Milliseconds(),
+				Error:        result.Error,
+			}
+
+			reply, err := NewEnvelopeFromPayload(
+				n.protocolVersion,
+				MsgTypeNAT4Probe,
+				response,
+			)
+			if err != nil {
+				log.Printf(
+					"[p2p] NAT4 result envelope failed for %s: %v",
+					peer.ID(),
+					err,
+				)
+				return
+			}
+
+			if err := peer.SendEnvelope(reply); err != nil {
+				log.Printf(
+					"[p2p] NAT4 result send failed to %s: %v",
+					peer.ID(),
+					err,
+				)
+				return
+			}
+
+			if result.Success {
+				log.Printf(
+					"[p2p] NAT4 TCP probe succeeded peer=%s addr=%s latency=%s",
+					peer.ID(),
+					result.Address,
+					result.Latency.Round(time.Millisecond),
+				)
+			} else {
+				log.Printf(
+					"[p2p] NAT4 TCP probe failed peer=%s addr=%s error=%s",
+					peer.ID(),
+					result.Address,
+					result.Error,
+				)
+			}
+		}(p, payload)
 	})
 	// =========================================================
 	// PING / PONG

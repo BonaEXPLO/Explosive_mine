@@ -198,7 +198,7 @@ func (n *Node) PeerReconnectLoop() {
 		// 3. FILTER ACTIVE PEERS AND RETRY STATE
 		// ------------------------------------------------------------
 
-		addresses := make([]string, 0, len(candidates))
+		reconnectCandidates := make([]reconnectCandidate, 0, len(candidates))
 
 		for _, candidate := range candidates {
 			peerID := candidate.peerID
@@ -257,15 +257,19 @@ func (n *Node) PeerReconnectLoop() {
 				}
 			}
 
-			addresses = append(addresses, addr)
+			reconnectCandidates = append(
+				reconnectCandidates,
+				candidate,
+			)
 		}
 
 		// ------------------------------------------------------------
 		// START NEW MOBILE SESSIONS
 		// ------------------------------------------------------------
 
-		for _, addr := range addresses {
-			addr := addr
+		for _, candidate := range reconnectCandidates {
+			addr := candidate.address
+			peerID := candidate.peerID
 
 			// Double-check the in-flight state because another
 			// address may have been discovered more than once
@@ -319,6 +323,7 @@ func (n *Node) PeerReconnectLoop() {
 			// The old Peer may have been disconnected for a long
 			// time. It is never reused.
 			peer := NewPeer("", addr, n)
+			peer.targetPeerID = peerID
 
 			inFlight[addr] = peer
 

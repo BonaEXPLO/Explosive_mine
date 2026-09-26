@@ -32,6 +32,13 @@ type PeerID string
 
 // Peer represents a remote peer connection, its outgoing queue, lifecycle, and blockchain state.
 type Peer struct {
+	// targetPeerID is the permanent remote identity known before
+	// establishing a transport session.
+	//
+	// It is used by relay transport, which routes by PeerID rather
+	// than by IP address or TCP port.
+	targetPeerID PeerID
+
 	id   PeerID
 	addr string
 
@@ -99,10 +106,12 @@ type Peer struct {
 	// Candidate exchange is performed only after the authenticated
 	// EXPLOSIVE handshake has completed.
 	candidateExchangeOnce sync.Once
+	candidateExchangeMu   sync.RWMutex
+	remoteNATCandidates   []NATCandidate
+	seenCandidateNonces   map[uint64]time.Time
 
-	candidateExchangeMu sync.RWMutex
-	remoteNATCandidates []NATCandidate
-	seenCandidateNonces map[uint64]time.Time
+	nat4Mu         sync.Mutex
+	seenNAT4Nonces map[uint64]time.Time
 }
 
 func init() {
@@ -411,6 +420,7 @@ func (p *Peer) Connect() error {
 		Config:    p.node.tlsConfig,
 	}
 
+	relayTransport := false
 	conn, err := tlsDialer.DialContext(
 		ctx,
 		"tcp",
@@ -425,18 +435,11 @@ func (p *Peer) Connect() error {
 		default:
 		}
 
-		log.Printf(
-			"[p2p] ❌ TLS connection FAILED to %s: %v",
-			p.addr,
-			err,
-		)
+		log.Printf("[p2p] ❌ TLS connection FAILED to %s: %v", p.addr, err)
 
-		// Diagnostic TCP probe only.
-		// Failure here is network/session failure, not peer misbehavior.
-		tcpDialer := &net.Dialer{
-			Timeout: dialTimeout,
-		}
-
+		// Keep the direct TCP diagnostic. This confirms whether the
+		// failure is specifically at the TLS layer.
+		tcpDialer := &net.Dialer{Timeout: dialTimeout}
 		tcpConn, tcpErr := tcpDialer.DialContext(
 			ctx,
 			"tcp",
@@ -454,15 +457,45 @@ func (p *Peer) Connect() error {
 				"[p2p] ✅ TCP connection SUCCESSFUL to %s — TLS is the failing layer",
 				p.addr,
 			)
-
 			_ = tcpConn.Close()
 		}
 
-		return fmt.Errorf(
-			"TLS dial failed to %s: %w",
-			p.addr,
-			err,
-		)
+		// Relay fallback is available only when the permanent remote
+		// PeerID is already known. IP address alone is never enough
+		// to select a relay destination.
+		if p.targetPeerID != "" {
+			relayConn, relayErr := p.node.connectRelayPeer(
+				ctx,
+				p.targetPeerID,
+			)
+
+			if relayErr == nil {
+				conn = relayConn
+				relayTransport = true
+
+				log.Printf(
+					"[p2p] 🔄 Direct TLS failed; relay fallback established to peer %s",
+					p.targetPeerID,
+				)
+			} else {
+				log.Printf(
+					"[p2p] ❌ Relay fallback FAILED to peer %s: %v",
+					p.targetPeerID,
+					relayErr,
+				)
+				return fmt.Errorf(
+					"TLS dial failed to %s: %w",
+					p.addr,
+					err,
+				)
+			}
+		} else {
+			return fmt.Errorf(
+				"TLS dial failed to %s: %w",
+				p.addr,
+				err,
+			)
+		}
 	}
 
 	// ------------------------------------------------------------------
@@ -499,10 +532,16 @@ func (p *Peer) Connect() error {
 	p.mu.Unlock()
 
 	// ------------------------------------------------------------------
-	// TLS INFORMATION
+	// ------------------------------------------------------------------
+	// TRANSPORT INFORMATION
 	// ------------------------------------------------------------------
 
-	if tlsConn, ok := conn.(*tls.Conn); ok {
+	if relayTransport {
+		log.Printf(
+			"[p2p] 🔄 Relay transport established to %s",
+			p.targetPeerID,
+		)
+	} else if tlsConn, ok := conn.(*tls.Conn); ok {
 		state := tlsConn.ConnectionState()
 
 		log.Printf(
@@ -2236,6 +2275,41 @@ func (p *Peer) acceptCandidateExchangeNonce(nonce uint64) bool {
 	}
 
 	p.seenCandidateNonces[nonce] = now
+
+	return true
+}
+
+// acceptNAT4Nonce records a NAT4 coordination nonce.
+//
+// A NAT4 nonce can only be accepted once during its validity window.
+// This prevents replay of a previously authenticated coordination request.
+func (p *Peer) acceptNAT4Nonce(nonce uint64) bool {
+	if p == nil || nonce == 0 {
+		return false
+	}
+
+	now := time.Now()
+
+	p.nat4Mu.Lock()
+	defer p.nat4Mu.Unlock()
+
+	if p.seenNAT4Nonces == nil {
+		p.seenNAT4Nonces = make(map[uint64]time.Time)
+	}
+
+	maxAge := nat4MaxClockSkew
+
+	for seenNonce, seenAt := range p.seenNAT4Nonces {
+		if now.Sub(seenAt) > maxAge {
+			delete(p.seenNAT4Nonces, seenNonce)
+		}
+	}
+
+	if _, exists := p.seenNAT4Nonces[nonce]; exists {
+		return false
+	}
+
+	p.seenNAT4Nonces[nonce] = now
 
 	return true
 }

@@ -29,6 +29,7 @@ var hidePassword = false
 var (
 	walletDB            *wallet.WalletDB
 	currentMiningWallet *wallet.Wallet
+	relayServerAddr     string
 )
 
 // Wallet signing session.
@@ -681,7 +682,15 @@ func main() {
 		"Initial P2P peer address (host:port)",
 	)
 
+	flagRelay := flag.String(
+		"relay",
+		"",
+		"Relay server address (host:port)",
+	)
+
 	flag.Parse()
+
+	relayServerAddr = strings.TrimSpace(*flagRelay)
 
 	// ----- Setup paths -----
 
