@@ -873,7 +873,25 @@ func (n *Node) registerDefaultHandlers() {
 					"[p2p] NAT2 no directly reachable candidate for peer=%s",
 					peerID,
 				)
-			}
+			
+                            // NAT2 found no directly reachable TCP candidate.
+                            // Start NAT4 as the next transport attempt.
+                            //
+                            // The authenticated Peer remains sovereign.
+                            // NAT4 only creates a temporary transport session.
+                            if err := n.StartNAT4Traversal(peer); err != nil {
+                                    log.Printf(
+                                            "[p2p] NAT4 fallback failed peer=%s: %v",
+                                            peerID,
+                                            err,
+                                    )
+                            } else {
+                                    log.Printf(
+                                            "[p2p] NAT4 fallback completed peer=%s",
+                                            peerID,
+                                    )
+                            }
+                    }
 		}(p, p.ID(), candidates)
 	})
 
@@ -1038,6 +1056,375 @@ func (n *Node) registerDefaultHandlers() {
 			}
 		}(p, payload)
 	})
+
+// ================================================================
+// NAT4 COORDINATED TCP TRAVERSAL
+// ================================================================
+//
+// NAT4 is a transport mechanism only.
+//
+// The authenticated Peer remains the sovereign session authority.
+// NAT4 never replaces the current Peer session directly.
+//
+// A successful TCP traversal creates a NEW Peer session.
+// That new session is then adopted by Peer.adoptNAT4Conn(),
+// which performs TLS and the normal EXPLOSIVE handshake.
+//
+// The existing authenticated Peer remains untouched until the
+// new session completes the normal authentication process.
+// ================================================================
+
+n.RegisterHandler(MsgTypeNAT4Traversal, func(p *Peer, env *Envelope) {
+	if p == nil || env == nil {
+		return
+	}
+
+	// ------------------------------------------------------------
+	// 1. EXISTING AUTHENTICATED SESSION IS REQUIRED
+	// ------------------------------------------------------------
+
+	if !p.handshakeDone {
+		log.Printf(
+			"[p2p] rejected NAT4 traversal from %s: handshake incomplete",
+			p.Addr(),
+		)
+		p.Penalize(1, 0)
+		return
+	}
+
+	// ------------------------------------------------------------
+	// 2. DECODE PAYLOAD
+	// ------------------------------------------------------------
+
+	var payload NAT4TraversalPayload
+
+	if err := cbor.Unmarshal(env.Payload, &payload); err != nil {
+		log.Printf(
+			"[p2p] rejected NAT4 traversal from %s: invalid payload: %v",
+			p.Addr(),
+			err,
+		)
+		p.Penalize(1, 0)
+		return
+	}
+
+	// ------------------------------------------------------------
+	// 3. VALIDATE AGAINST THE AUTHENTICATED PEER
+	// ------------------------------------------------------------
+
+	expectedPeerID := strings.TrimSpace(string(p.ID()))
+
+	if err := ValidateNAT4TraversalPayload(
+		payload,
+		expectedPeerID,
+	); err != nil {
+		log.Printf(
+			"[p2p] rejected NAT4 traversal from %s: %v",
+			p.Addr(),
+			err,
+		)
+		p.Penalize(1, 0)
+		return
+	}
+
+	// ------------------------------------------------------------
+	// 4. ANTI-REPLAY
+	// ------------------------------------------------------------
+
+	if !p.acceptNAT4Nonce(payload.Nonce) {
+		log.Printf(
+			"[p2p] rejected replayed NAT4 traversal from %s",
+			p.ID(),
+		)
+		p.Penalize(1, 0)
+		return
+	}
+
+	// ------------------------------------------------------------
+	// 5. DELIVER TRAVERSAL RESULT TO THE WAITING SESSION
+	// ------------------------------------------------------------
+	//
+	// A RESULT belongs to the temporary NAT4 SessionID.
+	// It does not create, replace, or modify Peer identity.
+	//
+	// The authenticated Peer remains the sovereign session authority.
+	// The coordinator only delivers the transport result to the
+	// NAT4 operation that registered this SessionID.
+
+	if payload.Kind == nat4TraversalKindResult {
+
+		if n.nat4Coordinator == nil {
+			log.Printf(
+				"[p2p] NAT4 traversal result ignored: coordinator is not initialized peer=%s session=%d",
+				p.ID(),
+				payload.SessionID,
+			)
+			return
+		}
+
+		result := NAT4TraversalResult{
+			Status:    payload.Status,
+			Latency:   time.Duration(payload.LatencyMs) * time.Millisecond,
+			Error:     payload.Error,
+		}
+
+		if payload.Success &&
+			payload.Status == nat4TraversalStatusConnected {
+			result.Status = nat4TraversalStatusConnected
+		}
+
+		if !n.nat4Coordinator.resolveResult(
+			payload.SessionID,
+			result,
+		) {
+			log.Printf(
+				"[p2p] NAT4 traversal result has no waiting session peer=%s session=%d status=%s",
+				p.ID(),
+				payload.SessionID,
+				payload.Status,
+			)
+			return
+		}
+
+		log.Printf(
+			"[p2p] NAT4 traversal result delivered peer=%s session=%d mode=%s success=%t status=%s latency=%dms error=%s",
+			p.ID(),
+			payload.SessionID,
+			payload.TCPMode,
+			payload.Success,
+			payload.Status,
+			payload.LatencyMs,
+			payload.Error,
+		)
+
+		return
+	}
+
+	// ------------------------------------------------------------
+	// 6. COORDINATOR
+	// ------------------------------------------------------------
+	//
+	// Only one NAT4 traversal may be active for this authenticated
+	// peer at a time.
+	//
+	// The coordinator does not own the Peer.
+	// It only prevents concurrent traversal attempts.
+
+	if n.nat4Coordinator == nil {
+		log.Printf(
+			"[p2p] NAT4 traversal unavailable: coordinator is not initialized",
+		)
+		return
+	}
+
+	if !n.nat4Coordinator.begin(expectedPeerID) {
+		log.Printf(
+			"[p2p] NAT4 traversal already active for peer=%s session=%d",
+			expectedPeerID,
+			payload.SessionID,
+		)
+		return
+	}
+
+	defer n.nat4Coordinator.end(expectedPeerID)
+
+	// ------------------------------------------------------------
+	// 7. LOG REQUEST
+	// ------------------------------------------------------------
+
+	log.Printf(
+		"[p2p] NAT4 traversal request from peer=%s session=%d mode=%s local=%s remote=%s start=%d",
+		p.ID(),
+		payload.SessionID,
+		payload.TCPMode,
+		payload.LocalAddr,
+		payload.RemoteAddr,
+		payload.StartAt,
+	)
+
+	// ------------------------------------------------------------
+	// 8. PERFORM COORDINATED TCP ATTEMPT
+	// ------------------------------------------------------------
+	//
+	// The request sender provides:
+	//
+	//     LocalAddr  = sender's candidate
+	//     RemoteAddr = receiver's candidate
+	//
+	// For simultaneous-open, the receiver reverses the direction:
+	//
+	//     receiver local  = RemoteAddr
+	//     receiver remote = LocalAddr
+	//
+	// Both sides use the same SessionID and StartAt.
+	//
+	// NAT4CoordinatedDial performs only the TCP transport attempt.
+	// TLS and EXPLOSIVE authentication remain under Peer.
+
+	go func(
+		authPeer *Peer,
+		request NAT4TraversalPayload,
+	) {
+		if authPeer == nil {
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(
+			authPeer.ctx,
+			nat4TraversalTimeout,
+		)
+		defer cancel()
+
+		startAt := time.UnixMilli(request.StartAt)
+
+		result := NAT4CoordinatedDial(
+			ctx,
+			request.RemoteAddr,
+			request.LocalAddr,
+			startAt,
+			nat4TraversalTimeout,
+		)
+
+		// --------------------------------------------------------
+		// 9. REPORT RESULT THROUGH THE EXISTING AUTHENTICATED PEER
+		// --------------------------------------------------------
+
+		response := NAT4TraversalPayload{
+			PeerID:     strings.TrimSpace(string(n.id)),
+			SessionID:  request.SessionID,
+			Kind:       nat4TraversalKindResult,
+			LocalAddr:  request.RemoteAddr,
+			RemoteAddr: request.LocalAddr,
+			TCPMode:    request.TCPMode,
+			StartAt:    request.StartAt,
+			Timestamp:  time.Now().UnixMilli(),
+			Nonce:      secureRelayNonce(),
+			Success:    result.Conn != nil &&
+				result.Status == nat4TraversalStatusConnected,
+			LatencyMs: result.Latency.Milliseconds(),
+			Status:    result.Status,
+			Error:     result.Error,
+		}
+
+		reply, err := NewEnvelopeFromPayload(
+			n.protocolVersion,
+			MsgTypeNAT4Traversal,
+			response,
+		)
+		if err != nil {
+			if result.Conn != nil {
+				_ = result.Conn.Close()
+			}
+
+			log.Printf(
+				"[p2p] NAT4 traversal result envelope failed for peer=%s session=%d: %v",
+				authPeer.ID(),
+				request.SessionID,
+				err,
+			)
+			return
+		}
+
+		if err := authPeer.SendEnvelope(reply); err != nil {
+			if result.Conn != nil {
+				_ = result.Conn.Close()
+			}
+
+			log.Printf(
+				"[p2p] NAT4 traversal result send failed for peer=%s session=%d: %v",
+				authPeer.ID(),
+				request.SessionID,
+				err,
+			)
+			return
+		}
+
+		// --------------------------------------------------------
+		// 10. TCP FAILED
+		// --------------------------------------------------------
+
+		if result.Conn == nil {
+			log.Printf(
+				"[p2p] NAT4 traversal failed peer=%s session=%d status=%s error=%s",
+				authPeer.ID(),
+				request.SessionID,
+				result.Status,
+				result.Error,
+			)
+			return
+		}
+
+		// --------------------------------------------------------
+		// 11. CREATE A NEW PEER SESSION
+		// --------------------------------------------------------
+		//
+		// IMPORTANT:
+		//
+		// We NEVER reuse authPeer.
+		// We NEVER replace its connection here.
+		//
+		// A new Peer represents the new transport session.
+		// The authenticated PeerID remains the same permanent identity.
+
+		newPeer := NewPeer(
+			"",
+			request.LocalAddr,
+			n,
+		)
+
+		if newPeer == nil {
+			_ = result.Conn.Close()
+
+			log.Printf(
+				"[p2p] NAT4 traversal could not create new Peer session peer=%s session=%d",
+				authPeer.ID(),
+				request.SessionID,
+			)
+			return
+		}
+
+		// The remote authenticated identity is already known through
+		// the existing sovereign Peer session.
+		newPeer.targetPeerID = authPeer.ID()
+
+		// --------------------------------------------------------
+		// 12. TRANSFER RAW TCP TO THE SOVEREIGN PEER LAYER
+		// --------------------------------------------------------
+		//
+		// adoptNAT4Conn() owns:
+		//
+		//     raw TCP
+		//         ↓
+		//     TLS
+		//         ↓
+		//     read/write loops
+		//         ↓
+		//     EXPLOSIVE HANDSHAKE
+		//         ↓
+		//     authenticated Peer
+		//
+		// NAT4 itself stops being involved after this point.
+
+		if err := newPeer.adoptNAT4Conn(result.Conn); err != nil {
+			_ = result.Conn.Close()
+
+			log.Printf(
+				"[p2p] NAT4 TCP session adoption failed peer=%s session=%d: %v",
+				authPeer.ID(),
+				request.SessionID,
+				err,
+			)
+			return
+		}
+
+		log.Printf(
+			"[p2p] NAT4 TCP path established; new Peer session handed to sovereign Peer layer peer=%s session=%d",
+			authPeer.ID(),
+			request.SessionID,
+		)
+
+	}(p, payload)
+})
 	// =========================================================
 	// PING / PONG
 	// =========================================================

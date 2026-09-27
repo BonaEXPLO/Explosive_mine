@@ -84,6 +84,19 @@ type Node struct {
 	userAgent       string
 	protocolVersion uint16
 	config          NodeConfig
+
+	// ------------------------------------------------------------------
+	// NAT4 TRAVERSAL COORDINATION
+	// ------------------------------------------------------------------
+	//
+	// The coordinator prevents multiple simultaneous NAT4 traversal
+	// attempts for the same authenticated peer.
+	//
+	// NAT4 remains a transport mechanism only.
+	// Peer remains the sovereign session authority.
+	//
+	nat4Coordinator *NAT4Coordinator
+
 	// ------------------------------------------------------------------
 	// RELAY TRANSPORT
 	// ------------------------------------------------------------------
@@ -283,12 +296,21 @@ func NewNode(listenAddr, networkID, userAgent string, minerID string, sacredWord
 	// ------------------------------------------------------------------
 	// CREATE NODE
 	// ------------------------------------------------------------------
-	n := &Node{}
+	// ------------------------------------------------------------------
+        n := &Node{}
 
-	// ------------------------------------------------------------------
-	// ANTI-REPLAY / NONCE TRACKING
-	// ------------------------------------------------------------------
-	n.nonceCount = make(map[string]int)
+// ------------------------------------------------------------------
+// NAT4 TRAVERSAL COORDINATION
+// ------------------------------------------------------------------
+// NAT4 is transport-only.
+// The coordinator prevents duplicate traversal attempts for the same
+// authenticated peer while Peer remains the sovereign session authority.
+        n.nat4Coordinator = NewNAT4Coordinator()
+
+// ------------------------------------------------------------------
+// ANTI-REPLAY / NONCE TRACKING
+// ------------------------------------------------------------------
+        n.nonceCount = make(map[string]int)
 
 	// ------------------------------------------------------------------
 	// ANTI-SYBIL / IP TRACKING

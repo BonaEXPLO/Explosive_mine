@@ -125,17 +125,18 @@ func NewPeer(id PeerID, addr string, node *Node) *Peer {
 	// A peer's permanent identity is established only after
 	// the EXPLOSIVE handshake verifies the remote wallet identity.
 	return &Peer{
-		id:                  id,
-		addr:                addr,
-		reconnectAddr:       addr,
-		node:                node,
-		sendQ:               make(chan []byte, qsize),
-		ctx:                 ctx,
-		cancel:              cancel,
-		handshakeCh:         make(chan struct{}),
-		pendingPings:        make(map[int64]time.Time),
-		seenCandidateNonces: make(map[uint64]time.Time),
-	}
+        id:                  id,
+        addr:                addr,
+        reconnectAddr:       addr,
+        node:                node,
+        sendQ:               make(chan []byte, qsize),
+        ctx:                 ctx,
+        cancel:              cancel,
+        handshakeCh:         make(chan struct{}),
+        pendingPings:        make(map[int64]time.Time),
+        seenCandidateNonces: make(map[uint64]time.Time),
+        seenNAT4Nonces:      make(map[uint64]time.Time),
+}
 }
 
 // ID returns the peer identifier.
@@ -1122,4 +1123,213 @@ func (p *Peer) getConn() net.Conn {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.conn
+}
+
+// adoptNAT4Conn adopts an already-established raw TCP connection
+// discovered by the NAT4 transport layer.
+//
+// NAT4 is responsible only for discovering the TCP path.
+// Peer remains the sovereign owner of the network session.
+//
+// This method:
+//   1. validates the Peer session,
+//   2. wraps the raw TCP connection in TLS,
+//   3. performs the TLS handshake,
+//   4. installs the TLS connection into this Peer,
+//   5. starts the normal Peer I/O workers,
+//   6. sends the normal EXPLOSIVE handshake.
+//
+// NAT4 never owns Peer state and never performs the EXPLOSIVE handshake.
+func (p *Peer) adoptNAT4Conn(rawConn net.Conn) error {
+	if p == nil {
+		return errors.New("nil peer")
+	}
+
+	if rawConn == nil {
+		return errors.New("nil NAT4 connection")
+	}
+
+	if p.node == nil {
+		_ = rawConn.Close()
+		return errors.New("missing node")
+	}
+
+	if p.node.tlsConfig == nil {
+		_ = rawConn.Close()
+		return errors.New("missing TLS configuration")
+	}
+
+	p.mu.Lock()
+
+	if p.connected && p.conn != nil {
+		p.mu.Unlock()
+		_ = rawConn.Close()
+		return nil
+	}
+
+	ctx := p.ctx
+
+	p.mu.Unlock()
+
+	if ctx == nil {
+		_ = rawConn.Close()
+		return errors.New("peer context is missing")
+	}
+
+	select {
+	case <-ctx.Done():
+		_ = rawConn.Close()
+		return errors.New("peer session already closed")
+	default:
+	}
+
+	// ------------------------------------------------------------------
+	// RAW TCP -> TLS
+	// ------------------------------------------------------------------
+	//
+	// NAT4 has already established the TCP path.
+	// Peer now becomes responsible for the secure transport.
+	// ------------------------------------------------------------------
+
+	tlsConn := tls.Client(rawConn, p.node.tlsConfig)
+
+	handshakeTimeout := 10 * time.Second
+	if p.node.config.DialTimeout > 0 {
+		handshakeTimeout = p.node.config.DialTimeout
+	}
+
+	if err := tlsConn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		_ = rawConn.Close()
+		return fmt.Errorf("failed to configure NAT4 TLS deadline: %w", err)
+	}
+
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = rawConn.Close()
+
+		select {
+		case <-ctx.Done():
+			return errors.New("peer session cancelled during NAT4 TLS handshake")
+		default:
+		}
+
+		return fmt.Errorf("NAT4 TLS handshake failed: %w", err)
+	}
+
+	// The TLS handshake is complete.
+	// Remove the temporary handshake deadline so the normal Peer
+	// read/write lifecycle controls the connection from this point.
+	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+		_ = rawConn.Close()
+		return fmt.Errorf("failed to clear NAT4 TLS deadline: %w", err)
+	}
+
+	// ------------------------------------------------------------------
+	// SESSION INSTALLATION
+	// ------------------------------------------------------------------
+
+	p.mu.Lock()
+
+	select {
+	case <-ctx.Done():
+		p.mu.Unlock()
+		_ = tlsConn.Close()
+		return errors.New(
+			"peer session cancelled before NAT4 TLS connection was installed",
+		)
+
+	default:
+	}
+
+	// Never install a second connection into the same Peer session.
+	if p.connected && p.conn != nil {
+		p.mu.Unlock()
+		_ = tlsConn.Close()
+		return nil
+	}
+
+	p.conn = tlsConn
+	p.connected = true
+	p.lastSeen = time.Now()
+
+	p.mu.Unlock()
+
+	// ------------------------------------------------------------------
+	// START NORMAL PEER IO
+	// ------------------------------------------------------------------
+
+	state := tlsConn.ConnectionState()
+
+	log.Printf(
+		"[p2p] 🔒 NAT4 TLS connection established to %s (TLS %d.%d, cipher=%s)",
+		p.addr,
+		state.Version>>8,
+		state.Version&0xff,
+		tls.CipherSuiteName(state.CipherSuite),
+	)
+
+	p.wg.Add(2)
+
+	go p.readLoop()
+	go p.writeLoop()
+
+	// ------------------------------------------------------------------
+	// SEND NORMAL EXPLOSIVE HANDSHAKE
+	// ------------------------------------------------------------------
+	//
+	// NAT4 does not authenticate the remote wallet.
+	// The normal Peer handshake remains authoritative.
+	// ------------------------------------------------------------------
+
+	go func() {
+		delay := time.Duration(
+			100+rand.Intn(501),
+		) * time.Millisecond
+
+		log.Printf(
+			"[p2p] ⏳ Preparing NAT4 outbound handshake to %s (delay=%v)",
+			p.addr,
+			delay,
+		)
+
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+
+		select {
+		case <-p.ctx.Done():
+			return
+
+		case <-timer.C:
+		}
+
+		if !p.IsConnected() {
+			log.Printf(
+				"[p2p] ⛔ NAT4 session disappeared before handshake to %s",
+				p.addr,
+			)
+			return
+		}
+
+		log.Printf(
+			"[p2p] 🚀 Sending NAT4 handshake to %s",
+			p.addr,
+		)
+
+		if err := p.sendHandshake(); err != nil {
+			log.Printf(
+				"[p2p] ❌ NAT4 handshake failed to %s: %v",
+				p.addr,
+				err,
+			)
+
+			p.Close()
+			return
+		}
+
+		log.Printf(
+			"[p2p] ✅ NAT4 handshake queued for %s",
+			p.addr,
+		)
+	}()
+
+	return nil
 }
