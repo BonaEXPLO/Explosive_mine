@@ -10,9 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"strings"
-        "math/rand"
 	"sync"
 	"time"
 
@@ -297,20 +297,20 @@ func NewNode(listenAddr, networkID, userAgent string, minerID string, sacredWord
 	// CREATE NODE
 	// ------------------------------------------------------------------
 	// ------------------------------------------------------------------
-        n := &Node{}
+	n := &Node{}
 
-// ------------------------------------------------------------------
-// NAT4 TRAVERSAL COORDINATION
-// ------------------------------------------------------------------
-// NAT4 is transport-only.
-// The coordinator prevents duplicate traversal attempts for the same
-// authenticated peer while Peer remains the sovereign session authority.
-        n.nat4Coordinator = NewNAT4Coordinator()
+	// ------------------------------------------------------------------
+	// NAT4 TRAVERSAL COORDINATION
+	// ------------------------------------------------------------------
+	// NAT4 is transport-only.
+	// The coordinator prevents duplicate traversal attempts for the same
+	// authenticated peer while Peer remains the sovereign session authority.
+	n.nat4Coordinator = NewNAT4Coordinator()
 
-// ------------------------------------------------------------------
-// ANTI-REPLAY / NONCE TRACKING
-// ------------------------------------------------------------------
-        n.nonceCount = make(map[string]int)
+	// ------------------------------------------------------------------
+	// ANTI-REPLAY / NONCE TRACKING
+	// ------------------------------------------------------------------
+	n.nonceCount = make(map[string]int)
 
 	// ------------------------------------------------------------------
 	// ANTI-SYBIL / IP TRACKING
@@ -1245,6 +1245,110 @@ func (n *Node) RelayClient() *RelayClient {
 	n.relayMu.RUnlock()
 
 	return client
+}
+
+// BootstrapRelayPeers discovers authenticated EXPLOSIVE PeerIDs through
+// the relay and establishes relay-backed P2P sessions for them.
+//
+// The relay is transport and discovery only. It never becomes the peer
+// identity, blockchain authority, or session authority. The normal
+// handleNewConnection() path remains responsible for creating the Peer
+// session and completing the authenticated EXPLOSIVE handshake.
+func (n *Node) BootstrapRelayPeers(ctx context.Context) error {
+	if n == nil {
+		return errors.New("nil node")
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	client := n.RelayClient()
+	if client == nil {
+		return errors.New("relay transport is not configured")
+	}
+
+	peerIDs, err := client.DiscoverPeers(ctx)
+	if err != nil {
+		return fmt.Errorf("relay peer discovery failed: %w", err)
+	}
+
+	if len(peerIDs) == 0 {
+		log.Printf("[p2p] Relay discovery returned no other peers")
+		return nil
+	}
+
+	var connected int
+
+	for _, discoveredID := range peerIDs {
+		peerID := PeerID(strings.TrimSpace(discoveredID))
+		if peerID == "" || peerID == n.id {
+			continue
+		}
+
+		// Do not create a second session when this identity is already
+		// authenticated and connected.
+		active := false
+
+		for _, p := range n.AllPeers() {
+			if p == nil || !p.IsConnected() {
+				continue
+			}
+
+			p.mu.RLock()
+			activeID := p.id
+			p.mu.RUnlock()
+
+			if activeID == peerID {
+				active = true
+				break
+			}
+		}
+
+		if active {
+			log.Printf(
+				"[p2p] Relay discovery: peer %s already connected",
+				peerID,
+			)
+			continue
+		}
+
+		log.Printf(
+			"[p2p] 🔎 Relay discovered peer %s",
+			peerID,
+		)
+
+		conn, err := n.connectRelayPeer(ctx, peerID)
+		if err != nil {
+			log.Printf(
+				"[p2p] ❌ Relay connection to peer %s failed: %v",
+				peerID,
+				err,
+			)
+			continue
+		}
+
+		// The relay transport is already established. Do not call
+		// Peer.Connect(), because that method performs a new TCP+TLS dial.
+		//
+		// The normal Peer lifecycle and authenticated EXPLOSIVE handshake
+		// begin here.
+		n.handleNewConnection(conn)
+		connected++
+
+		log.Printf(
+			"[p2p] 🔗 Relay session handed to normal P2P lifecycle: peer=%s",
+			peerID,
+		)
+	}
+
+	log.Printf(
+		"[p2p] Relay bootstrap completed: discovered=%d connected=%d",
+		len(peerIDs),
+		connected,
+	)
+
+	return nil
 }
 
 // connectRelayPeer creates a relay-backed network connection to a known

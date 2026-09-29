@@ -14,12 +14,21 @@ import (
 // ============================================================
 // RELAY CLIENT
 // ============================================================
-
 type RelayClientConfig struct {
 	TLSConfig *tls.Config
 
 	RelayAddr string
 
+	// NetworkID identifies the exact EXPLOSIVE network.
+	//
+	// This value is derived from the official genesis and is used
+	// to prevent cross-network peer discovery.
+	NetworkID string
+
+	// PeerID is the permanent EXPLOSIVE identity of this node.
+	//
+	// It is never replaced by an IP address, port, relay address,
+	// NAT candidate, or transport session.
 	PeerID string
 
 	WalletPublicKey ed25519.PublicKey
@@ -77,6 +86,11 @@ type RelayClient struct {
 	openMu      sync.Mutex
 	pendingOpen map[uint64]chan relayFrame
 
+	// pendingDiscover maps the DISCOVER nonce to the waiting
+	// DiscoverPeers caller.
+	discoverMu      sync.Mutex
+	pendingDiscover map[uint64]chan relayFrame
+
 	// incomingTunnels receives tunnels initiated by another
 	// peer through the relay.
 	//
@@ -102,6 +116,12 @@ func NewRelayClient(
 	if config.RelayAddr == "" {
 		return nil, errors.New(
 			"relay address is required",
+		)
+	}
+
+	if config.NetworkID == "" {
+		return nil, errors.New(
+			"relay NetworkID is required",
 		)
 	}
 
@@ -131,6 +151,10 @@ func NewRelayClient(
 		),
 
 		pendingOpen: make(
+			map[uint64]chan relayFrame,
+		),
+
+		pendingDiscover: make(
 			map[uint64]chan relayFrame,
 		),
 
@@ -494,6 +518,12 @@ func (c *RelayClient) relayReadLoop(
 			relayMsgOpenReject:
 
 			c.dispatchOpenResponse(
+				frame,
+			)
+
+		case relayMsgPeers:
+
+			c.dispatchDiscoverResponse(
 				frame,
 			)
 
@@ -1587,4 +1617,244 @@ func (c *RelayClient) removeTunnel(
 			targetPeerID,
 		)
 	}
+}
+
+// dispatchDiscoverResponse delivers a PEERS response to the
+// goroutine waiting inside DiscoverPeers().
+func (c *RelayClient) dispatchDiscoverResponse(
+	frame relayFrame,
+) {
+
+	if c == nil {
+		return
+	}
+
+	if frame.Type != relayMsgPeers {
+		return
+	}
+
+	if frame.Nonce == 0 {
+		return
+	}
+
+	if err := validateRelayTimestamp(
+		frame.Timestamp,
+	); err != nil {
+		return
+	}
+
+	c.discoverMu.Lock()
+
+	ch, ok := c.pendingDiscover[frame.Nonce]
+
+	if ok {
+		delete(
+			c.pendingDiscover,
+			frame.Nonce,
+		)
+	}
+
+	c.discoverMu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	select {
+	case ch <- frame:
+	default:
+	}
+}
+
+// ============================================================
+// DISCOVER PEERS
+// ============================================================
+
+// DiscoverPeers asks the relay server for authenticated EXPLOSIVE
+// PeerIDs currently connected to the same NetworkID.
+//
+// The relay returns permanent PeerIDs only.
+// No IP address, port, NAT candidate, or transport locator is
+// exposed by the discovery protocol.
+//
+// The returned PeerIDs can later be passed to OpenTunnel().
+func (c *RelayClient) DiscoverPeers(
+	ctx context.Context,
+) ([]string, error) {
+
+	if c == nil {
+		return nil, errors.New(
+			"nil relay client",
+		)
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	if c.config.NetworkID == "" {
+		return nil, errors.New(
+			"relay NetworkID is not configured",
+		)
+	}
+
+	c.mu.Lock()
+
+	conn := c.conn
+	closed := c.closed
+
+	c.mu.Unlock()
+
+	if closed || conn == nil {
+		return nil, errors.New(
+			"relay client is not connected",
+		)
+	}
+
+	nonce := secureRelayNonce()
+
+	responseCh := make(
+		chan relayFrame,
+		1,
+	)
+
+	c.discoverMu.Lock()
+
+	if _, exists := c.pendingDiscover[nonce]; exists {
+		c.discoverMu.Unlock()
+
+		return nil, errors.New(
+			"relay DISCOVER nonce collision",
+		)
+	}
+
+	c.pendingDiscover[nonce] = responseCh
+
+	c.discoverMu.Unlock()
+
+	frame := relayFrame{
+		Version:      relayProtocolVersion,
+		Type:         relayMsgDiscover,
+		SourcePeerID: c.config.PeerID,
+		Timestamp:    time.Now().UnixMilli(),
+		Nonce:        nonce,
+		NetworkID:    c.config.NetworkID,
+	}
+
+	if err := c.writeFrame(frame); err != nil {
+
+		c.discoverMu.Lock()
+
+		delete(
+			c.pendingDiscover,
+			nonce,
+		)
+
+		c.discoverMu.Unlock()
+
+		return nil, fmt.Errorf(
+			"relay DISCOVER failed: %w",
+			err,
+		)
+	}
+
+	var response relayFrame
+
+	select {
+
+	case <-ctx.Done():
+
+		c.discoverMu.Lock()
+
+		delete(
+			c.pendingDiscover,
+			nonce,
+		)
+
+		c.discoverMu.Unlock()
+
+		return nil, ctx.Err()
+
+	case response = <-responseCh:
+	}
+
+	if response.Type != relayMsgPeers {
+
+		if response.Error == "" {
+			response.Error = "unexpected relay DISCOVER response"
+		}
+
+		return nil, errors.New(
+			response.Error,
+		)
+	}
+
+	if response.Version != relayProtocolVersion {
+		return nil, errors.New(
+			"relay PEERS protocol version mismatch",
+		)
+	}
+
+	if response.SourcePeerID != c.config.PeerID {
+		return nil, errors.New(
+			"relay PEERS source identity mismatch",
+		)
+	}
+
+	if response.NetworkID != c.config.NetworkID {
+		return nil, errors.New(
+			"relay PEERS NetworkID mismatch",
+		)
+	}
+
+	if response.Nonce != nonce {
+		return nil, errors.New(
+			"relay PEERS nonce mismatch",
+		)
+	}
+
+	if err := validateRelayTimestamp(
+		response.Timestamp,
+	); err != nil {
+		return nil, fmt.Errorf(
+			"invalid relay PEERS timestamp: %w",
+			err,
+		)
+	}
+
+	peers := make(
+		[]string,
+		0,
+		len(response.PeerIDs),
+	)
+
+	seen := make(
+		map[string]struct{},
+		len(response.PeerIDs),
+	)
+
+	for _, peerID := range response.PeerIDs {
+
+		if peerID == "" {
+			continue
+		}
+
+		// Never return the local permanent identity.
+		if peerID == c.config.PeerID {
+			continue
+		}
+
+		if _, exists := seen[peerID]; exists {
+			continue
+		}
+
+		seen[peerID] = struct{}{}
+
+		peers = append(
+			peers,
+			peerID,
+		)
+	}
+
+	return peers, nil
 }

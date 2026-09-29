@@ -61,6 +61,10 @@ const (
 	relayMsgClose
 	relayMsgPing
 	relayMsgPong
+
+	// Peer discovery messages.
+	relayMsgDiscover
+	relayMsgPeers
 )
 
 // relayFrame is the control protocol used between a node
@@ -77,6 +81,14 @@ type relayFrame struct {
 
 	Timestamp int64  `cbor:"timestamp"`
 	Nonce     uint64 `cbor:"nonce"`
+
+	// NetworkID scopes relay discovery to one EXPLOSIVE network.
+	NetworkID string `cbor:"network_id,omitempty"`
+
+	// PeerIDs is used only by relay peer discovery responses.
+	// It contains authenticated EXPLOSIVE identities only.
+	// No transport addresses are exposed.
+	PeerIDs []string `cbor:"peer_ids,omitempty"`
 
 	Payload []byte `cbor:"payload,omitempty"`
 
@@ -888,4 +900,37 @@ func osDeadlineExceeded(err error) error {
 	}
 
 	return err
+}
+
+// PeerIDs returns the authenticated PeerIDs currently connected
+// to the relay.
+//
+// Only permanent EXPLOSIVE identities are returned.
+// Transport addresses are intentionally excluded.
+func (r *RelayRegistry) PeerIDs() []string {
+        if r == nil {
+                return nil
+        }
+
+        r.mu.RLock()
+        defer r.mu.RUnlock()
+
+        peerIDs := make(
+                []string,
+                0,
+                len(r.sessions),
+        )
+
+        for peerID := range r.sessions {
+                if peerID == "" {
+                        continue
+                }
+
+                peerIDs = append(
+                        peerIDs,
+                        peerID,
+                )
+        }
+
+        return peerIDs
 }

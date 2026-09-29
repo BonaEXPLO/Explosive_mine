@@ -22,6 +22,9 @@ import (
 type RelayServerConfig struct {
 	TLSConfig *tls.Config
 
+	// NetworkID scopes peer discovery to one EXPLOSIVE network.
+	NetworkID string
+
 	MaxSessions int
 
 	IdleTimeout time.Duration
@@ -32,7 +35,7 @@ type RelayServerConfig struct {
 func DefaultRelayServerConfig() RelayServerConfig {
 	return RelayServerConfig{
 		MaxSessions:  relayDefaultMaxSessions,
-		IdleTimeout: relayIdleTimeout,
+		IdleTimeout:  relayIdleTimeout,
 		MaxFrameSize: relayMaxFrameSize,
 	}
 }
@@ -638,6 +641,22 @@ func (s *RelayServer) handleConnection(
 
 			return
 
+		case relayMsgDiscover:
+
+			if frame.SourcePeerID != peerID {
+				log.Printf(
+					"[relay] DISCOVER source identity mismatch PeerID=%s",
+					peerID,
+				)
+
+				return
+			}
+
+			s.handleDiscover(
+				session,
+				frame,
+			)
+
 		case relayMsgOpen:
 
 			if frame.SourcePeerID != peerID {
@@ -1167,7 +1186,7 @@ func (s *RelayServer) handleData(
 		TargetPeerID: target.peerID,
 		Timestamp:    time.Now().UnixMilli(),
 		Nonce:        secureRelayNonce(),
-		Payload:      append(
+		Payload: append(
 			[]byte(nil),
 			frame.Payload...,
 		),
@@ -1398,4 +1417,159 @@ func isRelayTimeout(
 	}
 
 	return false
+}
+
+// ============================================================
+// PEER DISCOVERY
+// ============================================================
+
+func (s *RelayServer) handleDiscover(
+	source *relaySession,
+	frame relayFrame,
+) {
+	if s == nil ||
+		source == nil {
+
+		return
+	}
+
+	// --------------------------------------------------------
+	// Source identity.
+	// --------------------------------------------------------
+
+	if frame.SourcePeerID != source.peerID {
+		log.Printf(
+			"[relay] DISCOVER source identity mismatch PeerID=%s",
+			source.peerID,
+		)
+
+		return
+	}
+
+	// --------------------------------------------------------
+	// Network isolation.
+	//
+	// Discovery is valid only inside the exact EXPLOSIVE
+	// network configured for this relay.
+	// --------------------------------------------------------
+
+	if s.config.NetworkID == "" ||
+		frame.NetworkID == "" ||
+		frame.NetworkID != s.config.NetworkID {
+
+		log.Printf(
+			"[relay] DISCOVER network mismatch PeerID=%s",
+			source.peerID,
+		)
+
+		return
+	}
+
+	// --------------------------------------------------------
+	// Timestamp.
+	// --------------------------------------------------------
+
+	if err := validateRelayTimestamp(
+		frame.Timestamp,
+	); err != nil {
+
+		log.Printf(
+			"[relay] invalid DISCOVER timestamp PeerID=%s: %v",
+			source.peerID,
+			err,
+		)
+
+		return
+	}
+
+	// --------------------------------------------------------
+	// Nonce.
+	// --------------------------------------------------------
+
+	if frame.Nonce == 0 {
+		log.Printf(
+			"[relay] DISCOVER nonce missing PeerID=%s",
+			source.peerID,
+		)
+
+		return
+	}
+
+	if !source.acceptNonce(
+		frame.Nonce,
+	) {
+		log.Printf(
+			"[relay] DISCOVER nonce replay PeerID=%s",
+			source.peerID,
+		)
+
+		return
+	}
+
+	// --------------------------------------------------------
+	// Collect authenticated peers.
+	//
+	// Only permanent EXPLOSIVE PeerIDs are returned.
+	// Transport addresses are never exposed.
+	// --------------------------------------------------------
+
+	peerIDs := s.registry.PeerIDs()
+
+	discovered := make(
+		[]string,
+		0,
+		16,
+	)
+
+	for _, peerID := range peerIDs {
+
+		if peerID == "" ||
+			peerID == source.peerID {
+
+			continue
+		}
+
+		discovered = append(
+			discovered,
+			peerID,
+		)
+
+		if len(discovered) >= 16 {
+			break
+		}
+	}
+
+	// --------------------------------------------------------
+	// PEERS response.
+	// --------------------------------------------------------
+
+	response := relayFrame{
+		Version:      relayProtocolVersion,
+		Type:         relayMsgPeers,
+		SourcePeerID: source.peerID,
+		Timestamp:    time.Now().UnixMilli(),
+		Nonce:        frame.Nonce,
+		NetworkID:    s.config.NetworkID,
+		PeerIDs:      discovered,
+	}
+
+	if err := relayServerWrite(
+		source,
+		response,
+	); err != nil {
+
+		log.Printf(
+			"[relay] PEERS response failed PeerID=%s: %v",
+			source.peerID,
+			err,
+		)
+
+		return
+	}
+
+	log.Printf(
+		"[relay] discovery PeerID=%s returned=%d",
+		source.peerID,
+		len(discovered),
+	)
 }

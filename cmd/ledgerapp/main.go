@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"explosive/internal/address"
@@ -153,12 +154,23 @@ func startP2PNodeForMiner(
 	var node *p2p.Node
 	var err error
 
+	// The official EXPLOSIVE NetworkID is derived from the immutable genesis.
+	// ledger.InitNetworkID(db) must have completed before this function is called.
+	networkID := fmt.Sprintf("%x", ledger.CurrentNetworkID)
+
+	if len(networkID) != 64 {
+		return nil, nil, fmt.Errorf(
+			"invalid EXPLOSIVE NetworkID: %q",
+			networkID,
+		)
+	}
+
 	// Create a deterministic node identity when a miner identity is available.
 	// Otherwise create a normal wallet-based node identity.
 	if minerID != "" && len(sacredWords) == 4 {
 		node, err = p2p.NewNode(
 			listenAddr,
-			"explosive-mainnet",
+			networkID,
 			"ledger-client",
 			minerID,
 			sacredWords,
@@ -166,7 +178,7 @@ func startP2PNodeForMiner(
 	} else {
 		node, err = p2p.NewNode(
 			listenAddr,
-			"explosive-mainnet",
+			networkID,
 			"ledger-client",
 			"",
 			nil,
@@ -275,6 +287,27 @@ func startP2PNodeForMiner(
 		"🔐 Wallet P2P identity attached: %s",
 		currentMiningWallet.Address,
 	)
+
+	// ------------------------------------------------------------
+	// 1.1 OPTIONAL RELAY TRANSPORT
+	// ------------------------------------------------------------
+	//
+	// The relay is transport-only. It never becomes the peer
+	// identity or blockchain authority.
+	if relayServerAddr != "" {
+		if err := node.ConfigureRelayClient(relayServerAddr); err != nil {
+			node.Stop()
+			return nil, nil, fmt.Errorf(
+				"failed to configure relay client: %w",
+				err,
+			)
+		}
+
+		log.Printf(
+			"[p2p] Relay transport configured: %s",
+			relayServerAddr,
+		)
+	}
 
 	// Clear the temporary public-key copy.
 	for i := range walletPublicKey {
@@ -495,6 +528,47 @@ func startP2PNodeForMiner(
 			"failed to start P2P node: %w",
 			err,
 		)
+	}
+
+	if relayServerAddr != "" {
+		relayClient := node.RelayClient()
+		if relayClient == nil {
+			node.Stop()
+			return nil, nil, fmt.Errorf("relay client is not configured")
+		}
+
+		if err := relayClient.Connect(context.Background()); err != nil {
+			node.Stop()
+			return nil, nil, fmt.Errorf(
+				"failed to connect to relay server %s: %w",
+				relayServerAddr,
+				err,
+			)
+		}
+
+		log.Printf(
+			"[p2p] Relay connection established: %s",
+			relayServerAddr,
+		)
+
+		// Discover authenticated EXPLOSIVE PeerIDs through the relay.
+		//
+		// The relay is transport/discovery only. The discovered PeerID remains
+		// the permanent wallet-derived identity of the remote EXPLOSIVE peer.
+		go func() {
+			ctx, cancel := context.WithTimeout(
+				context.Background(),
+				30*time.Second,
+			)
+			defer cancel()
+
+			if err := node.BootstrapRelayPeers(ctx); err != nil {
+				log.Printf(
+					"[p2p] ⚠️ Relay peer bootstrap failed: %v",
+					err,
+				)
+			}
+		}()
 	}
 
 	// Attach node to wallet package.

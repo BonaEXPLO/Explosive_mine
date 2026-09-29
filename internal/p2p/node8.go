@@ -114,6 +114,83 @@ func (n *Node) SetWalletSigner(signer func([]byte) ([]byte, error)) error {
 	return nil
 }
 
+// ConfigureRelayClient creates and attaches the authenticated relay client.
+//
+// The relay is transport-only. It never becomes the EXPLOSIVE peer identity,
+// blockchain authority, or session authority. The authenticated PeerID remains
+// derived from the permanent wallet identity.
+//
+// The NetworkID is taken from the Node's official network configuration,
+// which is initialized from the EXPLOSIVE genesis before this function is
+// called.
+func (n *Node) ConfigureRelayClient(relayAddr string) error {
+	if n == nil {
+		return errors.New("nil P2P node")
+	}
+
+	relayAddr = strings.TrimSpace(relayAddr)
+	if relayAddr == "" {
+		return errors.New("relay address is empty")
+	}
+
+	networkID := strings.TrimSpace(n.networkID)
+	if networkID == "" {
+		return errors.New("network ID is not configured")
+	}
+
+	n.walletSignerMu.RLock()
+	signer := n.walletSigner
+	n.walletSignerMu.RUnlock()
+
+	if signer == nil {
+		return errors.New("wallet signer is not configured")
+	}
+
+	n.walletIdentityMu.RLock()
+	peerID := n.id
+	walletPublicKey := append([]byte(nil), n.walletPublicKey...)
+	n.walletIdentityMu.RUnlock()
+
+	if peerID == "" {
+		return errors.New("peer identity is not configured")
+	}
+
+	if len(walletPublicKey) != ed25519.PublicKeySize {
+		return fmt.Errorf(
+			"invalid wallet public key size: got %d, want %d",
+			len(walletPublicKey),
+			ed25519.PublicKeySize,
+		)
+	}
+
+	tlsConfig, err := n.RelayTLSConfig()
+	if err != nil {
+		return fmt.Errorf(
+			"get relay TLS config: %w",
+			err,
+		)
+	}
+
+	client, err := NewRelayClient(RelayClientConfig{
+		RelayAddr:       relayAddr,
+		NetworkID:       networkID,
+		PeerID:          string(peerID),
+		WalletPublicKey: ed25519.PublicKey(walletPublicKey),
+		WalletSigner:    signer,
+		TLSConfig:       tlsConfig,
+	})
+	if err != nil {
+		return fmt.Errorf(
+			"create relay client: %w",
+			err,
+		)
+	}
+
+	n.SetRelayClient(client)
+
+	return nil
+}
+
 // signWalletData delegates signing to the configured wallet signer.
 //
 // The private key never enters the P2P package.
